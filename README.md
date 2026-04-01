@@ -84,7 +84,7 @@ Unknown models fall back to Sonnet rates.
 
 ## Origins
 
-This is a Python rewrite of the Go-based [cctrack dashboard](https://github.com/ksred/cctrack), written by Dan Rapp using Claude. The Go version provides a full web dashboard with real-time updates, session explorer, and project breakdown. This Python version strips it down to the essentials: a single command that parses logs and prints a cost report. The JSONL parsing logic, deduplication strategy, and rate card are ported directly from the Go implementation.
+This is a Python rewrite of the Go-based [cctrack dashboard](https://github.com/ksred/cctrack). The Go version provides a full web dashboard with real-time updates, session explorer, and project breakdown. This Python version strips it down to the essentials: a single command that parses logs and prints a cost report. The JSONL parsing logic, deduplication strategy, and rate card are ported directly from the Go implementation.
 
 ## License
 
