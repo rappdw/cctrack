@@ -25,15 +25,18 @@ from pathlib import Path
 # Longer/more-specific prefixes MUST come first — "claude-opus-4-6" would
 # otherwise match "claude-opus-4" and get the wrong rate.
 RATES = [
+    {"family": "claude-opus-4-7",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25},
     {"family": "claude-opus-4-6",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25},
     {"family": "claude-opus-4-5",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25},
     {"family": "claude-opus-4",     "input": 15.0,  "output": 75.0,  "cache_read": 1.50,  "cache_write": 18.75},
     {"family": "claude-sonnet-4",   "input": 3.0,   "output": 15.0,  "cache_read": 0.30,  "cache_write": 3.75},
-    {"family": "claude-haiku-4-5",  "input": 1.0,   "output": 5.0,   "cache_read": 0.10,  "cache_write": 1.25},
-    {"family": "claude-haiku-3",    "input": 0.80,  "output": 4.0,   "cache_read": 0.08,  "cache_write": 1.00},
+    {"family": "claude-sonnet-3",   "input": 3.0,   "output": 15.0,  "cache_read": 0.30,  "cache_write": 3.75},
+    {"family": "claude-haiku-4",    "input": 1.0,   "output": 5.0,   "cache_read": 0.10,  "cache_write": 1.25},
+    {"family": "claude-haiku-3-5",  "input": 0.80,  "output": 4.0,   "cache_read": 0.08,  "cache_write": 1.00},
+    {"family": "claude-haiku-3",    "input": 0.25,  "output": 1.25,  "cache_read": 0.03,  "cache_write": 0.30},
 ]
 
-SONNET_RATES = RATES[3]  # fallback
+SONNET_RATES = RATES[4]  # fallback
 
 
 def get_rates(model: str) -> dict:

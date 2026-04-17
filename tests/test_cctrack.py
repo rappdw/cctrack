@@ -52,13 +52,20 @@ def write_jsonl(dir_path: str, filename: str, events: list[dict]) -> str:
 
 # ── Rate card tests ─────────────────────────────────────────────────────
 
+def test_get_rates_opus_4_7():
+    r = cctrack.get_rates("claude-opus-4-7-20260416")
+    assert r["family"] == "claude-opus-4-7"
+    assert r["input"] == 5.0
+    assert r["output"] == 25.0
+    assert r["cache_read"] == 0.50
+    assert r["cache_write"] == 6.25
+
+
 def test_get_rates_opus_4_6():
     r = cctrack.get_rates("claude-opus-4-6")
     assert r["family"] == "claude-opus-4-6"
     assert r["input"] == 5.0
     assert r["output"] == 25.0
-    assert r["cache_read"] == 0.50
-    assert r["cache_write"] == 6.25
 
 
 def test_get_rates_opus_4_5():
@@ -95,18 +102,32 @@ def test_get_rates_sonnet_4_6():
     assert r["input"] == 3.0
 
 
+def test_get_rates_sonnet_3_7():
+    """Deprecated Sonnet 3.7 matches claude-sonnet-3 prefix."""
+    r = cctrack.get_rates("claude-sonnet-3-7-20250219")
+    assert r["family"] == "claude-sonnet-3"
+    assert r["input"] == 3.0
+
+
 def test_get_rates_haiku_4_5():
     r = cctrack.get_rates("claude-haiku-4-5-20251001")
-    assert r["family"] == "claude-haiku-4-5"
+    assert r["family"] == "claude-haiku-4"
     assert r["input"] == 1.0
     assert r["output"] == 5.0
 
 
 def test_get_rates_haiku_3_5():
     r = cctrack.get_rates("claude-haiku-3-5-20241022")
-    assert r["family"] == "claude-haiku-3"
+    assert r["family"] == "claude-haiku-3-5"
     assert r["input"] == 0.80
     assert r["output"] == 4.0
+
+
+def test_get_rates_haiku_3():
+    r = cctrack.get_rates("claude-haiku-3-20240307")
+    assert r["family"] == "claude-haiku-3"
+    assert r["input"] == 0.25
+    assert r["output"] == 1.25
 
 
 def test_get_rates_unknown_falls_back_to_sonnet():

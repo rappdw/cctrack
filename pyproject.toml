@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cctrack"
-version = "0.1.0"
+version = "0.2.0"
 description = "Claude Code cost tracker — scans JSONL logs and reports token usage + estimated cost"
 readme = "README.md"
 license = "MIT"
@@ -31,6 +31,6 @@ classifiers = [
 cctrack = "cctrack:main"
 
 [project.urls]
-Homepage = "https://github.com/ksred/cctrack"
-Repository = "https://github.com/ksred/cctrack"
-Issues = "https://github.com/ksred/cctrack/issues"
+Homepage = "https://github.com/rappdw/cctrack"
+Repository = "https://github.com/rappdw/cctrack"
+Issues = "https://github.com/rappdw/cctrack/issues"
