@@ -26,16 +26,18 @@ from pathlib import Path
 
 # Longer/more-specific prefixes MUST come first — "claude-opus-4-6" would
 # otherwise match "claude-opus-4" and get the wrong rate.
+# cache_write is the 5-minute TTL rate (1.25× input); cache_write_1h is the
+# 1-hour TTL rate (2× input). Claude Code hits the 1h tier heavily in practice.
 RATES = [
-    {"family": "claude-opus-4-7",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25},
-    {"family": "claude-opus-4-6",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25},
-    {"family": "claude-opus-4-5",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25},
-    {"family": "claude-opus-4",     "input": 15.0,  "output": 75.0,  "cache_read": 1.50,  "cache_write": 18.75},
-    {"family": "claude-sonnet-4",   "input": 3.0,   "output": 15.0,  "cache_read": 0.30,  "cache_write": 3.75},
-    {"family": "claude-sonnet-3",   "input": 3.0,   "output": 15.0,  "cache_read": 0.30,  "cache_write": 3.75},
-    {"family": "claude-haiku-4",    "input": 1.0,   "output": 5.0,   "cache_read": 0.10,  "cache_write": 1.25},
-    {"family": "claude-haiku-3-5",  "input": 0.80,  "output": 4.0,   "cache_read": 0.08,  "cache_write": 1.00},
-    {"family": "claude-haiku-3",    "input": 0.25,  "output": 1.25,  "cache_read": 0.03,  "cache_write": 0.30},
+    {"family": "claude-opus-4-7",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25,   "cache_write_1h": 10.0},
+    {"family": "claude-opus-4-6",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25,   "cache_write_1h": 10.0},
+    {"family": "claude-opus-4-5",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25,   "cache_write_1h": 10.0},
+    {"family": "claude-opus-4",     "input": 15.0,  "output": 75.0,  "cache_read": 1.50,  "cache_write": 18.75,  "cache_write_1h": 30.0},
+    {"family": "claude-sonnet-4",   "input": 3.0,   "output": 15.0,  "cache_read": 0.30,  "cache_write": 3.75,   "cache_write_1h": 6.0},
+    {"family": "claude-sonnet-3",   "input": 3.0,   "output": 15.0,  "cache_read": 0.30,  "cache_write": 3.75,   "cache_write_1h": 6.0},
+    {"family": "claude-haiku-4",    "input": 1.0,   "output": 5.0,   "cache_read": 0.10,  "cache_write": 1.25,   "cache_write_1h": 2.0},
+    {"family": "claude-haiku-3-5",  "input": 0.80,  "output": 4.0,   "cache_read": 0.08,  "cache_write": 1.00,   "cache_write_1h": 1.60},
+    {"family": "claude-haiku-3",    "input": 0.25,  "output": 1.25,  "cache_read": 0.03,  "cache_write": 0.30,   "cache_write_1h": 0.50},
 ]
 
 SONNET_RATES = RATES[4]  # fallback
@@ -49,13 +51,15 @@ def get_rates(model: str) -> dict:
     return SONNET_RATES
 
 
-def calculate_cost(model: str, input_t: int, output_t: int, cache_read: int, cache_write: int) -> float:
+def calculate_cost(model: str, input_t: int, output_t: int, cache_read: int,
+                   cache_write: int, cache_write_1h: int = 0) -> float:
     r = get_rates(model)
     return (
         input_t / 1_000_000 * r["input"]
         + output_t / 1_000_000 * r["output"]
         + cache_read / 1_000_000 * r["cache_read"]
         + cache_write / 1_000_000 * r["cache_write"]
+        + cache_write_1h / 1_000_000 * r["cache_write_1h"]
     )
 
 
@@ -432,9 +436,19 @@ def parse_lines(lines: list[str]) -> list[dict]:
         input_t = usage.get("input_tokens", 0)
         output_t = usage.get("output_tokens", 0)
         cache_read = usage.get("cache_read_input_tokens", 0)
-        cache_write = usage.get("cache_creation_input_tokens", 0)
 
-        if input_t == 0 and output_t == 0 and cache_read == 0 and cache_write == 0:
+        # Prefer nested cache_creation.{ephemeral_5m,ephemeral_1h}_input_tokens
+        # — 1h cache writes cost 2× input vs 1.25× for 5m, and Claude Code
+        # commonly uses the 1h tier. Fall back to flat cache_creation_input_tokens
+        # as all-5m for older logs that didn't emit the split.
+        cc = usage.get("cache_creation") or {}
+        cache_write = cc.get("ephemeral_5m_input_tokens", 0)
+        cache_write_1h = cc.get("ephemeral_1h_input_tokens", 0)
+        if not cc:
+            cache_write = usage.get("cache_creation_input_tokens", 0)
+
+        if (input_t == 0 and output_t == 0 and cache_read == 0
+                and cache_write == 0 and cache_write_1h == 0):
             continue
 
         entry = {
@@ -444,6 +458,7 @@ def parse_lines(lines: list[str]) -> list[dict]:
             "output": output_t,
             "cache_read": cache_read,
             "cache_write": cache_write,
+            "cache_write_1h": cache_write_1h,
         }
 
         req_id = event.get("requestId", "")
@@ -471,15 +486,17 @@ def parse_events(files: list[str]) -> list[dict]:
 # ── Hook data parsing ──────────────────────────────────────────────────
 
 def parse_hook_events(cctrack_dir: Path | None = None) -> list[dict]:
-    """Parse statusline-*.jsonl files. Dedup by session_id (last entry by _ts wins).
-    Also reads legacy statusline.jsonl for migration.
-    Returns list of {date_str, cost_usd, input_tokens, output_tokens, cache_read, cache_write, model, session_id}."""
+    """Parse statusline-*.jsonl files. For each (session_id, date) pair, keeps the
+    entry with the latest _ts — the session's cumulative values as of end-of-day
+    for that date. Also reads legacy statusline.jsonl for migration.
+    Returns list of {date_str, session_id, cost_usd, input_tokens, output_tokens,
+    cache_read, cache_write, model}."""
     if cctrack_dir is None:
         cctrack_dir = CCTRACK_DIR
     if not cctrack_dir.exists():
         return []
 
-    by_session: dict[str, dict] = {}
+    by_session_day: dict[tuple[str, str], dict] = {}
 
     files = sorted(cctrack_dir.glob("statusline-*.jsonl"))
     legacy = cctrack_dir / "statusline.jsonl"
@@ -506,25 +523,26 @@ def parse_hook_events(cctrack_dir: Path | None = None) -> list[dict]:
                     if not ts:
                         continue
 
-                    if session_id in by_session:
-                        existing_ts = by_session[session_id].get("_ts", "")
-                        if ts <= existing_ts:
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except (ValueError, AttributeError):
+                        continue
+                    date_str = dt.strftime("%Y-%m-%d")
+
+                    key = (session_id, date_str)
+                    if key in by_session_day:
+                        if ts <= by_session_day[key].get("_ts", ""):
                             continue
 
-                    by_session[session_id] = entry
+                    entry["_date_str"] = date_str
+                    by_session_day[key] = entry
         except (OSError, IOError):
             continue
 
     results = []
-    for session_id, entry in by_session.items():
-        ts = entry.get("_ts", "")
-        try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
-            continue
-
+    for (session_id, date_str), entry in by_session_day.items():
         results.append({
-            "date_str": dt.strftime("%Y-%m-%d"),
+            "date_str": date_str,
             "cost_usd": float(entry.get("cost_usd", 0.0)),
             "input_tokens": int(entry.get("input_tokens", 0)),
             "output_tokens": int(entry.get("output_tokens", 0)),
@@ -535,6 +553,50 @@ def parse_hook_events(cctrack_dir: Path | None = None) -> list[dict]:
         })
 
     return results
+
+
+def compute_hook_deltas(events: list[dict]) -> list[dict]:
+    """Convert per-(session, date) cumulative records into per-(session, date)
+    daily deltas. For each session, sorts its records by date and computes
+    day-over-day deltas for cost_usd, input_tokens, output_tokens. The first
+    visible day for a session uses 0 as the prior cumulative. Cache fields are
+    snapshot (not cumulative), so they're passed through unchanged. Records
+    with zero cost delta and zero token delta are dropped."""
+    by_session: dict[str, list[dict]] = defaultdict(list)
+    for e in events:
+        by_session[e["session_id"]].append(e)
+
+    result = []
+    for sid, session_events in by_session.items():
+        session_events.sort(key=lambda e: e["date_str"])
+        prev_cost = 0.0
+        prev_in = 0
+        prev_out = 0
+        for e in session_events:
+            cost = float(e.get("cost_usd", 0.0))
+            in_t = int(e.get("input_tokens", 0))
+            out_t = int(e.get("output_tokens", 0))
+
+            d_cost = max(0.0, cost - prev_cost)
+            d_in = max(0, in_t - prev_in)
+            d_out = max(0, out_t - prev_out)
+
+            prev_cost, prev_in, prev_out = cost, in_t, out_t
+
+            if d_cost == 0.0 and d_in == 0 and d_out == 0:
+                continue
+
+            result.append({
+                "date_str": e["date_str"],
+                "session_id": sid,
+                "cost_usd": d_cost,
+                "input_tokens": d_in,
+                "output_tokens": d_out,
+                "cache_read": int(e.get("cache_read", 0)),
+                "cache_write": int(e.get("cache_write", 0)),
+                "model": e.get("model", ""),
+            })
+    return result
 
 
 def load_monthly_hook_summaries(cctrack_dir: Path | None = None) -> dict:
@@ -561,7 +623,10 @@ def load_monthly_hook_summaries(cctrack_dir: Path | None = None) -> dict:
 
 def rollup_old_hook_files(cctrack_dir: Path | None = None,
                           retention_days: int = HOOK_RETENTION_DAYS) -> None:
-    """Roll up daily JSONL files older than retention_days into monthly summaries, then delete them."""
+    """Roll up daily JSONL files older than retention_days into monthly summaries,
+    then delete them. Computes per-session daily deltas within the rollup pass so
+    a session spanning multiple days contributes correctly to each day (rather
+    than double-counting cumulative values across days)."""
     if cctrack_dir is None:
         cctrack_dir = CCTRACK_DIR
     if not cctrack_dir.exists():
@@ -569,12 +634,21 @@ def rollup_old_hook_files(cctrack_dir: Path | None = None,
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).strftime("%Y-%m-%d")
 
+    old_paths: list[tuple[str, Path]] = []
     for path in sorted(cctrack_dir.glob("statusline-*.jsonl")):
         date_str = path.stem.replace("statusline-", "")
         if not date_str or date_str >= cutoff:
             continue
+        old_paths.append((date_str, path))
 
-        by_session: dict[str, dict] = {}
+    if not old_paths:
+        return
+
+    # Parse all old files into per-(session, date) latest cumulative snapshots.
+    by_session_day: dict[tuple[str, str], dict] = {}
+    empty_paths: list[Path] = []
+    for date_str, path in old_paths:
+        had_any_row = False
         try:
             with open(path, "r", errors="replace") as f:
                 for line in f:
@@ -589,35 +663,68 @@ def rollup_old_hook_files(cctrack_dir: Path | None = None,
                     ts = entry.get("_ts", "")
                     if not sid or not ts:
                         continue
-                    if sid in by_session and ts <= by_session[sid].get("_ts", ""):
+                    had_any_row = True
+                    key = (sid, date_str)
+                    if key in by_session_day and ts <= by_session_day[key].get("_ts", ""):
                         continue
-                    by_session[sid] = entry
+                    by_session_day[key] = entry
         except (OSError, IOError):
             continue
 
-        if not by_session:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-            continue
+        if not had_any_row:
+            empty_paths.append(path)
 
-        day_cost = sum(float(e.get("cost_usd", 0.0)) for e in by_session.values())
-        day_sessions = len(by_session)
+    # Compute per-session per-day deltas by walking each session chronologically.
+    by_session: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for (sid, date_str), entry in by_session_day.items():
+        by_session[sid].append((date_str, entry))
 
+    day_costs: dict[str, float] = defaultdict(float)
+    day_session_ids: dict[str, set] = defaultdict(set)
+
+    for sid, records in by_session.items():
+        records.sort(key=lambda r: r[0])
+        prev_cost = 0.0
+        for date_str, entry in records:
+            cost = float(entry.get("cost_usd", 0.0))
+            delta = max(0.0, cost - prev_cost)
+            prev_cost = cost
+            day_costs[date_str] += delta
+            day_session_ids[date_str].add(sid)
+
+    # Write per-day deltas into the appropriate monthly file and delete dailies.
+    by_month: dict[str, dict] = {}
+    for date_str in sorted(day_costs.keys()):
         month_str = date_str[:7]
+        if month_str not in by_month:
+            monthly_path = cctrack_dir / f"monthly-{month_str}.json"
+            if monthly_path.exists():
+                try:
+                    by_month[month_str] = json.loads(monthly_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    by_month[month_str] = {"month": month_str, "days": {}}
+            else:
+                by_month[month_str] = {"month": month_str, "days": {}}
+            by_month[month_str].setdefault("days", {})
+        by_month[month_str]["days"][date_str] = {
+            "cost": day_costs[date_str],
+            "sessions": len(day_session_ids[date_str]),
+        }
+
+    for month_str, data in by_month.items():
         monthly_path = cctrack_dir / f"monthly-{month_str}.json"
-        monthly_data: dict = {"month": month_str, "days": {}}
-        if monthly_path.exists():
-            try:
-                monthly_data = json.loads(monthly_path.read_text())
-            except (json.JSONDecodeError, OSError):
-                monthly_data = {"month": month_str, "days": {}}
-
-        monthly_data["days"][date_str] = {"cost": day_cost, "sessions": day_sessions}
-
         try:
-            monthly_path.write_text(json.dumps(monthly_data, indent=2) + "\n")
+            monthly_path.write_text(json.dumps(data, indent=2) + "\n")
+        except OSError:
+            pass
+
+    for _, path in old_paths:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    for path in empty_paths:
+        try:
             path.unlink()
         except OSError:
             pass
@@ -625,21 +732,38 @@ def rollup_old_hook_files(cctrack_dir: Path | None = None,
 
 def aggregate_hook_data(events: list[dict], monthly_summaries: dict | None = None) -> dict:
     """Aggregate hook events by date, merging with pre-aggregated monthly data.
-    Returns {date_str: {cost: float, sessions: int}}."""
+    Returns {date_str: {cost, sessions, input_tokens, output_tokens, cache_read, cache_write, models}}.
+    Note: cache_read/cache_write come from current_usage (snapshot of the last message's
+    context), so aggregating them is not strictly meaningful — treat as indicative only."""
+    def _empty() -> dict:
+        return {"cost": 0.0, "sessions": 0, "input_tokens": 0, "output_tokens": 0,
+                "cache_read": 0, "cache_write": 0, "models": {}}
+
     by_date: dict[str, dict] = {}
 
     if monthly_summaries:
         for date_str, data in monthly_summaries.items():
-            by_date[date_str] = {"cost": data["cost"], "sessions": data["sessions"]}
+            bucket = _empty()
+            bucket["cost"] = data["cost"]
+            bucket["sessions"] = data["sessions"]
+            by_date[date_str] = bucket
 
     recent_dates: set[str] = set()
     for e in events:
         date_str = e["date_str"]
         if date_str not in recent_dates:
-            by_date[date_str] = {"cost": 0.0, "sessions": 0}
+            by_date[date_str] = _empty()
             recent_dates.add(date_str)
-        by_date[date_str]["cost"] += e["cost_usd"]
-        by_date[date_str]["sessions"] += 1
+        bucket = by_date[date_str]
+        bucket["cost"] += e["cost_usd"]
+        bucket["sessions"] += 1
+        bucket["input_tokens"] += e.get("input_tokens", 0)
+        bucket["output_tokens"] += e.get("output_tokens", 0)
+        bucket["cache_read"] += e.get("cache_read", 0)
+        bucket["cache_write"] += e.get("cache_write", 0)
+        model = e.get("model", "")
+        if model:
+            bucket["models"][model] = bucket["models"].get(model, 0) + 1
 
     return by_date
 
@@ -647,14 +771,15 @@ def aggregate_hook_data(events: list[dict], monthly_summaries: dict | None = Non
 # ── Aggregation ─────────────────────────────────────────────────────────
 
 def new_bucket() -> dict:
-    return {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0}
+    return {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+            "cache_write_1h": 0, "cost": 0.0, "models": {}}
 
 
 def aggregate(events: list[dict]) -> tuple[dict, dict]:
     """
     Returns:
-        daily: {date_str: {input, output, cache_read, cache_write, cost}}
-        monthly: {month_str: {input, output, cache_read, cache_write, cost}}
+        daily: {date_str: {input, output, cache_read, cache_write, cache_write_1h, cost, models}}
+        monthly: {month_str: {input, output, cache_read, cache_write, cache_write_1h, cost, models}}
     """
     daily = defaultdict(new_bucket)
     monthly = defaultdict(new_bucket)
@@ -672,14 +797,20 @@ def aggregate(events: list[dict]) -> tuple[dict, dict]:
         date_str = dt.strftime("%Y-%m-%d")
         month_str = dt.strftime("%Y-%m")
 
-        cost = calculate_cost(e["model"], e["input"], e["output"], e["cache_read"], e["cache_write"])
+        cache_1h = e.get("cache_write_1h", 0)
+        cost = calculate_cost(e["model"], e["input"], e["output"],
+                              e["cache_read"], e["cache_write"], cache_1h)
+        model = e.get("model", "")
 
         for bucket in (daily[date_str], monthly[month_str]):
             bucket["input"] += e["input"]
             bucket["output"] += e["output"]
             bucket["cache_read"] += e["cache_read"]
             bucket["cache_write"] += e["cache_write"]
+            bucket["cache_write_1h"] += cache_1h
             bucket["cost"] += cost
+            if model:
+                bucket["models"][model] = bucket["models"].get(model, 0) + 1
 
     return dict(daily), dict(monthly)
 
@@ -690,8 +821,26 @@ def format_tokens(n: int) -> str:
     return f"{n:,}"
 
 
+def format_model(models: dict) -> str:
+    """Format a model counter dict as 'short-name' or 'short-name+N' when
+    multiple models appear. Returns empty string for no models.
+    Strips the 'claude-' prefix and any trailing YYYYMMDD date suffix."""
+    if not models:
+        return ""
+    ranked = sorted(models.items(), key=lambda kv: (-kv[1], kv[0]))
+    primary = ranked[0][0]
+    short = primary[len("claude-"):] if primary.startswith("claude-") else primary
+    parts = short.split("-")
+    if len(parts) > 1 and parts[-1].isdigit() and len(parts[-1]) == 8:
+        short = "-".join(parts[:-1])
+    if len(ranked) > 1:
+        short += f"+{len(ranked) - 1}"
+    return short
+
+
 def total_tokens(b: dict) -> int:
-    return b["input"] + b["output"] + b["cache_read"] + b["cache_write"]
+    return (b["input"] + b["output"] + b["cache_read"]
+            + b["cache_write"] + b.get("cache_write_1h", 0))
 
 
 def _compute_accuracy_factor(daily: dict, hook_daily: dict, hook_install_date: str | None) -> tuple[float, bool]:
@@ -796,12 +945,25 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
         print(f"{current_month_name} — month to date (day {day_of_month}, {days_active} active)")
         print("───────────────────────────────────────")
         if m:
-            print(f"  Input tokens:   {format_tokens(m['input']):>15}")
-            print(f"  Output tokens:  {format_tokens(m['output']):>15}")
-            if m['cache_read'] or m['cache_write']:
+            hook_in_mtd = sum(hook_daily.get(d, {}).get("input_tokens", 0) for d in current_days_all)
+            hook_out_mtd = sum(hook_daily.get(d, {}).get("output_tokens", 0) for d in current_days_all)
+            input_t = hook_in_mtd if hook_in_mtd else m["input"]
+            output_t = hook_out_mtd if hook_out_mtd else m["output"]
+            print(f"  Input tokens:   {format_tokens(input_t):>15}")
+            print(f"  Output tokens:  {format_tokens(output_t):>15}")
+            cache_w_total = m['cache_write'] + m.get('cache_write_1h', 0)
+            if m['cache_read'] or cache_w_total:
                 print(f"  Cache read:     {format_tokens(m['cache_read']):>15}")
-                print(f"  Cache write:    {format_tokens(m['cache_write']):>15}")
-            print(f"  Total tokens:   {format_tokens(total_tokens(m)):>15}")
+                print(f"  Cache write:    {format_tokens(cache_w_total):>15}")
+            total = input_t + output_t + m['cache_read'] + cache_w_total
+            print(f"  Total tokens:   {format_tokens(total):>15}")
+            mtd_model = format_model(m.get("models", {}))
+            if mtd_model:
+                print(f"  Model:          {mtd_model:>15}")
+
+        mtd_sessions = sum(hook_daily.get(d, {}).get("sessions", 0) for d in current_days_all)
+        if mtd_sessions:
+            print(f"  Sessions:       {mtd_sessions:>15}")
 
         if hook_install_date and est_days > 0:
             factor_source = "measured" if factor_is_measured else "estimated ~20-25%"
@@ -829,26 +991,32 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
     if current_month_days:
         print("Daily breakdown:")
         if hook_install_date:
-            print(f"  {'Date':<12} {'Input':>12} {'Output':>12} {'Cache R':>12} {'Cache W':>12} {'Cost':>10} {'':>3}")
-            print(f"  {'─'*12} {'─'*12} {'─'*12} {'─'*12} {'─'*12} {'─'*10} {'─'*3}")
+            print(f"  {'Date':<12} {'Input':>11} {'Output':>11} {'Cache R':>11} {'Cache W':>11} {'Sess':>5} {'Model':<12} {'Cost':>9} {'':>2}")
+            print(f"  {'─'*12} {'─'*11} {'─'*11} {'─'*11} {'─'*11} {'─'*5} {'─'*12} {'─'*9} {'─'*2}")
         else:
-            print(f"  {'Date':<12} {'Input':>12} {'Output':>12} {'Cache R':>12} {'Cache W':>12} {'Cost':>10}")
-            print(f"  {'─'*12} {'─'*12} {'─'*12} {'─'*12} {'─'*12} {'─'*10}")
+            print(f"  {'Date':<12} {'Input':>11} {'Output':>11} {'Cache R':>11} {'Cache W':>11} {'Model':<12} {'Cost':>9}")
+            print(f"  {'─'*12} {'─'*11} {'─'*11} {'─'*11} {'─'*11} {'─'*12} {'─'*9}")
         display_days = current_month_days
         if days is not None:
             display_days = display_days[:days]
         for date_str in display_days:
             cost, is_auth = _date_cost(date_str)
             d = daily.get(date_str)
-            input_t = d["input"] if d else 0
-            output_t = d["output"] if d else 0
+            hook = hook_daily.get(date_str, {})
+            hook_in = hook.get("input_tokens", 0)
+            hook_out = hook.get("output_tokens", 0)
+            input_t = hook_in if hook_in else (d["input"] if d else 0)
+            output_t = hook_out if hook_out else (d["output"] if d else 0)
             cache_r = d["cache_read"] if d else 0
-            cache_w = d["cache_write"] if d else 0
+            cache_w = (d["cache_write"] + d.get("cache_write_1h", 0)) if d else 0
+            model_str = format_model(d.get("models", {})) if d else format_model(hook.get("models", {}))
             if hook_install_date:
                 marker = "" if is_auth else "~"
-                print(f"  {date_str:<12} {format_tokens(input_t):>12} {format_tokens(output_t):>12} {format_tokens(cache_r):>12} {format_tokens(cache_w):>12} ${cost:>8.2f} {marker:>3}")
+                sessions = hook.get("sessions", 0)
+                sess_str = str(sessions) if sessions else "-"
+                print(f"  {date_str:<12} {format_tokens(input_t):>11} {format_tokens(output_t):>11} {format_tokens(cache_r):>11} {format_tokens(cache_w):>11} {sess_str:>5} {model_str:<12} ${cost:>7.2f} {marker:>2}")
             else:
-                print(f"  {date_str:<12} {format_tokens(input_t):>12} {format_tokens(output_t):>12} {format_tokens(cache_r):>12} {format_tokens(cache_w):>12} ${cost:>8.2f}")
+                print(f"  {date_str:<12} {format_tokens(input_t):>11} {format_tokens(output_t):>11} {format_tokens(cache_r):>11} {format_tokens(cache_w):>11} {model_str:<12} ${cost:>7.2f}")
 
     if hook_install_date and current_month_days:
         has_estimated = any(not _date_cost(d)[1] for d in current_month_days)
@@ -863,8 +1031,8 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
     if prev_months:
         print()
         print("Previous months:")
-        print(f"  {'Month':<12} {'Input':>12} {'Output':>12} {'Cache R':>12} {'Cache W':>12} {'Cost':>10}")
-        print(f"  {'─'*12} {'─'*12} {'─'*12} {'─'*12} {'─'*12} {'─'*10}")
+        print(f"  {'Month':<12} {'Input':>11} {'Output':>11} {'Cache R':>11} {'Cache W':>11} {'Model':<12} {'Cost':>9}")
+        print(f"  {'─'*12} {'─'*11} {'─'*11} {'─'*11} {'─'*11} {'─'*12} {'─'*9}")
         for month_str in prev_months:
             m = monthly.get(month_str)
             month_days_list = [d for d in prev_month_days if d.startswith(month_str)]
@@ -890,12 +1058,13 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
             input_t = m["input"] if m else 0
             output_t = m["output"] if m else 0
             cache_r = m["cache_read"] if m else 0
-            cache_w = m["cache_write"] if m else 0
+            cache_w = (m["cache_write"] + m.get("cache_write_1h", 0)) if m else 0
+            model_str = format_model(m.get("models", {})) if m else ""
 
-            cost_str = f"${month_cost:>8.2f}"
+            cost_str = f"${month_cost:>7.2f}"
             if hook_install_date and month_has_est and not month_has_hook:
                 cost_str += "  ~"
-            print(f"  {month_str + days_str:<12} {format_tokens(input_t):>12} {format_tokens(output_t):>12} {format_tokens(cache_r):>12} {format_tokens(cache_w):>12} {cost_str}")
+            print(f"  {month_str + days_str:<12} {format_tokens(input_t):>11} {format_tokens(output_t):>11} {format_tokens(cache_r):>11} {format_tokens(cache_w):>11} {model_str:<12} {cost_str}")
 
     print()
 
@@ -975,7 +1144,7 @@ def main():
         all_monthly: dict[str, dict] = {}
         for hdir in hook_dirs:
             rollup_old_hook_files(hdir)
-            all_hook_events.extend(parse_hook_events(hdir))
+            all_hook_events.extend(compute_hook_deltas(parse_hook_events(hdir)))
             for date_str, data in load_monthly_hook_summaries(hdir).items():
                 if date_str in all_monthly:
                     all_monthly[date_str]["cost"] += data["cost"]

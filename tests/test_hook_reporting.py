@@ -159,6 +159,106 @@ def test_parse_hook_events_reads_legacy_file():
         assert events[0]["session_id"] == "legacy_1"
 
 
+def test_parse_hook_events_session_spans_multiple_days():
+    """A session active on multiple days returns one record per (session, day)
+    with that day's maximum cumulative values."""
+    with tempfile.TemporaryDirectory() as d:
+        write_hook_jsonl(d, [
+            make_hook_entry(session_id="sA", ts="2026-04-14T10:00:00+00:00", cost_usd=2.00, input_tokens=100, output_tokens=50),
+            make_hook_entry(session_id="sA", ts="2026-04-14T18:00:00+00:00", cost_usd=5.00, input_tokens=300, output_tokens=150),
+        ], date="2026-04-14")
+        write_hook_jsonl(d, [
+            make_hook_entry(session_id="sA", ts="2026-04-15T09:00:00+00:00", cost_usd=8.00, input_tokens=500, output_tokens=250),
+            make_hook_entry(session_id="sA", ts="2026-04-15T16:00:00+00:00", cost_usd=12.00, input_tokens=800, output_tokens=400),
+        ], date="2026-04-15")
+        events = cctrack.parse_hook_events(cctrack_dir=Path(d))
+        by_date = {e["date_str"]: e for e in events}
+        assert len(events) == 2
+        assert by_date["2026-04-14"]["cost_usd"] == 5.00
+        assert by_date["2026-04-14"]["input_tokens"] == 300
+        assert by_date["2026-04-15"]["cost_usd"] == 12.00
+        assert by_date["2026-04-15"]["input_tokens"] == 800
+
+
+# ── compute_hook_deltas tests ──────────────────────────────────────────
+
+def test_compute_hook_deltas_single_day_session():
+    """Session visible on one day produces one delta equal to its cumulative."""
+    events = [
+        {"date_str": "2026-04-15", "session_id": "s1", "cost_usd": 3.0,
+         "input_tokens": 100, "output_tokens": 50, "cache_read": 0, "cache_write": 0, "model": "m"},
+    ]
+    deltas = cctrack.compute_hook_deltas(events)
+    assert len(deltas) == 1
+    assert deltas[0]["cost_usd"] == 3.0
+    assert deltas[0]["input_tokens"] == 100
+    assert deltas[0]["output_tokens"] == 50
+
+
+def test_compute_hook_deltas_session_spans_days():
+    """A session spanning days produces one delta per day, each being the
+    day-over-day increment rather than the cumulative value."""
+    events = [
+        {"date_str": "2026-04-14", "session_id": "sA", "cost_usd": 5.00,
+         "input_tokens": 300, "output_tokens": 150, "cache_read": 0, "cache_write": 0, "model": "m"},
+        {"date_str": "2026-04-15", "session_id": "sA", "cost_usd": 12.00,
+         "input_tokens": 800, "output_tokens": 400, "cache_read": 0, "cache_write": 0, "model": "m"},
+    ]
+    deltas = cctrack.compute_hook_deltas(events)
+    by_date = {d["date_str"]: d for d in deltas}
+    assert abs(by_date["2026-04-14"]["cost_usd"] - 5.00) < 0.001
+    assert abs(by_date["2026-04-15"]["cost_usd"] - 7.00) < 0.001
+    assert by_date["2026-04-14"]["input_tokens"] == 300
+    assert by_date["2026-04-15"]["input_tokens"] == 500
+    assert by_date["2026-04-14"]["output_tokens"] == 150
+    assert by_date["2026-04-15"]["output_tokens"] == 250
+
+
+def test_compute_hook_deltas_drops_zero_records():
+    """A record whose cumulative didn't advance from the prior day is dropped."""
+    events = [
+        {"date_str": "2026-04-14", "session_id": "sA", "cost_usd": 5.0,
+         "input_tokens": 100, "output_tokens": 50, "cache_read": 0, "cache_write": 0, "model": "m"},
+        {"date_str": "2026-04-15", "session_id": "sA", "cost_usd": 5.0,
+         "input_tokens": 100, "output_tokens": 50, "cache_read": 0, "cache_write": 0, "model": "m"},
+    ]
+    deltas = cctrack.compute_hook_deltas(events)
+    assert len(deltas) == 1
+    assert deltas[0]["date_str"] == "2026-04-14"
+
+
+def test_compute_hook_deltas_clamps_negatives():
+    """Cumulative values should never decrease, but if they do (bad data),
+    deltas clamp to zero rather than produce negative costs."""
+    events = [
+        {"date_str": "2026-04-14", "session_id": "sA", "cost_usd": 5.0,
+         "input_tokens": 100, "output_tokens": 50, "cache_read": 0, "cache_write": 0, "model": "m"},
+        {"date_str": "2026-04-15", "session_id": "sA", "cost_usd": 3.0,
+         "input_tokens": 80, "output_tokens": 40, "cache_read": 0, "cache_write": 0, "model": "m"},
+    ]
+    deltas = cctrack.compute_hook_deltas(events)
+    # Day 2 delta is negative, so it's dropped entirely (all-zero after clamping).
+    assert len(deltas) == 1
+    assert deltas[0]["date_str"] == "2026-04-14"
+
+
+def test_compute_hook_deltas_multiple_sessions_independent():
+    """Each session's deltas are computed independently."""
+    events = [
+        {"date_str": "2026-04-14", "session_id": "sA", "cost_usd": 10.0,
+         "input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_write": 0, "model": "m"},
+        {"date_str": "2026-04-15", "session_id": "sA", "cost_usd": 15.0,
+         "input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_write": 0, "model": "m"},
+        {"date_str": "2026-04-15", "session_id": "sB", "cost_usd": 4.0,
+         "input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_write": 0, "model": "m"},
+    ]
+    deltas = cctrack.compute_hook_deltas(events)
+    by_key = {(d["date_str"], d["session_id"]): d["cost_usd"] for d in deltas}
+    assert by_key[("2026-04-14", "sA")] == 10.0
+    assert by_key[("2026-04-15", "sA")] == 5.0
+    assert by_key[("2026-04-15", "sB")] == 4.0
+
+
 # ── aggregate_hook_data tests ──────────────────────────────────────────
 
 def test_aggregate_hook_data_single_day():
@@ -314,6 +414,35 @@ def test_rollup_appends_to_existing_monthly():
         assert "2025-12-02" in data["days"]
         assert data["days"]["2025-12-01"]["cost"] == 5.00
         assert data["days"]["2025-12-02"]["cost"] == 7.00
+
+
+def test_rollup_cross_day_session_attributes_deltas():
+    """A session active across multiple rolled-up days should have its
+    cumulative cost attributed as per-day deltas, not double-counted."""
+    with tempfile.TemporaryDirectory() as d:
+        # Session sA: cumulative rises 0 → 5 on day 1, 5 → 12 on day 2.
+        # Session sB: only active on day 2, cumulative rises 0 → 3.
+        write_hook_jsonl(d, [
+            make_hook_entry(session_id="sA", ts="2025-12-01T10:00:00+00:00", cost_usd=2.00),
+            make_hook_entry(session_id="sA", ts="2025-12-01T18:00:00+00:00", cost_usd=5.00),
+        ], date="2025-12-01")
+        write_hook_jsonl(d, [
+            make_hook_entry(session_id="sA", ts="2025-12-02T10:00:00+00:00", cost_usd=12.00),
+            make_hook_entry(session_id="sB", ts="2025-12-02T11:00:00+00:00", cost_usd=3.00),
+        ], date="2025-12-02")
+
+        cctrack.rollup_old_hook_files(cctrack_dir=Path(d), retention_days=0)
+
+        data = json.loads(Path(d, "monthly-2025-12.json").read_text())
+        # Day 1: sA delta = 5.00. Total = 5.00, 1 session.
+        assert abs(data["days"]["2025-12-01"]["cost"] - 5.00) < 0.001
+        assert data["days"]["2025-12-01"]["sessions"] == 1
+        # Day 2: sA delta = 12 - 5 = 7.00, sB delta = 3.00. Total = 10.00, 2 sessions.
+        assert abs(data["days"]["2025-12-02"]["cost"] - 10.00) < 0.001
+        assert data["days"]["2025-12-02"]["sessions"] == 2
+        # Sum equals actual session totals: sA $12 + sB $3 = $15.
+        total = sum(day["cost"] for day in data["days"].values())
+        assert abs(total - 15.00) < 0.001
 
 
 def test_rollup_deletes_empty_daily():

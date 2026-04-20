@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cctrack"
-version = "0.3.0"
+version = "0.4.0"
 description = "Claude Code cost tracker — scans JSONL logs and reports token usage + estimated cost"
 readme = "README.md"
 license = "MIT"

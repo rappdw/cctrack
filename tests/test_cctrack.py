@@ -172,6 +172,62 @@ def test_calculate_cost_zero_tokens():
     assert cost == 0.0
 
 
+def test_calculate_cost_1h_cache_write():
+    # Opus 4.7: 1M 1h-cache-write tokens at $10/M = $10.00 (2× input rate)
+    cost = cctrack.calculate_cost("claude-opus-4-7", 0, 0, 0, 0, 1_000_000)
+    assert abs(cost - 10.0) < 0.001
+
+
+def test_calculate_cost_1h_vs_5m_cache_write_differ():
+    # Same 1M tokens priced differently depending on TTL.
+    cost_5m = cctrack.calculate_cost("claude-opus-4-7", 0, 0, 0, 1_000_000, 0)
+    cost_1h = cctrack.calculate_cost("claude-opus-4-7", 0, 0, 0, 0, 1_000_000)
+    assert abs(cost_5m - 6.25) < 0.001
+    assert abs(cost_1h - 10.0) < 0.001
+
+
+def test_get_rates_include_1h_cache_write():
+    # Every family should expose a cache_write_1h rate at 2× input.
+    for r in cctrack.RATES:
+        assert "cache_write_1h" in r
+        assert abs(r["cache_write_1h"] - 2.0 * r["input"]) < 0.001
+
+
+def test_parse_lines_extracts_1h_cache_split():
+    # Nested cache_creation.ephemeral_{5m,1h}_input_tokens should be picked up.
+    event = make_event()
+    event["message"]["usage"]["cache_creation_input_tokens"] = 1000
+    event["message"]["usage"]["cache_creation"] = {
+        "ephemeral_5m_input_tokens": 300,
+        "ephemeral_1h_input_tokens": 700,
+    }
+    events = cctrack.parse_lines([json.dumps(event)])
+    assert len(events) == 1
+    assert events[0]["cache_write"] == 300
+    assert events[0]["cache_write_1h"] == 700
+
+
+def test_parse_lines_flat_cache_creation_treated_as_5m():
+    # Legacy logs without the nested object treat the flat field as 5m.
+    event = make_event(cache_write=1000)
+    events = cctrack.parse_lines([json.dumps(event)])
+    assert len(events) == 1
+    assert events[0]["cache_write"] == 1000
+    assert events[0]["cache_write_1h"] == 0
+
+
+def test_aggregate_1h_cache_cost():
+    # 1M 1h-cache-write tokens on opus-4-7 → $10 via aggregation.
+    events = [
+        {"model": "claude-opus-4-7", "timestamp": "2026-03-15T10:00:00Z",
+         "input": 0, "output": 0, "cache_read": 0,
+         "cache_write": 0, "cache_write_1h": 1_000_000},
+    ]
+    daily, monthly = cctrack.aggregate(events)
+    assert abs(daily["2026-03-15"]["cost"] - 10.0) < 0.001
+    assert daily["2026-03-15"]["cache_write_1h"] == 1_000_000
+
+
 # ── File discovery tests ───────────────────────────────────────────────
 
 def test_discover_files_finds_jsonl():
