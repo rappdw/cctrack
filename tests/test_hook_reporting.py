@@ -259,6 +259,107 @@ def test_compute_hook_deltas_multiple_sessions_independent():
     assert by_key[("2026-04-15", "sB")] == 4.0
 
 
+# ── Remote hook data tests ─────────────────────────────────────────────
+
+def _remote_raw(hook_chunks: list[list[dict]], monthly_chunks: list[dict]) -> str:
+    """Build a raw SSH output stream the way fetch_remote_hook_data returns it."""
+    parts = []
+    for entries in hook_chunks:
+        parts.append(cctrack.HOOK_FILE_SEP)
+        for e in entries:
+            parts.append(json.dumps(e))
+    for doc in monthly_chunks:
+        parts.append(cctrack.MONTHLY_FILE_SEP)
+        parts.append(json.dumps(doc))
+    return "\n".join(parts) + "\n"
+
+
+def test_parse_remote_hook_data_basic():
+    """Statusline entries and monthly summaries are both parsed from the stream."""
+    raw = _remote_raw(
+        hook_chunks=[
+            [make_hook_entry(session_id="r1", ts="2026-04-15T10:00:00+00:00", cost_usd=3.00)],
+            [make_hook_entry(session_id="r2", ts="2026-04-16T10:00:00+00:00", cost_usd=7.00)],
+        ],
+        monthly_chunks=[
+            {"month": "2026-01", "days": {"2026-01-10": {"cost": 10.0, "sessions": 2}}},
+        ],
+    )
+    with patch("cctrack.fetch_remote_hook_data", return_value=raw):
+        events, monthly = cctrack.parse_remote_hook_data("fakehost")
+    assert len(events) == 2
+    by_session = {e["session_id"]: e for e in events}
+    assert by_session["r1"]["cost_usd"] == 3.00
+    assert by_session["r2"]["date_str"] == "2026-04-16"
+    assert monthly == {"2026-01-10": {"cost": 10.0, "sessions": 2}}
+
+
+def test_parse_remote_hook_data_dedup_across_files():
+    """Same (session, date) in multiple remote files: latest _ts wins."""
+    raw = _remote_raw(
+        hook_chunks=[
+            [make_hook_entry(session_id="rA", ts="2026-04-15T10:00:00+00:00", cost_usd=2.00)],
+            [make_hook_entry(session_id="rA", ts="2026-04-15T18:00:00+00:00", cost_usd=6.00)],
+        ],
+        monthly_chunks=[],
+    )
+    with patch("cctrack.fetch_remote_hook_data", return_value=raw):
+        events, monthly = cctrack.parse_remote_hook_data("fakehost")
+    assert len(events) == 1
+    assert events[0]["cost_usd"] == 6.00
+
+
+def test_parse_remote_hook_data_empty():
+    with patch("cctrack.fetch_remote_hook_data", return_value=""):
+        events, monthly = cctrack.parse_remote_hook_data("fakehost")
+    assert events == []
+    assert monthly == {}
+
+
+def test_parse_remote_hook_data_malformed_monthly_skipped():
+    raw = (cctrack.HOOK_FILE_SEP + "\n"
+           + json.dumps(make_hook_entry(session_id="ok", cost_usd=1.0)) + "\n"
+           + cctrack.MONTHLY_FILE_SEP + "\n"
+           + "not json\n")
+    with patch("cctrack.fetch_remote_hook_data", return_value=raw):
+        events, monthly = cctrack.parse_remote_hook_data("fakehost")
+    assert len(events) == 1
+    assert monthly == {}
+
+
+def test_fetch_remote_hook_data_timeout():
+    with patch("subprocess.run", side_effect=cctrack.subprocess.TimeoutExpired("ssh", 60)):
+        result = cctrack.fetch_remote_hook_data("fakehost")
+    assert result == ""
+
+
+def test_merge_monthly_summaries_sums_overlapping_dates():
+    """Same date on two hosts sums cost and sessions."""
+    target = {"2026-01-10": {"cost": 10.0, "sessions": 2}}
+    cctrack.merge_monthly_summaries(target, {
+        "2026-01-10": {"cost": 5.0, "sessions": 1},
+        "2026-01-11": {"cost": 3.0, "sessions": 1},
+    })
+    assert target["2026-01-10"] == {"cost": 15.0, "sessions": 3}
+    assert target["2026-01-11"] == {"cost": 3.0, "sessions": 1}
+
+
+def test_remote_and_local_hook_costs_sum_per_date():
+    """Regression: a date covered by hooks on two hosts must sum both hosts'
+    costs, not keep just one host's value."""
+    local_events = cctrack.compute_hook_deltas([
+        {"date_str": "2026-06-11", "session_id": "local_s", "cost_usd": 9.05,
+         "input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_write": 0, "model": "m"},
+    ])
+    remote_events = cctrack.compute_hook_deltas([
+        {"date_str": "2026-06-11", "session_id": "air_s", "cost_usd": 340.90,
+         "input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_write": 0, "model": "m"},
+    ])
+    hook_daily = cctrack.aggregate_hook_data(local_events + remote_events)
+    assert abs(hook_daily["2026-06-11"]["cost"] - 349.95) < 0.001
+    assert hook_daily["2026-06-11"]["sessions"] == 2
+
+
 # ── aggregate_hook_data tests ──────────────────────────────────────────
 
 def test_aggregate_hook_data_single_day():

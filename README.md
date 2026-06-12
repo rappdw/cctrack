@@ -61,11 +61,14 @@ Daily breakdown:
 
 ## Remote aggregation
 
-With `--remote`, cctrack SSHs to each host (one call per host) and streams back all JSONL content for local parsing. Requires SSH key auth.
+With `--remote`, cctrack SSHs to each host and streams back both the JSONL logs and the host's statusline hook data (`~/.claude/cctrack/`) for local parsing, so authoritative hook costs from every machine are summed per day. Requires SSH key auth.
 
 ```bash
 # Aggregate this machine + DGX server + laptop
 cctrack --remote dgx macbook-air
+
+# For accurate aggregate costs, install the hook on each host too
+cctrack --install-hook --remote dgx macbook-air
 ```
 
 ## Rate card

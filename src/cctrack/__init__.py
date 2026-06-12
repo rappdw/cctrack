@@ -126,6 +126,84 @@ def parse_remote_events(host: str) -> list[dict]:
     return all_events
 
 
+HOOK_FILE_SEP = "___CCTRACK_HOOK_FILE___"
+MONTHLY_FILE_SEP = "___CCTRACK_MONTHLY_FILE___"
+
+# Hook data locations on remote hosts: the host's own cctrack dir plus any
+# Sandy sandbox equivalents (mirrors discover_hook_data_dirs).
+REMOTE_HOOK_DIRS = "~/.claude/cctrack ~/.sandy/sandboxes"
+
+
+def fetch_remote_hook_data(host: str) -> str:
+    """SSH to host and cat all statusline JSONL + monthly summary files.
+    Returns raw output with file-type separators."""
+    remote_cmd = (
+        f"find {REMOTE_HOOK_DIRS} -name 'statusline*.jsonl' "
+        f"-exec echo '{HOOK_FILE_SEP}' \\; -exec cat {{}} \\; 2>/dev/null; "
+        f"find {REMOTE_HOOK_DIRS} -name 'monthly-*.json' "
+        f"-exec echo '{MONTHLY_FILE_SEP}' \\; -exec cat {{}} \\; 2>/dev/null; "
+        f"true"
+    )
+    cmd = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, remote_cmd]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0 and not result.stdout:
+            print(f"  Warning: SSH to {host} failed: {result.stderr.strip()}", file=sys.stderr)
+            return ""
+        return result.stdout
+    except subprocess.TimeoutExpired:
+        print(f"  Warning: SSH to {host} timed out", file=sys.stderr)
+        return ""
+    except FileNotFoundError:
+        print(f"  Warning: ssh command not found", file=sys.stderr)
+        return ""
+
+
+def parse_remote_hook_data(host: str) -> tuple[list[dict], dict]:
+    """Fetch and parse hook data from a remote host.
+    Returns (hook_events, monthly_summaries) in the same shapes as
+    parse_hook_events and load_monthly_hook_summaries."""
+    raw = fetch_remote_hook_data(host)
+    if not raw:
+        return [], {}
+
+    # Statusline chunks come first, monthly chunks after (find order above).
+    head, _, monthly_raw = raw.partition(MONTHLY_FILE_SEP)
+
+    lines: list[str] = []
+    for chunk in head.split(HOOK_FILE_SEP):
+        lines.extend(chunk.splitlines())
+    events = _hook_events_from_lines(lines)
+
+    monthly: dict[str, dict] = {}
+    for chunk in monthly_raw.split(MONTHLY_FILE_SEP):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            data = json.loads(chunk)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        for date_str, day_data in data.get("days", {}).items():
+            entry = {
+                "cost": float(day_data.get("cost", 0.0)),
+                "sessions": int(day_data.get("sessions", 0)),
+            }
+            merge_monthly_summaries(monthly, {date_str: entry})
+    return events, monthly
+
+
+def merge_monthly_summaries(target: dict, source: dict) -> None:
+    """Merge per-date {cost, sessions} summaries from source into target,
+    summing where dates overlap (e.g. same day on multiple hosts)."""
+    for date_str, data in source.items():
+        if date_str in target:
+            target[date_str]["cost"] += data["cost"]
+            target[date_str]["sessions"] += data["sessions"]
+        else:
+            target[date_str] = dict(data)
+
+
 # ── Hook infrastructure ───────────────────────────────────────────────
 
 HOOK_SCRIPT = """\
@@ -485,59 +563,42 @@ def parse_events(files: list[str]) -> list[dict]:
 
 # ── Hook data parsing ──────────────────────────────────────────────────
 
-def parse_hook_events(cctrack_dir: Path | None = None) -> list[dict]:
-    """Parse statusline-*.jsonl files. For each (session_id, date) pair, keeps the
+def _hook_events_from_lines(lines) -> list[dict]:
+    """Parse statusline JSONL lines. For each (session_id, date) pair, keeps the
     entry with the latest _ts — the session's cumulative values as of end-of-day
-    for that date. Also reads legacy statusline.jsonl for migration.
-    Returns list of {date_str, session_id, cost_usd, input_tokens, output_tokens,
-    cache_read, cache_write, model}."""
-    if cctrack_dir is None:
-        cctrack_dir = CCTRACK_DIR
-    if not cctrack_dir.exists():
-        return []
-
+    for that date. Returns list of {date_str, session_id, cost_usd, input_tokens,
+    output_tokens, cache_read, cache_write, model}."""
     by_session_day: dict[tuple[str, str], dict] = {}
 
-    files = sorted(cctrack_dir.glob("statusline-*.jsonl"))
-    legacy = cctrack_dir / "statusline.jsonl"
-    if legacy.exists():
-        files.append(legacy)
-
-    for filepath in files:
-        try:
-            with open(filepath, "r", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-
-                    session_id = entry.get("session_id", "")
-                    if not session_id:
-                        continue
-
-                    ts = entry.get("_ts", "")
-                    if not ts:
-                        continue
-
-                    try:
-                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    except (ValueError, AttributeError):
-                        continue
-                    date_str = dt.strftime("%Y-%m-%d")
-
-                    key = (session_id, date_str)
-                    if key in by_session_day:
-                        if ts <= by_session_day[key].get("_ts", ""):
-                            continue
-
-                    entry["_date_str"] = date_str
-                    by_session_day[key] = entry
-        except (OSError, IOError):
+    for line in lines:
+        line = line.strip()
+        if not line:
             continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        session_id = entry.get("session_id", "")
+        if not session_id:
+            continue
+
+        ts = entry.get("_ts", "")
+        if not ts:
+            continue
+
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        date_str = dt.strftime("%Y-%m-%d")
+
+        key = (session_id, date_str)
+        if key in by_session_day:
+            if ts <= by_session_day[key].get("_ts", ""):
+                continue
+
+        by_session_day[key] = entry
 
     results = []
     for (session_id, date_str), entry in by_session_day.items():
@@ -553,6 +614,31 @@ def parse_hook_events(cctrack_dir: Path | None = None) -> list[dict]:
         })
 
     return results
+
+
+def parse_hook_events(cctrack_dir: Path | None = None) -> list[dict]:
+    """Parse statusline-*.jsonl files from a local hook data directory.
+    Also reads legacy statusline.jsonl for migration. See _hook_events_from_lines
+    for the per-(session, date) dedup semantics."""
+    if cctrack_dir is None:
+        cctrack_dir = CCTRACK_DIR
+    if not cctrack_dir.exists():
+        return []
+
+    files = sorted(cctrack_dir.glob("statusline-*.jsonl"))
+    legacy = cctrack_dir / "statusline.jsonl"
+    if legacy.exists():
+        files.append(legacy)
+
+    lines: list[str] = []
+    for filepath in files:
+        try:
+            with open(filepath, "r", errors="replace") as f:
+                lines.extend(f.readlines())
+        except (OSError, IOError):
+            continue
+
+    return _hook_events_from_lines(lines)
 
 
 def compute_hook_deltas(events: list[dict]) -> list[dict]:
@@ -1138,21 +1224,33 @@ def main():
         except (ValueError, AttributeError):
             pass
 
-    hook_dirs = discover_hook_data_dirs()
-    if hook_dirs:
-        all_hook_events: list[dict] = []
-        all_monthly: dict[str, dict] = {}
-        for hdir in hook_dirs:
-            rollup_old_hook_files(hdir)
-            all_hook_events.extend(compute_hook_deltas(parse_hook_events(hdir)))
-            for date_str, data in load_monthly_hook_summaries(hdir).items():
-                if date_str in all_monthly:
-                    all_monthly[date_str]["cost"] += data["cost"]
-                    all_monthly[date_str]["sessions"] += data["sessions"]
-                else:
-                    all_monthly[date_str] = dict(data)
-        if all_hook_events or all_monthly:
-            hook_daily = aggregate_hook_data(all_hook_events, all_monthly)
+    all_hook_events: list[dict] = []
+    all_monthly: dict[str, dict] = {}
+
+    for hdir in discover_hook_data_dirs():
+        rollup_old_hook_files(hdir)
+        all_hook_events.extend(compute_hook_deltas(parse_hook_events(hdir)))
+        merge_monthly_summaries(all_monthly, load_monthly_hook_summaries(hdir))
+
+    # Remote hook data: each host's deltas are computed independently so a
+    # session's cumulative history never mixes across hosts.
+    if args.remote:
+        for host in args.remote:
+            remote_hook_events, remote_monthly = parse_remote_hook_data(host)
+            all_hook_events.extend(compute_hook_deltas(remote_hook_events))
+            merge_monthly_summaries(all_monthly, remote_monthly)
+
+    if all_hook_events or all_monthly:
+        hook_daily = aggregate_hook_data(all_hook_events, all_monthly)
+
+    # Hook coverage may start earlier than the local install date (e.g. a
+    # remote host installed the hook first). Treat the earliest observed
+    # hook date as the effective install date so those days count as
+    # authoritative rather than being scaled by the accuracy factor.
+    if hook_daily:
+        earliest_hook_date = min(hook_daily.keys())
+        if hook_install_date is None or earliest_hook_date < hook_install_date:
+            hook_install_date = earliest_hook_date
 
     # Suggest hook if not installed
     if not is_hook_installed():
