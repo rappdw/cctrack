@@ -73,18 +73,19 @@ cctrack --install-hook --remote dgx macbook-air
 
 ## Rate card
 
-Prices per million tokens, from [Anthropic's pricing page](https://www.anthropic.com/pricing):
+Prices per million tokens, from [Anthropic's pricing page](https://www.anthropic.com/pricing). Cache writes are priced per TTL: 5-minute at 1.25× input, 1-hour at 2× input.
 
-| Model | Input | Output | Cache Read | Cache Write |
-|---|---|---|---|---|
-| Opus 4.7 / 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 |
-| Opus 4 / 4.1 | $15.00 | $75.00 | $1.50 | $18.75 |
-| Sonnet 4.x / 3.7 | $3.00 | $15.00 | $0.30 | $3.75 |
-| Haiku 4.x | $1.00 | $5.00 | $0.10 | $1.25 |
-| Haiku 3.5 | $0.80 | $4.00 | $0.08 | $1.00 |
-| Haiku 3 | $0.25 | $1.25 | $0.03 | $0.30 |
+| Model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
+|---|---|---|---|---|---|
+| Fable 5 / Mythos 5 | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
+| Opus 4.8 / 4.7 / 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
+| Opus 4 / 4.1 | $15.00 | $75.00 | $1.50 | $18.75 | $30.00 |
+| Sonnet 5 / 4.x / 3.7 | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
+| Haiku 4.x | $1.00 | $5.00 | $0.10 | $1.25 | $2.00 |
+| Haiku 3.5 | $0.80 | $4.00 | $0.08 | $1.00 | $1.60 |
+| Haiku 3 | $0.25 | $1.25 | $0.03 | $0.30 | $0.50 |
 
-Unknown models fall back to Sonnet rates.
+Unknown models fall back to Sonnet rates and are flagged with `?` in the report's Model column.
 
 ## Origins
 

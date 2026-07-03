@@ -28,11 +28,17 @@ from pathlib import Path
 # otherwise match "claude-opus-4" and get the wrong rate.
 # cache_write is the 5-minute TTL rate (1.25× input); cache_write_1h is the
 # 1-hour TTL rate (2× input). Claude Code hits the 1h tier heavily in practice.
+# "claude-opus-4" (legacy Opus 4.0/4.1 at 15/75) MUST come after every
+# claude-opus-4-x entry — a new opus-4-N missing here would silently price 3× high.
 RATES = [
+    {"family": "claude-fable-5",    "input": 10.0,  "output": 50.0,  "cache_read": 1.00,  "cache_write": 12.50,  "cache_write_1h": 20.0},
+    {"family": "claude-mythos",     "input": 10.0,  "output": 50.0,  "cache_read": 1.00,  "cache_write": 12.50,  "cache_write_1h": 20.0},
+    {"family": "claude-opus-4-8",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25,   "cache_write_1h": 10.0},
     {"family": "claude-opus-4-7",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25,   "cache_write_1h": 10.0},
     {"family": "claude-opus-4-6",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25,   "cache_write_1h": 10.0},
     {"family": "claude-opus-4-5",   "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25,   "cache_write_1h": 10.0},
     {"family": "claude-opus-4",     "input": 15.0,  "output": 75.0,  "cache_read": 1.50,  "cache_write": 18.75,  "cache_write_1h": 30.0},
+    {"family": "claude-sonnet-5",   "input": 3.0,   "output": 15.0,  "cache_read": 0.30,  "cache_write": 3.75,   "cache_write_1h": 6.0},
     {"family": "claude-sonnet-4",   "input": 3.0,   "output": 15.0,  "cache_read": 0.30,  "cache_write": 3.75,   "cache_write_1h": 6.0},
     {"family": "claude-sonnet-3",   "input": 3.0,   "output": 15.0,  "cache_read": 0.30,  "cache_write": 3.75,   "cache_write_1h": 6.0},
     {"family": "claude-haiku-4",    "input": 1.0,   "output": 5.0,   "cache_read": 0.10,  "cache_write": 1.25,   "cache_write_1h": 2.0},
@@ -40,7 +46,7 @@ RATES = [
     {"family": "claude-haiku-3",    "input": 0.25,  "output": 1.25,  "cache_read": 0.03,  "cache_write": 0.30,   "cache_write_1h": 0.50},
 ]
 
-SONNET_RATES = RATES[4]  # fallback
+SONNET_RATES = next(r for r in RATES if r["family"] == "claude-sonnet-4")  # fallback
 
 
 def get_rates(model: str) -> dict:
@@ -49,6 +55,11 @@ def get_rates(model: str) -> dict:
         if model.startswith(r["family"]):
             return r
     return SONNET_RATES
+
+
+def is_known_model(model: str) -> bool:
+    """True if the model matches a rate-card family (i.e. wasn't priced by fallback)."""
+    return any(model.startswith(r["family"]) for r in RATES)
 
 
 def calculate_cost(model: str, input_t: int, output_t: int, cache_read: int,
@@ -112,22 +123,20 @@ def fetch_remote_jsonl(host: str) -> str:
 
 
 def parse_remote_events(host: str) -> list[dict]:
-    """Fetch and parse JSONL from a remote host via SSH."""
+    """Fetch and parse JSONL from a remote host via SSH.
+    Dedup by request_id across the host's files (resumed sessions)."""
     print(f"  Fetching from {host}...", file=sys.stderr)
     raw = fetch_remote_jsonl(host)
     if not raw:
         return []
 
     chunks = raw.split("___CCTRACK_FILE_SEP___")
-    all_events = []
-    for chunk in chunks:
-        events = parse_lines(chunk.splitlines())
-        all_events.extend(events)
-    return all_events
+    return dedup_events(parse_lines(chunk.splitlines()) for chunk in chunks)
 
 
 HOOK_FILE_SEP = "___CCTRACK_HOOK_FILE___"
 MONTHLY_FILE_SEP = "___CCTRACK_MONTHLY_FILE___"
+BASELINE_FILE_SEP = "___CCTRACK_BASELINE_FILE___"
 
 # Hook data locations on remote hosts: the host's own cctrack dir plus any
 # Sandy sandbox equivalents (mirrors discover_hook_data_dirs).
@@ -142,6 +151,8 @@ def fetch_remote_hook_data(host: str) -> str:
         f"-exec echo '{HOOK_FILE_SEP}' \\; -exec cat {{}} \\; 2>/dev/null; "
         f"find {REMOTE_HOOK_DIRS} -name 'monthly-*.json' "
         f"-exec echo '{MONTHLY_FILE_SEP}' \\; -exec cat {{}} \\; 2>/dev/null; "
+        f"find {REMOTE_HOOK_DIRS} -name 'session-baselines.json' "
+        f"-exec echo '{BASELINE_FILE_SEP}' \\; -exec cat {{}} \\; 2>/dev/null; "
         f"true"
     )
     cmd = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, remote_cmd]
@@ -159,16 +170,18 @@ def fetch_remote_hook_data(host: str) -> str:
         return ""
 
 
-def parse_remote_hook_data(host: str) -> tuple[list[dict], dict]:
+def parse_remote_hook_data(host: str) -> tuple[list[dict], dict, dict]:
     """Fetch and parse hook data from a remote host.
-    Returns (hook_events, monthly_summaries) in the same shapes as
-    parse_hook_events and load_monthly_hook_summaries."""
+    Returns (hook_events, monthly_summaries, session_baselines) in the same
+    shapes as parse_hook_events, load_monthly_hook_summaries, and
+    load_session_baselines."""
     raw = fetch_remote_hook_data(host)
     if not raw:
-        return [], {}
+        return [], {}, {}
 
-    # Statusline chunks come first, monthly chunks after (find order above).
-    head, _, monthly_raw = raw.partition(MONTHLY_FILE_SEP)
+    # Chunk order matches the find order above: statusline, monthly, baselines.
+    main_part, *baseline_chunks = raw.split(BASELINE_FILE_SEP)
+    head, _, monthly_raw = main_part.partition(MONTHLY_FILE_SEP)
 
     lines: list[str] = []
     for chunk in head.split(HOOK_FILE_SEP):
@@ -190,7 +203,22 @@ def parse_remote_hook_data(host: str) -> tuple[list[dict], dict]:
                 "sessions": int(day_data.get("sessions", 0)),
             }
             merge_monthly_summaries(monthly, {date_str: entry})
-    return events, monthly
+
+    baselines: dict[str, dict] = {}
+    for chunk in baseline_chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            data = json.loads(chunk)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(data, dict):
+            for sid, b in data.items():
+                # Session ids are unique per host; keep the newer date on clash.
+                if sid not in baselines or b.get("date", "") > baselines[sid].get("date", ""):
+                    baselines[sid] = b
+    return events, monthly, baselines
 
 
 def merge_monthly_summaries(target: dict, source: dict) -> None:
@@ -529,6 +557,7 @@ def parse_lines(lines: list[str]) -> list[dict]:
                 and cache_write == 0 and cache_write_1h == 0):
             continue
 
+        req_id = event.get("requestId", "")
         entry = {
             "model": event.get("message", {}).get("model", ""),
             "timestamp": event.get("timestamp", ""),
@@ -537,9 +566,9 @@ def parse_lines(lines: list[str]) -> list[dict]:
             "cache_read": cache_read,
             "cache_write": cache_write,
             "cache_write_1h": cache_write_1h,
+            "_request_id": req_id,
         }
 
-        req_id = event.get("requestId", "")
         if req_id:
             by_request_id[req_id] = entry
         else:
@@ -548,17 +577,34 @@ def parse_lines(lines: list[str]) -> list[dict]:
     return list(by_request_id.values()) + no_request_id
 
 
+def dedup_events(event_lists) -> list[dict]:
+    """Dedup parsed events across files by request_id (last wins).
+    A session resumed via --resume/--continue writes a new JSONL file that
+    repeats earlier events with the same requestId — without cross-file dedup
+    those would be counted twice. Events without a requestId are kept as-is."""
+    by_request_id: dict[str, dict] = {}
+    no_request_id: list[dict] = []
+    for events in event_lists:
+        for e in events:
+            rid = e.get("_request_id", "")
+            if rid:
+                by_request_id[rid] = e
+            else:
+                no_request_id.append(e)
+    return list(by_request_id.values()) + no_request_id
+
+
 def parse_events(files: list[str]) -> list[dict]:
-    """Parse all local JSONL files. Dedup by request_id (last event wins per file)."""
-    all_events = []
+    """Parse all local JSONL files. Dedup by request_id across all files
+    (last event wins), so resumed sessions aren't double counted."""
+    event_lists = []
     for path in files:
         try:
             with open(path, "r", errors="replace") as f:
-                events = parse_lines(f.readlines())
-                all_events.extend(events)
+                event_lists.append(parse_lines(f.readlines()))
         except (OSError, IOError):
             continue
-    return all_events
+    return dedup_events(event_lists)
 
 
 # ── Hook data parsing ──────────────────────────────────────────────────
@@ -641,13 +687,15 @@ def parse_hook_events(cctrack_dir: Path | None = None) -> list[dict]:
     return _hook_events_from_lines(lines)
 
 
-def compute_hook_deltas(events: list[dict]) -> list[dict]:
+def compute_hook_deltas(events: list[dict], baselines: dict | None = None) -> list[dict]:
     """Convert per-(session, date) cumulative records into per-(session, date)
     daily deltas. For each session, sorts its records by date and computes
     day-over-day deltas for cost_usd, input_tokens, output_tokens. The first
-    visible day for a session uses 0 as the prior cumulative. Cache fields are
-    snapshot (not cumulative), so they're passed through unchanged. Records
-    with zero cost delta and zero token delta are dropped."""
+    visible day for a session uses the session's rolled-up baseline (see
+    load_session_baselines) as the prior cumulative, or 0 if none — so a
+    session whose earlier days were rolled up isn't re-counted from zero.
+    Cache fields are snapshot (not cumulative), so they're passed through
+    unchanged. Records with zero cost delta and zero token delta are dropped."""
     by_session: dict[str, list[dict]] = defaultdict(list)
     for e in events:
         by_session[e["session_id"]].append(e)
@@ -655,9 +703,10 @@ def compute_hook_deltas(events: list[dict]) -> list[dict]:
     result = []
     for sid, session_events in by_session.items():
         session_events.sort(key=lambda e: e["date_str"])
-        prev_cost = 0.0
-        prev_in = 0
-        prev_out = 0
+        base = (baselines or {}).get(sid) or {}
+        prev_cost = float(base.get("cost_usd", 0.0))
+        prev_in = int(base.get("input_tokens", 0))
+        prev_out = int(base.get("output_tokens", 0))
         for e in session_events:
             cost = float(e.get("cost_usd", 0.0))
             in_t = int(e.get("input_tokens", 0))
@@ -683,6 +732,31 @@ def compute_hook_deltas(events: list[dict]) -> list[dict]:
                 "model": e.get("model", ""),
             })
     return result
+
+
+BASELINES_FILENAME = "session-baselines.json"
+
+
+def load_session_baselines(cctrack_dir: Path | None = None) -> dict:
+    """Load per-session cumulative baselines written by rollup_old_hook_files.
+    Returns {session_id: {date, cost_usd, input_tokens, output_tokens}}."""
+    if cctrack_dir is None:
+        cctrack_dir = CCTRACK_DIR
+    path = cctrack_dir / BASELINES_FILENAME
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_session_baselines(cctrack_dir: Path, baselines: dict) -> None:
+    try:
+        (cctrack_dir / BASELINES_FILENAME).write_text(json.dumps(baselines, indent=2) + "\n")
+    except OSError:
+        pass
 
 
 def load_monthly_hook_summaries(cctrack_dir: Path | None = None) -> dict:
@@ -761,6 +835,10 @@ def rollup_old_hook_files(cctrack_dir: Path | None = None,
             empty_paths.append(path)
 
     # Compute per-session per-day deltas by walking each session chronologically.
+    # Baselines carry each session's cumulative across rollup passes, so a
+    # session with days on both sides of the cutoff isn't re-counted from zero.
+    baselines = load_session_baselines(cctrack_dir)
+
     by_session: dict[str, list[tuple[str, dict]]] = defaultdict(list)
     for (sid, date_str), entry in by_session_day.items():
         by_session[sid].append((date_str, entry))
@@ -770,13 +848,30 @@ def rollup_old_hook_files(cctrack_dir: Path | None = None,
 
     for sid, records in by_session.items():
         records.sort(key=lambda r: r[0])
-        prev_cost = 0.0
+        base = baselines.get(sid) or {}
+        prev_cost = float(base.get("cost_usd", 0.0))
         for date_str, entry in records:
             cost = float(entry.get("cost_usd", 0.0))
             delta = max(0.0, cost - prev_cost)
             prev_cost = cost
             day_costs[date_str] += delta
             day_session_ids[date_str].add(sid)
+
+        last_date, last_entry = records[-1]
+        baselines[sid] = {
+            "date": last_date,
+            "cost_usd": float(last_entry.get("cost_usd", 0.0)),
+            "input_tokens": int(last_entry.get("input_tokens", 0)),
+            "output_tokens": int(last_entry.get("output_tokens", 0)),
+        }
+
+    # Prune baselines for sessions long past the cutoff (no live data can
+    # reference them anymore), then persist.
+    prune_before = (datetime.now(timezone.utc)
+                    - timedelta(days=retention_days + 30)).strftime("%Y-%m-%d")
+    baselines = {sid: b for sid, b in baselines.items()
+                 if b.get("date", "") >= prune_before}
+    _write_session_baselines(cctrack_dir, baselines)
 
     # Write per-day deltas into the appropriate monthly file and delete dailies.
     by_month: dict[str, dict] = {}
@@ -818,11 +913,16 @@ def rollup_old_hook_files(cctrack_dir: Path | None = None,
 
 def aggregate_hook_data(events: list[dict], monthly_summaries: dict | None = None) -> dict:
     """Aggregate hook events by date, merging with pre-aggregated monthly data.
-    Returns {date_str: {cost, sessions, input_tokens, output_tokens, cache_read, cache_write, models}}.
-    Note: cache_read/cache_write come from current_usage (snapshot of the last message's
-    context), so aggregating them is not strictly meaningful — treat as indicative only."""
+    Live events ADD INTO monthly-seeded buckets — a date can legitimately have
+    both (e.g. one host rolled it up while another host still has live data).
+    Same-host overlap can't double count because rollup deletes the daily files
+    it rolls. Returns {date_str: {cost, sessions, rolled_sessions, session_ids,
+    input_tokens, output_tokens, cache_read, cache_write, models}}.
+    Note: cache_read/cache_write come from current_usage (snapshot of the last
+    message's context), so aggregating them is not strictly meaningful."""
     def _empty() -> dict:
-        return {"cost": 0.0, "sessions": 0, "input_tokens": 0, "output_tokens": 0,
+        return {"cost": 0.0, "sessions": 0, "rolled_sessions": 0, "session_ids": set(),
+                "input_tokens": 0, "output_tokens": 0,
                 "cache_read": 0, "cache_write": 0, "models": {}}
 
     by_date: dict[str, dict] = {}
@@ -831,18 +931,15 @@ def aggregate_hook_data(events: list[dict], monthly_summaries: dict | None = Non
         for date_str, data in monthly_summaries.items():
             bucket = _empty()
             bucket["cost"] = data["cost"]
-            bucket["sessions"] = data["sessions"]
+            bucket["rolled_sessions"] = data["sessions"]
             by_date[date_str] = bucket
 
-    recent_dates: set[str] = set()
     for e in events:
-        date_str = e["date_str"]
-        if date_str not in recent_dates:
-            by_date[date_str] = _empty()
-            recent_dates.add(date_str)
-        bucket = by_date[date_str]
+        bucket = by_date.setdefault(e["date_str"], _empty())
         bucket["cost"] += e["cost_usd"]
-        bucket["sessions"] += 1
+        sid = e.get("session_id", "")
+        if sid:
+            bucket["session_ids"].add(sid)
         bucket["input_tokens"] += e.get("input_tokens", 0)
         bucket["output_tokens"] += e.get("output_tokens", 0)
         bucket["cache_read"] += e.get("cache_read", 0)
@@ -850,6 +947,10 @@ def aggregate_hook_data(events: list[dict], monthly_summaries: dict | None = Non
         model = e.get("model", "")
         if model:
             bucket["models"][model] = bucket["models"].get(model, 0) + 1
+
+    # Per-day session count: distinct live sessions + rolled-up count.
+    for bucket in by_date.values():
+        bucket["sessions"] = len(bucket["session_ids"]) + bucket["rolled_sessions"]
 
     return by_date
 
@@ -929,21 +1030,25 @@ def total_tokens(b: dict) -> int:
             + b["cache_write"] + b.get("cache_write_1h", 0))
 
 
-def _compute_accuracy_factor(daily: dict, hook_daily: dict, hook_install_date: str | None) -> tuple[float, bool]:
-    """Compute ratio of hook cost to JSONL cost for overlapping dates.
-    Returns (factor, is_measured). Falls back to DEFAULT_ACCURACY_FACTOR when
-    no overlapping data exists."""
-    if not hook_install_date:
-        return DEFAULT_ACCURACY_FACTOR, False
-
+def _compute_accuracy_factor_sources(sources: list[dict]) -> tuple[float, bool]:
+    """Compute ratio of hook cost to JSONL cost over (source, date) pairs where
+    both exist. Dates strictly AFTER each source's install date only — the
+    install day itself has partial hook coverage and would bias the factor low.
+    Comparing per source keeps a hook-less machine's JSONL out of the
+    denominator. Returns (factor, is_measured); falls back to
+    DEFAULT_ACCURACY_FACTOR when no overlapping data exists."""
     jsonl_total = 0.0
     hook_total = 0.0
-    for date_str in daily:
-        if date_str >= hook_install_date and date_str in hook_daily:
-            jsonl_cost = daily[date_str]["cost"]
-            hook_cost = hook_daily[date_str]["cost"]
-            if jsonl_cost > 0 and hook_cost > 0:
-                jsonl_total += jsonl_cost
+    for src in sources:
+        install = src.get("install_date")
+        if not install:
+            continue
+        for date_str, d in src["daily"].items():
+            if date_str <= install:
+                continue
+            hook_cost = src["hook_daily"].get(date_str, {}).get("cost", 0.0)
+            if d["cost"] > 0 and hook_cost > 0:
+                jsonl_total += d["cost"]
                 hook_total += hook_cost
 
     if jsonl_total > 0 and hook_total > 0:
@@ -951,10 +1056,29 @@ def _compute_accuracy_factor(daily: dict, hook_daily: dict, hook_install_date: s
     return DEFAULT_ACCURACY_FACTOR, False
 
 
+def _compute_accuracy_factor(daily: dict, hook_daily: dict, hook_install_date: str | None) -> tuple[float, bool]:
+    """Single-source convenience wrapper around _compute_accuracy_factor_sources."""
+    return _compute_accuracy_factor_sources([
+        {"daily": daily, "hook_daily": hook_daily, "install_date": hook_install_date}
+    ])
+
+
 def print_report(daily: dict, monthly: dict, days: int | None = None,
                  hook_daily: dict | None = None,
-                 hook_install_date: str | None = None):
-    if not daily and not monthly and not hook_daily:
+                 hook_install_date: str | None = None,
+                 sources: list[dict] | None = None):
+    """Print the report. `sources` is a list of {name, daily, hook_daily,
+    install_date} — one per machine — enabling per-source cost composition
+    (hook cost where covered, adjusted JSONL where not) so a hook-less machine
+    isn't dropped on days another machine has hook data. When omitted, the
+    legacy (daily, hook_daily, hook_install_date) args form a single source."""
+    if hook_daily is None:
+        hook_daily = {}
+    if sources is None:
+        sources = [{"name": "all", "daily": daily, "hook_daily": hook_daily,
+                    "install_date": hook_install_date}]
+
+    if not daily and not monthly and not any(src["hook_daily"] for src in sources):
         print("cctrack — no log data found")
         print()
         print("Looked in:")
@@ -962,14 +1086,16 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
             print(f"  {d}")
         return
 
-    if hook_daily is None:
-        hook_daily = {}
+    hooks_exist = any(src.get("install_date") or src["hook_daily"] for src in sources)
 
     now = datetime.now(timezone.utc)
     current_month = now.strftime("%Y-%m")
     current_month_name = now.strftime("%B %Y")
 
-    all_dates = set(daily.keys()) | set(hook_daily.keys())
+    all_dates: set[str] = set()
+    for src in sources:
+        all_dates |= set(src["daily"].keys()) | set(src["hook_daily"].keys())
+    all_dates |= set(daily.keys())
     all_months_set: set[str] = set()
     for d in all_dates:
         all_months_set.add(d[:7])
@@ -979,30 +1105,77 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
     sorted_days = sorted(all_dates, reverse=True)
     sorted_months = sorted(all_months_set, reverse=True)
 
-    accuracy_factor, factor_is_measured = _compute_accuracy_factor(daily, hook_daily, hook_install_date)
+    accuracy_factor, factor_is_measured = _compute_accuracy_factor_sources(sources)
+
+    def _source_date_cost(src: dict, date_str: str) -> tuple[float, str | None]:
+        """Returns (cost, kind) for one source; kind is 'auth', 'est', or None.
+        Hook cost is authoritative for dates after that source's hook install;
+        the install day itself takes max(hook, adjusted JSONL) since the hook
+        only captured post-install sessions; JSONL-only days are adjusted by
+        the accuracy factor whenever any hook data exists anywhere."""
+        hook_cost = src["hook_daily"].get(date_str, {}).get("cost", 0.0)
+        jsonl_cost = src["daily"].get(date_str, {}).get("cost", 0.0)
+        install = src.get("install_date")
+
+        if install and date_str == install:
+            adjusted = jsonl_cost * accuracy_factor if jsonl_cost > 0 else 0.0
+            cost = max(hook_cost, adjusted)
+            return (cost, "est") if cost > 0 else (0.0, None)
+        if install and date_str > install and hook_cost > 0:
+            return hook_cost, "auth"
+        if jsonl_cost > 0:
+            if hooks_exist:
+                return jsonl_cost * accuracy_factor, "est"
+            return jsonl_cost, "auth"
+        if hook_cost > 0:
+            return hook_cost, "auth"
+        return 0.0, None
 
     def _date_cost(date_str: str) -> tuple[float, bool]:
-        """Returns (cost, is_authoritative).
-        Uses hook data for dates after hook install.
-        On the install day itself, takes max(hook, adjusted JSONL) since
-        the hook only captured post-install sessions.
-        For pre-hook days, applies accuracy_factor to JSONL cost."""
-        hook_cost = hook_daily.get(date_str, {}).get("cost", 0.0)
-        jsonl_cost = daily.get(date_str, {}).get("cost", 0.0)
+        """Sum of per-source costs; authoritative only if every contributing
+        source component is hook-authoritative."""
+        total = 0.0
+        kinds = []
+        for src in sources:
+            cost, kind = _source_date_cost(src, date_str)
+            total += cost
+            if kind:
+                kinds.append(kind)
+        is_auth = bool(kinds) and all(k == "auth" for k in kinds)
+        return total, is_auth
 
-        if hook_install_date and date_str == hook_install_date:
-            adjusted = jsonl_cost * accuracy_factor if jsonl_cost > 0 else 0.0
-            return max(hook_cost, adjusted), False
-        if hook_install_date and date_str > hook_install_date and hook_cost > 0:
-            return hook_cost, True
-        if jsonl_cost > 0:
-            cost = jsonl_cost
-            if hook_install_date:
-                cost *= accuracy_factor
-            return cost, not bool(hook_install_date)
-        if hook_cost > 0:
-            return hook_cost, True
-        return 0.0, False
+    def _date_tokens(date_str: str) -> tuple[int, int]:
+        """Input/output per date: each source contributes its hook counts when
+        present (more accurate), otherwise its JSONL counts."""
+        ti = to = 0
+        for src in sources:
+            h = src["hook_daily"].get(date_str, {})
+            d = src["daily"].get(date_str)
+            hi = h.get("input_tokens", 0)
+            ho = h.get("output_tokens", 0)
+            ti += hi if hi else (d["input"] if d else 0)
+            to += ho if ho else (d["output"] if d else 0)
+        return ti, to
+
+    def _date_sessions(date_str: str) -> int:
+        return sum(src["hook_daily"].get(date_str, {}).get("sessions", 0) for src in sources)
+
+    def _date_hook_models(date_str: str) -> dict:
+        merged: dict = {}
+        for src in sources:
+            for mname, cnt in src["hook_daily"].get(date_str, {}).get("models", {}).items():
+                merged[mname] = merged.get(mname, 0) + cnt
+        return merged
+
+    saw_unknown_model = False
+
+    def _model_str(models: dict) -> str:
+        nonlocal saw_unknown_model
+        s = format_model(models)
+        if any(not is_known_model(mn) for mn in models):
+            saw_unknown_model = True
+            s += "?"
+        return s
 
     # Header
     print("cctrack — Claude Code Cost Report")
@@ -1031,10 +1204,11 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
         print(f"{current_month_name} — month to date (day {day_of_month}, {days_active} active)")
         print("───────────────────────────────────────")
         if m:
-            hook_in_mtd = sum(hook_daily.get(d, {}).get("input_tokens", 0) for d in current_days_all)
-            hook_out_mtd = sum(hook_daily.get(d, {}).get("output_tokens", 0) for d in current_days_all)
-            input_t = hook_in_mtd if hook_in_mtd else m["input"]
-            output_t = hook_out_mtd if hook_out_mtd else m["output"]
+            input_t = output_t = 0
+            for d in current_days_all:
+                ti, to = _date_tokens(d)
+                input_t += ti
+                output_t += to
             print(f"  Input tokens:   {format_tokens(input_t):>15}")
             print(f"  Output tokens:  {format_tokens(output_t):>15}")
             cache_w_total = m['cache_write'] + m.get('cache_write_1h', 0)
@@ -1043,21 +1217,36 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
                 print(f"  Cache write:    {format_tokens(cache_w_total):>15}")
             total = input_t + output_t + m['cache_read'] + cache_w_total
             print(f"  Total tokens:   {format_tokens(total):>15}")
-            mtd_model = format_model(m.get("models", {}))
+            mtd_model = _model_str(m.get("models", {}))
             if mtd_model:
                 print(f"  Model:          {mtd_model:>15}")
 
-        mtd_sessions = sum(hook_daily.get(d, {}).get("sessions", 0) for d in current_days_all)
+        # Distinct sessions for the month: union of live session ids (a session
+        # spanning several days counts once) + rolled-up per-day counts.
+        mtd_ids: set = set()
+        mtd_counted = 0
+        for d in current_days_all:
+            for src in sources:
+                h = src["hook_daily"].get(d)
+                if not h:
+                    continue
+                ids = h.get("session_ids")
+                if ids:
+                    mtd_ids |= ids
+                    mtd_counted += h.get("rolled_sessions", 0)
+                else:
+                    mtd_counted += h.get("sessions", 0)
+        mtd_sessions = len(mtd_ids) + mtd_counted
         if mtd_sessions:
             print(f"  Sessions:       {mtd_sessions:>15}")
 
-        if hook_install_date and est_days > 0:
+        if hooks_exist and est_days > 0:
             factor_source = "measured" if factor_is_measured else "estimated ~20-25%"
             cost_note = f" ({accuracy_factor:.2f}x adjustment, {factor_source})"
             if auth_days > 0:
                 cost_note = f" ({auth_days}d authoritative, {est_days}d adjusted {accuracy_factor:.2f}x)"
             print(f"  Total cost:     ${mtd_cost:.2f}{cost_note}")
-        elif hook_install_date and auth_days > 0:
+        elif hooks_exist and auth_days > 0:
             print(f"  Total cost:     ${mtd_cost:.2f} (authoritative)")
         else:
             print(f"  Total cost:     ${mtd_cost:.2f}")
@@ -1076,7 +1265,7 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
 
     if current_month_days:
         print("Daily breakdown:")
-        if hook_install_date:
+        if hooks_exist:
             print(f"  {'Date':<12} {'Input':>11} {'Output':>11} {'Cache R':>11} {'Cache W':>11} {'Sess':>5} {'Model':<12} {'Cost':>9} {'':>2}")
             print(f"  {'─'*12} {'─'*11} {'─'*11} {'─'*11} {'─'*11} {'─'*5} {'─'*12} {'─'*9} {'─'*2}")
         else:
@@ -1088,23 +1277,20 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
         for date_str in display_days:
             cost, is_auth = _date_cost(date_str)
             d = daily.get(date_str)
-            hook = hook_daily.get(date_str, {})
-            hook_in = hook.get("input_tokens", 0)
-            hook_out = hook.get("output_tokens", 0)
-            input_t = hook_in if hook_in else (d["input"] if d else 0)
-            output_t = hook_out if hook_out else (d["output"] if d else 0)
+            input_t, output_t = _date_tokens(date_str)
             cache_r = d["cache_read"] if d else 0
             cache_w = (d["cache_write"] + d.get("cache_write_1h", 0)) if d else 0
-            model_str = format_model(d.get("models", {})) if d else format_model(hook.get("models", {}))
-            if hook_install_date:
+            models = (d.get("models", {}) if d else {}) or _date_hook_models(date_str)
+            model_str = _model_str(models)
+            if hooks_exist:
                 marker = "" if is_auth else "~"
-                sessions = hook.get("sessions", 0)
+                sessions = _date_sessions(date_str)
                 sess_str = str(sessions) if sessions else "-"
                 print(f"  {date_str:<12} {format_tokens(input_t):>11} {format_tokens(output_t):>11} {format_tokens(cache_r):>11} {format_tokens(cache_w):>11} {sess_str:>5} {model_str:<12} ${cost:>7.2f} {marker:>2}")
             else:
                 print(f"  {date_str:<12} {format_tokens(input_t):>11} {format_tokens(output_t):>11} {format_tokens(cache_r):>11} {format_tokens(cache_w):>11} {model_str:<12} ${cost:>7.2f}")
 
-    if hook_install_date and current_month_days:
+    if hooks_exist and current_month_days:
         has_estimated = any(not _date_cost(d)[1] for d in current_month_days)
         if has_estimated:
             if factor_is_measured:
@@ -1137,7 +1323,7 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
 
             if not month_days_list and m:
                 month_cost = m["cost"]
-                if hook_install_date:
+                if hooks_exist:
                     month_cost *= accuracy_factor
                 month_has_est = True
 
@@ -1145,12 +1331,16 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
             output_t = m["output"] if m else 0
             cache_r = m["cache_read"] if m else 0
             cache_w = (m["cache_write"] + m.get("cache_write_1h", 0)) if m else 0
-            model_str = format_model(m.get("models", {})) if m else ""
+            model_str = _model_str(m.get("models", {})) if m else ""
 
             cost_str = f"${month_cost:>7.2f}"
-            if hook_install_date and month_has_est and not month_has_hook:
+            if hooks_exist and month_has_est and not month_has_hook:
                 cost_str += "  ~"
             print(f"  {month_str + days_str:<12} {format_tokens(input_t):>11} {format_tokens(output_t):>11} {format_tokens(cache_r):>11} {format_tokens(cache_w):>11} {model_str:<12} {cost_str}")
+
+    if saw_unknown_model:
+        print()
+        print("  ? = unrecognized model — priced at default Sonnet rates; update cctrack's rate card")
 
     print()
 
@@ -1199,65 +1389,71 @@ def main():
             uninstall_hook()
         return
 
-    # Local events
+    # ── Local source: JSONL events + hook data ──
     dirs = args.dirs if args.dirs else default_dirs()
     files = discover_files(dirs)
-    events = parse_events(files)
+    local_events = parse_events(files)
+    local_daily, _ = aggregate(local_events)
 
-    # Remote events
-    if args.remote:
-        for host in args.remote:
-            remote_events = parse_remote_events(host)
-            events.extend(remote_events)
-
-    daily, monthly = aggregate(events)
-
-    # Hook data (authoritative cost from statusline hook)
-    hook_daily = None
-    hook_install_date = None
-
+    local_install = None
     config = read_hook_config()
     if config and "installed_at" in config:
         try:
             dt = datetime.fromisoformat(config["installed_at"].replace("Z", "+00:00"))
-            hook_install_date = dt.strftime("%Y-%m-%d")
+            local_install = dt.strftime("%Y-%m-%d")
         except (ValueError, AttributeError):
             pass
 
-    all_hook_events: list[dict] = []
-    all_monthly: dict[str, dict] = {}
-
+    local_hook_events: list[dict] = []
+    local_hook_monthly: dict[str, dict] = {}
     for hdir in discover_hook_data_dirs():
         rollup_old_hook_files(hdir)
-        all_hook_events.extend(compute_hook_deltas(parse_hook_events(hdir)))
-        merge_monthly_summaries(all_monthly, load_monthly_hook_summaries(hdir))
+        baselines = load_session_baselines(hdir)
+        local_hook_events.extend(compute_hook_deltas(parse_hook_events(hdir), baselines))
+        merge_monthly_summaries(local_hook_monthly, load_monthly_hook_summaries(hdir))
 
-    # Remote hook data: each host's deltas are computed independently so a
-    # session's cumulative history never mixes across hosts.
+    local_hook_daily: dict = {}
+    if local_hook_events or local_hook_monthly:
+        local_hook_daily = aggregate_hook_data(local_hook_events, local_hook_monthly)
+
+    # Hook coverage may start earlier than the configured install date
+    # (e.g. data restored from another machine); the earliest observed hook
+    # date is the effective install date for this source.
+    if local_hook_daily:
+        earliest = min(local_hook_daily.keys())
+        if local_install is None or earliest < local_install:
+            local_install = earliest
+
+    all_events = list(local_events)
+    sources = [{"name": "local", "daily": local_daily,
+                "hook_daily": local_hook_daily, "install_date": local_install}]
+
+    # ── One source per remote host. Deltas are computed per host so a
+    # session's cumulative history never mixes across hosts. ──
     if args.remote:
         for host in args.remote:
-            remote_hook_events, remote_monthly = parse_remote_hook_data(host)
-            all_hook_events.extend(compute_hook_deltas(remote_hook_events))
-            merge_monthly_summaries(all_monthly, remote_monthly)
+            remote_events = parse_remote_events(host)
+            all_events.extend(remote_events)
+            remote_daily, _ = aggregate(remote_events)
 
-    if all_hook_events or all_monthly:
-        hook_daily = aggregate_hook_data(all_hook_events, all_monthly)
+            remote_hook_events, remote_monthly, remote_baselines = parse_remote_hook_data(host)
+            remote_deltas = compute_hook_deltas(remote_hook_events, remote_baselines)
+            remote_hook_daily: dict = {}
+            if remote_deltas or remote_monthly:
+                remote_hook_daily = aggregate_hook_data(remote_deltas, remote_monthly)
+            remote_install = min(remote_hook_daily.keys()) if remote_hook_daily else None
 
-    # Hook coverage may start earlier than the local install date (e.g. a
-    # remote host installed the hook first). Treat the earliest observed
-    # hook date as the effective install date so those days count as
-    # authoritative rather than being scaled by the accuracy factor.
-    if hook_daily:
-        earliest_hook_date = min(hook_daily.keys())
-        if hook_install_date is None or earliest_hook_date < hook_install_date:
-            hook_install_date = earliest_hook_date
+            sources.append({"name": host, "daily": remote_daily,
+                            "hook_daily": remote_hook_daily, "install_date": remote_install})
+
+    # Global aggregates feed the token columns; cost is composed per source.
+    daily, monthly = aggregate(all_events)
 
     # Suggest hook if not installed
     if not is_hook_installed():
         prompt_hook_install()
 
-    print_report(daily, monthly, days=args.days,
-                 hook_daily=hook_daily, hook_install_date=hook_install_date)
+    print_report(daily, monthly, days=args.days, sources=sources)
 
 
 if __name__ == "__main__":

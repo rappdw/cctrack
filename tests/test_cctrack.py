@@ -319,6 +319,23 @@ def test_parse_dedup_by_request_id():
         assert 300 in by_input
 
 
+def test_parse_dedup_across_files_resumed_session():
+    """A resumed session repeats earlier events (same requestId) in a NEW file —
+    they must not be double counted."""
+    with tempfile.TemporaryDirectory() as d:
+        original = [
+            make_event(request_id="req_1", input_tokens=100),
+            make_event(request_id="req_2", input_tokens=200),
+        ]
+        # Resume: new session file replays req_1/req_2 and adds req_3.
+        resumed = original + [make_event(request_id="req_3", input_tokens=300)]
+        p1 = write_jsonl(d, "sess-original.jsonl", original)
+        p2 = write_jsonl(d, "sess-resumed.jsonl", resumed)
+        events = cctrack.parse_events([p1, p2])
+        assert len(events) == 3
+        assert sum(e["input"] for e in events) == 600
+
+
 def test_parse_no_request_id_not_deduped():
     """Events without request_id are all kept."""
     with tempfile.TemporaryDirectory() as d:
@@ -373,14 +390,15 @@ def test_parse_lines_dedup():
 
 # ── Remote support tests ──────────────────────────────────────────────
 
-def test_parse_remote_events_splits_by_file():
-    """Each file chunk gets independent dedup."""
+def test_parse_remote_events_dedups_across_files():
+    """Same requestId in two of a host's files (resumed session) counts once."""
     from unittest.mock import patch
 
-    # Two "files", each with a req_1. They should NOT dedup across files.
     file1 = json.dumps(make_event(request_id="req_1", input_tokens=100))
-    file2 = json.dumps(make_event(request_id="req_1", input_tokens=200))
-    raw = f"___CCTRACK_FILE_SEP___\n{file1}\n___CCTRACK_FILE_SEP___\n{file2}\n"
+    file2 = json.dumps(make_event(request_id="req_1", input_tokens=100))
+    file3 = json.dumps(make_event(request_id="req_2", input_tokens=300))
+    raw = (f"___CCTRACK_FILE_SEP___\n{file1}\n___CCTRACK_FILE_SEP___\n{file2}\n"
+           f"___CCTRACK_FILE_SEP___\n{file3}\n")
 
     with patch("cctrack.fetch_remote_jsonl", return_value=raw):
         events = cctrack.parse_remote_events("fakehost")
