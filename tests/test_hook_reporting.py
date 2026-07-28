@@ -49,26 +49,28 @@ def make_bucket(input=0, output=0, cache_read=0, cache_write=0, cost=0.0):
             "cache_write": cache_write, "cost": cost}
 
 
-# ── parse_hook_events tests ────────────────────────────────────────────
+# ── parse_hook_rows tests ──────────────────────────────────────────────
 
-def test_parse_hook_events_basic():
-    """Parse a single hook entry."""
+def test_parse_hook_rows_basic():
+    """Parse a single hook row. Only cost/session/model/date are carried —
+    the hook's token fields are context snapshots and are deliberately dropped."""
     with tempfile.TemporaryDirectory() as d:
         write_hook_jsonl(d, [
             make_hook_entry(session_id="sess_001", cost_usd=1.50),
         ])
-        events = cctrack.parse_hook_events(cctrack_dir=Path(d))
-        assert len(events) == 1
-        assert events[0]["session_id"] == "sess_001"
-        assert events[0]["cost_usd"] == 1.50
-        assert events[0]["date_str"] == "2026-04-15"
-        assert events[0]["model"] == "claude-opus-4-6"
-        assert events[0]["input_tokens"] == 50000
-        assert events[0]["output_tokens"] == 10000
+        rows = cctrack.parse_hook_rows(cctrack_dir=Path(d))
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "sess_001"
+        assert rows[0]["cost_usd"] == 1.50
+        assert rows[0]["date_str"] == "2026-04-15"
+        assert rows[0]["model"] == "claude-opus-4-6"
+        assert "input_tokens" not in rows[0]
+        assert "output_tokens" not in rows[0]
 
 
-def test_parse_hook_events_dedup_by_session_id():
-    """Multiple entries per session_id: last by _ts wins."""
+def test_parse_hook_rows_keeps_every_render():
+    """Every statusline render is kept, sorted by timestamp — the delta walk
+    needs them all to survive mid-day counter resets."""
     with tempfile.TemporaryDirectory() as d:
         write_hook_jsonl(d, [
             make_hook_entry(session_id="sess_A", ts="2026-04-15T10:00:00+00:00", cost_usd=0.50),
@@ -76,28 +78,23 @@ def test_parse_hook_events_dedup_by_session_id():
             make_hook_entry(session_id="sess_A", ts="2026-04-15T11:00:00+00:00", cost_usd=1.00),
             make_hook_entry(session_id="sess_B", ts="2026-04-15T10:00:00+00:00", cost_usd=2.00),
         ])
-        events = cctrack.parse_hook_events(cctrack_dir=Path(d))
-        assert len(events) == 2
-        by_session = {e["session_id"]: e for e in events}
-        assert by_session["sess_A"]["cost_usd"] == 1.50
-        assert by_session["sess_B"]["cost_usd"] == 2.00
+        rows = cctrack.parse_hook_rows(cctrack_dir=Path(d))
+        assert len(rows) == 4
+        a = [r["cost_usd"] for r in rows if r["session_id"] == "sess_A"]
+        assert a == [0.50, 1.00, 1.50]  # timestamp order, not file order
 
 
-def test_parse_hook_events_empty_file():
-    """Empty file returns empty list."""
+def test_parse_hook_rows_empty_file():
     with tempfile.TemporaryDirectory() as d:
         Path(d, "statusline-2026-04-15.jsonl").write_text("")
-        events = cctrack.parse_hook_events(cctrack_dir=Path(d))
-        assert events == []
+        assert cctrack.parse_hook_rows(cctrack_dir=Path(d)) == []
 
 
-def test_parse_hook_events_missing_dir():
-    """Missing directory returns empty list."""
-    events = cctrack.parse_hook_events(cctrack_dir=Path("/nonexistent/dir"))
-    assert events == []
+def test_parse_hook_rows_missing_dir():
+    assert cctrack.parse_hook_rows(cctrack_dir=Path("/nonexistent/dir")) == []
 
 
-def test_parse_hook_events_malformed_lines():
+def test_parse_hook_rows_malformed_lines():
     """Malformed lines are skipped."""
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "statusline-2026-04-15.jsonl")
@@ -105,141 +102,148 @@ def test_parse_hook_events_malformed_lines():
             f.write("not json\n")
             f.write('{"broken\n')
             f.write(json.dumps(make_hook_entry(cost_usd=3.33)) + "\n")
-        events = cctrack.parse_hook_events(cctrack_dir=Path(d))
-        assert len(events) == 1
-        assert events[0]["cost_usd"] == 3.33
+        rows = cctrack.parse_hook_rows(cctrack_dir=Path(d))
+        assert len(rows) == 1
+        assert rows[0]["cost_usd"] == 3.33
 
 
-def test_parse_hook_events_no_session_id_skipped():
-    """Entries without session_id are skipped."""
+def test_parse_hook_rows_no_session_id_skipped():
     with tempfile.TemporaryDirectory() as d:
         entry = make_hook_entry()
         del entry["session_id"]
         write_hook_jsonl(d, [entry])
-        events = cctrack.parse_hook_events(cctrack_dir=Path(d))
-        assert events == []
+        assert cctrack.parse_hook_rows(cctrack_dir=Path(d)) == []
 
 
-def test_parse_hook_events_no_ts_skipped():
-    """Entries without _ts are skipped."""
+def test_parse_hook_rows_no_ts_skipped():
     with tempfile.TemporaryDirectory() as d:
         entry = make_hook_entry()
         del entry["_ts"]
         write_hook_jsonl(d, [entry])
-        events = cctrack.parse_hook_events(cctrack_dir=Path(d))
-        assert events == []
+        assert cctrack.parse_hook_rows(cctrack_dir=Path(d)) == []
 
 
-def test_parse_hook_events_multiple_dates():
-    """Events across multiple dates are parsed correctly."""
+def test_parse_hook_rows_multiple_dates():
     with tempfile.TemporaryDirectory() as d:
-        write_hook_jsonl(d, [
-            make_hook_entry(session_id="s1", ts="2026-04-14T10:00:00+00:00", cost_usd=1.00),
-        ], date="2026-04-14")
-        write_hook_jsonl(d, [
-            make_hook_entry(session_id="s2", ts="2026-04-15T10:00:00+00:00", cost_usd=2.00),
-        ], date="2026-04-15")
-        write_hook_jsonl(d, [
-            make_hook_entry(session_id="s3", ts="2026-04-16T10:00:00+00:00", cost_usd=3.00),
-        ], date="2026-04-16")
-        events = cctrack.parse_hook_events(cctrack_dir=Path(d))
-        assert len(events) == 3
-        dates = {e["date_str"] for e in events}
-        assert dates == {"2026-04-14", "2026-04-15", "2026-04-16"}
+        for i, day in enumerate(("2026-04-14", "2026-04-15", "2026-04-16"), start=1):
+            write_hook_jsonl(d, [
+                make_hook_entry(session_id=f"s{i}", ts=f"{day}T10:00:00+00:00", cost_usd=float(i)),
+            ], date=day)
+        rows = cctrack.parse_hook_rows(cctrack_dir=Path(d))
+        assert len(rows) == 3
+        assert {r["date_str"] for r in rows} == {"2026-04-14", "2026-04-15", "2026-04-16"}
 
 
-def test_parse_hook_events_reads_legacy_file():
+def test_parse_hook_rows_reads_legacy_file():
     """Legacy statusline.jsonl is also read."""
     with tempfile.TemporaryDirectory() as d:
         legacy_path = os.path.join(d, "statusline.jsonl")
         with open(legacy_path, "w") as f:
             f.write(json.dumps(make_hook_entry(session_id="legacy_1", cost_usd=5.00)) + "\n")
-        events = cctrack.parse_hook_events(cctrack_dir=Path(d))
-        assert len(events) == 1
-        assert events[0]["session_id"] == "legacy_1"
+        rows = cctrack.parse_hook_rows(cctrack_dir=Path(d))
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "legacy_1"
 
 
-def test_parse_hook_events_session_spans_multiple_days():
-    """A session active on multiple days returns one record per (session, day)
-    with that day's maximum cumulative values."""
+def test_hook_token_fields_are_not_cumulative():
+    """Documents WHY hook tokens are unusable: `input_tokens` is the context
+    window size (≈ cache_read + cache_write), not a running total."""
+    entry = make_hook_entry(input_tokens=440341, cache_read=428341, cache_write=11999)
+    assert entry["input_tokens"] - (entry["cache_read"] + entry["cache_write"]) == 1
     with tempfile.TemporaryDirectory() as d:
-        write_hook_jsonl(d, [
-            make_hook_entry(session_id="sA", ts="2026-04-14T10:00:00+00:00", cost_usd=2.00, input_tokens=100, output_tokens=50),
-            make_hook_entry(session_id="sA", ts="2026-04-14T18:00:00+00:00", cost_usd=5.00, input_tokens=300, output_tokens=150),
-        ], date="2026-04-14")
-        write_hook_jsonl(d, [
-            make_hook_entry(session_id="sA", ts="2026-04-15T09:00:00+00:00", cost_usd=8.00, input_tokens=500, output_tokens=250),
-            make_hook_entry(session_id="sA", ts="2026-04-15T16:00:00+00:00", cost_usd=12.00, input_tokens=800, output_tokens=400),
-        ], date="2026-04-15")
-        events = cctrack.parse_hook_events(cctrack_dir=Path(d))
-        by_date = {e["date_str"]: e for e in events}
-        assert len(events) == 2
-        assert by_date["2026-04-14"]["cost_usd"] == 5.00
-        assert by_date["2026-04-14"]["input_tokens"] == 300
-        assert by_date["2026-04-15"]["cost_usd"] == 12.00
-        assert by_date["2026-04-15"]["input_tokens"] == 800
+        write_hook_jsonl(d, [entry])
+        rows = cctrack.parse_hook_rows(cctrack_dir=Path(d))
+        # None of those snapshot fields survive into the parsed row.
+        assert set(rows[0]) == {"session_id", "ts", "date_str", "cost_usd", "model"}
 
 
 # ── compute_hook_deltas tests ──────────────────────────────────────────
 
+def make_row(session_id="sA", ts="2026-04-15T10:00:00+00:00", cost_usd=1.0, model="m"):
+    return {"session_id": session_id, "ts": ts, "date_str": ts[:10],
+            "cost_usd": cost_usd, "model": model}
+
+
 def test_compute_hook_deltas_single_day_session():
-    """Session visible on one day produces one delta equal to its cumulative."""
-    events = [
-        {"date_str": "2026-04-15", "session_id": "s1", "cost_usd": 3.0,
-         "input_tokens": 100, "output_tokens": 50, "cache_read": 0, "cache_write": 0, "model": "m"},
-    ]
-    deltas = cctrack.compute_hook_deltas(events)
+    """Session visible on one day yields its cumulative as that day's spend."""
+    deltas = cctrack.compute_hook_deltas([make_row(session_id="s1", cost_usd=3.0)])
     assert len(deltas) == 1
     assert deltas[0]["cost_usd"] == 3.0
-    assert deltas[0]["input_tokens"] == 100
-    assert deltas[0]["output_tokens"] == 50
+    assert deltas[0]["date_str"] == "2026-04-15"
 
 
 def test_compute_hook_deltas_session_spans_days():
-    """A session spanning days produces one delta per day, each being the
-    day-over-day increment rather than the cumulative value."""
-    events = [
-        {"date_str": "2026-04-14", "session_id": "sA", "cost_usd": 5.00,
-         "input_tokens": 300, "output_tokens": 150, "cache_read": 0, "cache_write": 0, "model": "m"},
-        {"date_str": "2026-04-15", "session_id": "sA", "cost_usd": 12.00,
-         "input_tokens": 800, "output_tokens": 400, "cache_read": 0, "cache_write": 0, "model": "m"},
+    """A session spanning days yields the day-over-day increment per day."""
+    rows = [
+        make_row(ts="2026-04-14T10:00:00+00:00", cost_usd=2.00),
+        make_row(ts="2026-04-14T18:00:00+00:00", cost_usd=5.00),
+        make_row(ts="2026-04-15T09:00:00+00:00", cost_usd=8.00),
+        make_row(ts="2026-04-15T16:00:00+00:00", cost_usd=12.00),
     ]
-    deltas = cctrack.compute_hook_deltas(events)
-    by_date = {d["date_str"]: d for d in deltas}
+    by_date = {d["date_str"]: d for d in cctrack.compute_hook_deltas(rows)}
     assert abs(by_date["2026-04-14"]["cost_usd"] - 5.00) < 0.001
     assert abs(by_date["2026-04-15"]["cost_usd"] - 7.00) < 0.001
-    assert by_date["2026-04-14"]["input_tokens"] == 300
-    assert by_date["2026-04-15"]["input_tokens"] == 500
-    assert by_date["2026-04-14"]["output_tokens"] == 150
-    assert by_date["2026-04-15"]["output_tokens"] == 250
 
 
 def test_compute_hook_deltas_drops_zero_records():
-    """A record whose cumulative didn't advance from the prior day is dropped."""
-    events = [
-        {"date_str": "2026-04-14", "session_id": "sA", "cost_usd": 5.0,
-         "input_tokens": 100, "output_tokens": 50, "cache_read": 0, "cache_write": 0, "model": "m"},
-        {"date_str": "2026-04-15", "session_id": "sA", "cost_usd": 5.0,
-         "input_tokens": 100, "output_tokens": 50, "cache_read": 0, "cache_write": 0, "model": "m"},
+    """A day whose cumulative didn't advance contributes nothing."""
+    rows = [
+        make_row(ts="2026-04-14T10:00:00+00:00", cost_usd=5.0),
+        make_row(ts="2026-04-15T10:00:00+00:00", cost_usd=5.0),
     ]
-    deltas = cctrack.compute_hook_deltas(events)
+    deltas = cctrack.compute_hook_deltas(rows)
     assert len(deltas) == 1
     assert deltas[0]["date_str"] == "2026-04-14"
 
 
-def test_compute_hook_deltas_clamps_negatives():
-    """Cumulative values should never decrease, but if they do (bad data),
-    deltas clamp to zero rather than produce negative costs."""
-    events = [
-        {"date_str": "2026-04-14", "session_id": "sA", "cost_usd": 5.0,
-         "input_tokens": 100, "output_tokens": 50, "cache_read": 0, "cache_write": 0, "model": "m"},
-        {"date_str": "2026-04-15", "session_id": "sA", "cost_usd": 3.0,
-         "input_tokens": 80, "output_tokens": 40, "cache_read": 0, "cache_write": 0, "model": "m"},
+def test_compute_hook_deltas_counter_reset_is_counted():
+    """Regression: Claude Code restarts a session's cost counter on resume or
+    compaction. The post-reset spend must be counted, not clamped away."""
+    rows = [
+        make_row(ts="2026-04-14T10:00:00+00:00", cost_usd=67.55),
+        make_row(ts="2026-04-15T10:00:00+00:00", cost_usd=4.85),   # counter restarted
+        make_row(ts="2026-04-15T12:00:00+00:00", cost_usd=6.00),
     ]
-    deltas = cctrack.compute_hook_deltas(events)
-    # Day 2 delta is negative, so it's dropped entirely (all-zero after clamping).
+    by_date = {d["date_str"]: d["cost_usd"] for d in cctrack.compute_hook_deltas(rows)}
+    assert abs(by_date["2026-04-14"] - 67.55) < 0.001
+    # Post-reset day: the restarted total ($4.85) plus its later growth ($1.15).
+    assert abs(by_date["2026-04-15"] - 6.00) < 0.001
+
+
+def test_compute_hook_deltas_trailing_zero_render_preserves_day():
+    """Regression: the last render of a day can report cost 0 (a fresh session
+    start). Sampling only that row collapsed the whole day to nothing."""
+    rows = [
+        make_row(ts="2026-04-15T09:00:00+00:00", cost_usd=8.09),
+        make_row(ts="2026-04-15T20:00:00+00:00", cost_usd=67.55),
+        make_row(ts="2026-04-15T22:59:00+00:00", cost_usd=0.0),   # stale/reset render
+    ]
+    deltas = cctrack.compute_hook_deltas(rows)
     assert len(deltas) == 1
-    assert deltas[0]["date_str"] == "2026-04-14"
+    assert abs(deltas[0]["cost_usd"] - 67.55) < 0.001
+
+
+def test_compute_hook_deltas_float_jitter_is_not_a_reset():
+    """A negligible decrease must not be read as a counter restart (which
+    would re-add the full amount)."""
+    rows = [
+        make_row(ts="2026-04-15T10:00:00+00:00", cost_usd=10.0),
+        make_row(ts="2026-04-15T11:00:00+00:00", cost_usd=10.0 - 1e-12),
+    ]
+    deltas = cctrack.compute_hook_deltas(rows)
+    assert len(deltas) == 1
+    assert abs(deltas[0]["cost_usd"] - 10.0) < 0.001
+
+
+def test_compute_hook_deltas_rows_without_ts_sort_by_date():
+    """Callers may pass one pre-aggregated reading per day (no `ts`)."""
+    rows = [
+        {"session_id": "sA", "date_str": "2026-04-15", "cost_usd": 12.0, "model": "m"},
+        {"session_id": "sA", "date_str": "2026-04-14", "cost_usd": 5.0, "model": "m"},
+    ]
+    by_date = {d["date_str"]: d["cost_usd"] for d in cctrack.compute_hook_deltas(rows)}
+    assert abs(by_date["2026-04-14"] - 5.0) < 0.001
+    assert abs(by_date["2026-04-15"] - 7.0) < 0.001
 
 
 def test_compute_hook_deltas_multiple_sessions_independent():
@@ -299,8 +303,9 @@ def test_parse_remote_hook_data_basic():
     assert baselines == {}
 
 
-def test_parse_remote_hook_data_dedup_across_files():
-    """Same (session, date) in multiple remote files: latest _ts wins."""
+def test_parse_remote_hook_data_rows_across_files_resolve_to_one_day():
+    """A session's renders may be split across remote files; all rows are kept
+    and the delta walk resolves them to that day's true spend."""
     raw = _remote_raw(
         hook_chunks=[
             [make_hook_entry(session_id="rA", ts="2026-04-15T10:00:00+00:00", cost_usd=2.00)],
@@ -309,9 +314,11 @@ def test_parse_remote_hook_data_dedup_across_files():
         monthly_chunks=[],
     )
     with patch("cctrack.fetch_remote_hook_data", return_value=raw):
-        events, monthly, baselines = cctrack.parse_remote_hook_data("fakehost")
-    assert len(events) == 1
-    assert events[0]["cost_usd"] == 6.00
+        rows, monthly, baselines = cctrack.parse_remote_hook_data("fakehost")
+    assert len(rows) == 2
+    deltas = cctrack.compute_hook_deltas(rows)
+    assert len(deltas) == 1
+    assert abs(deltas[0]["cost_usd"] - 6.00) < 0.001
 
 
 def test_parse_remote_hook_data_empty():
@@ -383,17 +390,22 @@ def test_remote_and_local_hook_costs_sum_per_date():
 def test_compute_hook_deltas_seeds_from_baseline():
     """A session whose earlier days were rolled up resumes from its baseline
     cumulative, not from zero."""
-    events = [
-        {"date_str": "2026-04-15", "session_id": "sA", "cost_usd": 12.0,
-         "input_tokens": 800, "output_tokens": 400, "cache_read": 0, "cache_write": 0, "model": "m"},
-    ]
-    baselines = {"sA": {"date": "2026-04-14", "cost_usd": 5.0,
-                        "input_tokens": 300, "output_tokens": 150}}
-    deltas = cctrack.compute_hook_deltas(events, baselines)
+    rows = [make_row(session_id="sA", ts="2026-04-15T10:00:00+00:00", cost_usd=12.0)]
+    baselines = {"sA": {"date": "2026-04-14", "cost_usd": 5.0}}
+    deltas = cctrack.compute_hook_deltas(rows, baselines)
     assert len(deltas) == 1
     assert abs(deltas[0]["cost_usd"] - 7.0) < 0.001
-    assert deltas[0]["input_tokens"] == 500
-    assert deltas[0]["output_tokens"] == 250
+
+
+def test_compute_hook_deltas_reset_below_baseline_is_counted():
+    """Regression: a resumed session can restart its counter BELOW the rolled-up
+    baseline (observed: baseline $12.84, live cumulative $7.94). Clamping to
+    zero silently dropped that day entirely."""
+    rows = [make_row(session_id="sA", ts="2026-06-12T10:00:00+00:00", cost_usd=7.94)]
+    baselines = {"sA": {"date": "2026-04-20", "cost_usd": 12.84}}
+    deltas = cctrack.compute_hook_deltas(rows, baselines)
+    assert len(deltas) == 1
+    assert abs(deltas[0]["cost_usd"] - 7.94) < 0.001
 
 
 def _days_ago(n: int) -> str:
@@ -433,7 +445,7 @@ def test_rollup_boundary_session_not_double_counted():
         assert abs(baselines["sA"]["cost_usd"] - 5.00) < 0.001
 
         deltas = cctrack.compute_hook_deltas(
-            cctrack.parse_hook_events(cctrack_dir=Path(d)), baselines)
+            cctrack.parse_hook_rows(cctrack_dir=Path(d)), baselines)
         assert len(deltas) == 1
         # Delta is 12 - 5 = 7, NOT the full 12. Total counted = 5 + 7 = 12.
         assert abs(deltas[0]["cost_usd"] - 7.00) < 0.001
@@ -1326,6 +1338,58 @@ def test_mtd_sessions_distinct_across_days(capsys):
     assert session_lines and session_lines[0].split()[-1] == "2"
 
 
+def test_report_energy_column_opt_in(capsys):
+    """--energy adds the column, MTD line and the estimate caveat; without it
+    the report is unchanged."""
+    fake_now = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
+    bucket = make_bucket(input=1000, output=1_000_000, cost=25.0)
+    bucket["energy_wh"] = 2000.0
+    daily = {"2026-07-15": bucket}
+    monthly = {"2026-07": dict(bucket)}
+
+    def run(show_energy):
+        with patch("cctrack.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            cctrack.print_report(daily, monthly, show_energy=show_energy)
+        return capsys.readouterr().out
+
+    off = run(False)
+    assert "Energy" not in off
+    assert "ESTIMATE" not in off
+
+    on = run(True)
+    assert "Energy" in on
+    assert "2.00 kWh" in on          # 2000 Wh
+    assert "ESTIMATE" in on          # caveat is shown, not buried
+    assert "US household" in on
+
+
+def test_report_tokens_never_come_from_hook(capsys):
+    """Regression: hook token fields are context snapshots. Even when hook data
+    is present, the Input/Output columns must reflect the JSONL logs."""
+    fake_now = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
+    daily = {"2026-07-15": make_bucket(input=6404, output=112882, cost=61.41)}
+    monthly = {"2026-07": make_bucket(input=6404, output=112882, cost=61.41)}
+    # A hook bucket carrying the snapshot-shaped values the old code preferred.
+    hook_daily = {"2026-07-15": {"cost": 67.55, "sessions": 1,
+                                 "input_tokens": 411811, "output_tokens": 80}}
+
+    with patch("cctrack.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        mock_dt.fromisoformat = datetime.fromisoformat
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        cctrack.print_report(daily, monthly, hook_daily=hook_daily,
+                             hook_install_date="2026-07-01")
+
+    out = capsys.readouterr().out
+    assert "112,882" in out      # JSONL output tokens
+    assert "6,404" in out        # JSONL input tokens
+    assert "411,811" not in out  # hook context-size snapshot must not appear
+    assert "67.55" in out        # cost still comes from the hook
+
+
 # ── discover_hook_data_dirs tests ─────────────────────────────────────
 
 def test_discover_hook_data_dirs_host_only():
@@ -1402,7 +1466,7 @@ def test_main_aggregates_sandy_hook_data():
         hook_dirs = [cctrack_dir, sb_dir]
         all_hook_events: list[dict] = []
         for hdir in hook_dirs:
-            all_hook_events.extend(cctrack.parse_hook_events(hdir))
+            all_hook_events.extend(cctrack.compute_hook_deltas(cctrack.parse_hook_rows(hdir)))
         hook_daily = cctrack.aggregate_hook_data(all_hook_events)
         # Both sessions counted: $5.00 + $95.30 = $100.30
         assert abs(hook_daily["2026-04-17"]["cost"] - 100.30) < 0.01

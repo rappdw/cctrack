@@ -130,6 +130,56 @@ def test_get_rates_haiku_3():
     assert r["output"] == 1.25
 
 
+def test_get_rates_opus_5():
+    """Opus 5 must NOT fall through to the legacy claude-opus-4 15/75 entry."""
+    r = cctrack.get_rates("claude-opus-5")
+    assert r["family"] == "claude-opus-5"
+    assert r["input"] == 5.0
+    assert r["output"] == 25.0
+    assert r["cache_read"] == 0.50
+    assert r["cache_write"] == 6.25
+    assert r["cache_write_1h"] == 10.0
+
+
+def test_get_rates_fable_and_mythos():
+    for m in ("claude-fable-5", "claude-mythos-5", "claude-mythos-preview"):
+        r = cctrack.get_rates(m)
+        assert r["input"] == 10.0, m
+        assert r["output"] == 50.0, m
+        assert r["cache_read"] == 1.00, m
+        assert r["cache_write_1h"] == 20.0, m
+
+
+def test_get_rates_sonnet_5_introductory_pricing():
+    """Sonnet 5 bills at $2/$10 through 2026-08-31, $3/$15 from Sep 1."""
+    intro = cctrack.get_rates("claude-sonnet-5", "2026-08-31")
+    assert intro["input"] == 2.0 and intro["output"] == 10.0
+    assert intro["cache_read"] == 0.20 and intro["cache_write_1h"] == 4.0
+
+    standard = cctrack.get_rates("claude-sonnet-5", "2026-09-01")
+    assert standard["input"] == 3.0 and standard["output"] == 15.0
+
+    # No date given → standard rates (never silently apply a past promo).
+    assert cctrack.get_rates("claude-sonnet-5")["input"] == 3.0
+
+
+def test_intro_pricing_does_not_leak_to_other_families():
+    assert cctrack.get_rates("claude-sonnet-4-6", "2026-08-01")["input"] == 3.0
+    assert cctrack.get_rates("claude-opus-5", "2026-08-01")["input"] == 5.0
+
+
+def test_calculate_cost_honours_event_date():
+    intro = cctrack.calculate_cost("claude-sonnet-5", 1_000_000, 0, 0, 0, date_str="2026-07-28")
+    later = cctrack.calculate_cost("claude-sonnet-5", 1_000_000, 0, 0, 0, date_str="2026-09-15")
+    assert abs(intro - 2.0) < 0.001
+    assert abs(later - 3.0) < 0.001
+
+
+def test_every_rate_entry_has_an_energy_tier():
+    for r in cctrack.RATES:
+        assert r["tier"] in cctrack.ENERGY_WH_PER_MTOK, r["family"]
+
+
 def test_get_rates_unknown_falls_back_to_sonnet():
     r = cctrack.get_rates("claude-mystery-99")
     assert r["family"] == "claude-sonnet-4"
@@ -226,6 +276,76 @@ def test_aggregate_1h_cache_cost():
     daily, monthly = cctrack.aggregate(events)
     assert abs(daily["2026-03-15"]["cost"] - 10.0) < 0.001
     assert daily["2026-03-15"]["cache_write_1h"] == 1_000_000
+
+
+# ── Energy estimation tests ────────────────────────────────────────────
+
+def test_energy_matches_published_per_prompt_anchor():
+    """A 1,000-in / 300-out Sonnet-tier prompt should land near the published
+    full-stack figures (~0.24-0.34 Wh/query) the model is calibrated against."""
+    wh = cctrack.estimate_energy_wh("claude-sonnet-5", 1000, 300, 0, 0)
+    assert 0.2 < wh < 0.4
+
+
+def test_energy_scales_with_model_tier():
+    args = (1000, 300, 0, 0)
+    haiku = cctrack.estimate_energy_wh("claude-haiku-4-5", *args)
+    sonnet = cctrack.estimate_energy_wh("claude-sonnet-5", *args)
+    opus = cctrack.estimate_energy_wh("claude-opus-5", *args)
+    fable = cctrack.estimate_energy_wh("claude-fable-5", *args)
+    assert haiku < sonnet < opus < fable
+
+
+def test_energy_output_tokens_dominate():
+    """Decode is far more energy-intensive per token than prefill."""
+    out = cctrack.estimate_energy_wh("claude-opus-5", 0, 1000, 0, 0)
+    inp = cctrack.estimate_energy_wh("claude-opus-5", 1000, 0, 0, 0)
+    assert out > inp * 10
+
+
+def test_energy_cache_read_is_cheap():
+    read = cctrack.estimate_energy_wh("claude-opus-5", 0, 0, 1000, 0)
+    inp = cctrack.estimate_energy_wh("claude-opus-5", 1000, 0, 0, 0)
+    assert abs(read - inp * 0.1) < 1e-9
+
+
+def test_energy_cache_write_ttl_does_not_change_energy():
+    """A 1-hour cache write costs more money but the same compute — only the
+    storage duration differs, so the energy estimate must be identical."""
+    five_min = cctrack.estimate_energy_wh("claude-opus-5", 0, 0, 0, 100_000, 0)
+    one_hour = cctrack.estimate_energy_wh("claude-opus-5", 0, 0, 0, 0, 100_000)
+    assert abs(five_min - one_hour) < 1e-9
+
+
+def test_energy_unknown_model_uses_default_tier():
+    unknown = cctrack.estimate_energy_wh("claude-brandnew-9", 1000, 300, 0, 0)
+    sonnet = cctrack.estimate_energy_wh("claude-sonnet-5", 1000, 300, 0, 0)
+    assert abs(unknown - sonnet) < 1e-9
+
+
+def test_energy_scale_env_var(monkeypatch):
+    base = cctrack.estimate_energy_wh("claude-opus-5", 0, 1000, 0, 0)
+    monkeypatch.setenv("CCTRACK_ENERGY_SCALE", "2.5")
+    assert abs(cctrack.estimate_energy_wh("claude-opus-5", 0, 1000, 0, 0) - base * 2.5) < 1e-9
+    monkeypatch.setenv("CCTRACK_ENERGY_SCALE", "not-a-number")
+    assert abs(cctrack.estimate_energy_wh("claude-opus-5", 0, 1000, 0, 0) - base) < 1e-9
+
+
+def test_format_energy_units():
+    assert cctrack.format_energy(12.3) == "12.3 Wh"
+    assert cctrack.format_energy(2500) == "2.50 kWh"
+
+
+def test_aggregate_accumulates_energy():
+    events = [
+        {"model": "claude-opus-5", "timestamp": "2026-07-15T10:00:00Z",
+         "input": 0, "output": 1_000_000, "cache_read": 0,
+         "cache_write": 0, "cache_write_1h": 0},
+    ]
+    daily, monthly = cctrack.aggregate(events)
+    # 1M output tokens at the opus tier = 2000 Wh.
+    assert abs(daily["2026-07-15"]["energy_wh"] - 2000.0) < 0.001
+    assert abs(monthly["2026-07"]["energy_wh"] - 2000.0) < 0.001
 
 
 # ── File discovery tests ───────────────────────────────────────────────
