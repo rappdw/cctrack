@@ -206,14 +206,19 @@ def fetch_remote_jsonl(host: str) -> str:
 
 def parse_remote_events(host: str) -> list[dict]:
     """Fetch and parse JSONL from a remote host via SSH.
-    Dedup by request_id across the host's files (resumed sessions)."""
+    Dedup by request_id across the host's files (resumed sessions).
+    Events are tagged with `host` as their source."""
     print(f"  Fetching from {host}...", file=sys.stderr)
     raw = fetch_remote_jsonl(host)
     if not raw:
         return []
 
     chunks = raw.split("___CCTRACK_FILE_SEP___")
-    return dedup_events(parse_lines(chunk.splitlines()) for chunk in chunks)
+    events = dedup_events(parse_lines(chunk.splitlines(), source=host) for chunk in chunks)
+    # Remote streams carry no per-file path; note the host so the source is clear.
+    for e in events:
+        e["_source_file"] = f"(remote {host})"
+    return events
 
 
 HOOK_FILE_SEP = "___CCTRACK_HOOK_FILE___"
@@ -603,8 +608,18 @@ def prompt_hook_install() -> None:
 
 # ── JSONL parsing + dedup ───────────────────────────────────────────────
 
-def parse_lines(lines: list[str]) -> list[dict]:
-    """Parse JSONL lines from a single file. Dedup by request_id (last wins)."""
+def _project_name(cwd: str) -> str:
+    """Human-friendly project label from an event's working directory."""
+    if not cwd:
+        return "(unknown)"
+    return Path(cwd).name or cwd
+
+
+def parse_lines(lines: list[str], source: str = "local") -> list[dict]:
+    """Parse JSONL lines from a single file. Dedup by request_id (last wins).
+    `source` labels which machine the events came from (host name, or 'local').
+    Each event also carries its project (from `cwd`), session id and git branch
+    so the explore view can attribute spend."""
     by_request_id: dict[str, dict] = {}
     no_request_id: list[dict] = []
 
@@ -640,6 +655,7 @@ def parse_lines(lines: list[str]) -> list[dict]:
             continue
 
         req_id = event.get("requestId", "")
+        cwd = event.get("cwd", "")
         entry = {
             "model": event.get("message", {}).get("model", ""),
             "timestamp": event.get("timestamp", ""),
@@ -649,6 +665,11 @@ def parse_lines(lines: list[str]) -> list[dict]:
             "cache_write": cache_write,
             "cache_write_1h": cache_write_1h,
             "_request_id": req_id,
+            "source": source,
+            "session_id": event.get("sessionId", ""),
+            "project": _project_name(cwd),
+            "cwd": cwd,
+            "git_branch": event.get("gitBranch", ""),
         }
 
         if req_id:
@@ -678,12 +699,16 @@ def dedup_events(event_lists) -> list[dict]:
 
 def parse_events(files: list[str]) -> list[dict]:
     """Parse all local JSONL files. Dedup by request_id across all files
-    (last event wins), so resumed sessions aren't double counted."""
+    (last event wins), so resumed sessions aren't double counted. Each event
+    is tagged with the file it came from (`_source_file`) for traceability."""
     event_lists = []
     for path in files:
         try:
             with open(path, "r", errors="replace") as f:
-                event_lists.append(parse_lines(f.readlines()))
+                events = parse_lines(f.readlines())
+            for e in events:
+                e["_source_file"] = path
+            event_lists.append(events)
         except (OSError, IOError):
             continue
     return dedup_events(event_lists)
@@ -759,39 +784,40 @@ def parse_hook_rows(cctrack_dir: Path | None = None) -> list[dict]:
     return _hook_rows_from_lines(lines)
 
 
-def _cost_increment(cur: float, prev: float) -> float:
-    """Increment contributed by a cumulative-cost reading.
-
-    Normally the session's `total_cost_usd` only climbs, so the increment is
-    cur - prev. But the counter RESTARTS when a session is resumed or its
-    context is compacted (observed: $67.55 -> $4.85 under one session id), and
-    a statusline render can momentarily report 0 before cost is populated.
-    Clamping those to zero — the previous behaviour — silently discarded every
-    dollar spent after the reset. Treat a meaningful drop as a restart, so the
-    new reading counts in full.
-
-    The drop must clear both a relative and an absolute floor so float jitter
-    on an unchanged value is never mistaken for a restart."""
-    if cur < prev - max(1e-6, abs(prev) * 0.001):
-        return max(0.0, cur)          # counter restarted: cur is a fresh total
-    return max(0.0, cur - prev)
-
-
 def compute_hook_deltas(rows: list[dict], baselines: dict | None = None) -> list[dict]:
     """Convert per-render cumulative cost readings into per-(session, date)
     spend, walking every row of each session in timestamp order.
 
-    Walking rows (rather than sampling one reading per day) matters: it captures
-    spend that happens before a mid-day counter reset, and it is immune to the
-    last render of a day reporting a stale or zero total.
+    The hook's `total_cost_usd` is a session-lifetime cumulative, and this only
+    ever books the INCREMENTS observed between renders — never the standing
+    level of the counter. Two consequences, both load-bearing:
 
-    A session's walk starts from its rolled-up baseline (see
-    load_session_baselines) so days already folded into a monthly summary are
-    not counted twice. Records with zero spend are dropped.
+    * First observation establishes a baseline that is NOT counted. If a
+      long-running session first appears at $1,304 (its earlier days having
+      never been captured — e.g. an unattended run that only rendered its
+      statusline partway through), that $1,304 was spent on days we have no
+      data for; booking it onto the first-seen day is wrong. We can only
+      attribute what we watch accumulate, so we start from the first reading
+      and count upward from there. A session that genuinely starts on the
+      observed day first renders near $0, so nothing real is lost.
+
+    * A drop rebaselines WITHOUT counting the new level. The counter falls back
+      on resume/compaction (or when parallel processes under one session id
+      interleave their own cumulatives). The pre-drop dollars were already
+      spent — not new — so re-adding the post-drop level would let a day's
+      booked spend exceed the counter's own peak, which is impossible for real
+      money (observed: a session whose counter never passed $1,086 was booked
+      at $2,083). After a drop we resume counting increments from the lower
+      level.
+
+    A rolled-up baseline (see load_session_baselines) seeds `prev` so days
+    already folded into a monthly summary aren't recounted — the same "count
+    only increments above the baseline" rule. Records with zero spend are
+    dropped. Rows lacking `ts` sort by `date_str`, so callers may pass one
+    aggregated reading per day.
 
     Only cost is derived from hook data — see _hook_rows_from_lines for why the
-    hook's token fields are unusable. Rows lacking `ts` sort by `date_str`,
-    so callers may pass one aggregated reading per day."""
+    hook's token fields are unusable."""
     by_session: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         by_session[r["session_id"]].append(r)
@@ -801,14 +827,22 @@ def compute_hook_deltas(rows: list[dict], baselines: dict | None = None) -> list
 
     for sid, session_rows in by_session.items():
         session_rows.sort(key=lambda r: r.get("ts") or r["date_str"])
-        prev = float(((baselines or {}).get(sid) or {}).get("cost_usd", 0.0))
+        base = (baselines or {}).get(sid)
+        # None → not yet observed; the first render sets the baseline and is
+        # not counted. A rolled-up baseline is a real prior level to count from.
+        prev = float(base["cost_usd"]) if base else None
         for r in session_rows:
             cur = float(r.get("cost_usd", 0.0))
             key = (sid, r["date_str"])
-            day_cost[key] += _cost_increment(cur, prev)
-            prev = cur
             if r.get("model"):
                 day_model.setdefault(key, r["model"])
+            if prev is None:
+                prev = cur                                   # first observation → baseline
+            elif cur < prev - max(1e-6, abs(prev) * 0.001):
+                prev = cur                                   # counter dropped → rebaseline
+            else:
+                day_cost[key] += cur - prev                  # normal climb → count increment
+                prev = cur
 
     result = []
     for (sid, date_str), cost in day_cost.items():
@@ -1442,7 +1476,260 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
     print()
 
 
+# ── Explore a single day ────────────────────────────────────────────────
+
+def _event_cost_breakdown(e: dict, date_str: str) -> dict:
+    """Per-token-class dollar cost of one event, at the rates in effect on its
+    own date. Keys: input, output, cache_read, cache_write, cache_write_1h."""
+    r = get_rates(e.get("model", ""), date_str)
+    return {
+        "input": e.get("input", 0) / 1_000_000 * r["input"],
+        "output": e.get("output", 0) / 1_000_000 * r["output"],
+        "cache_read": e.get("cache_read", 0) / 1_000_000 * r["cache_read"],
+        "cache_write": e.get("cache_write", 0) / 1_000_000 * r["cache_write"],
+        "cache_write_1h": e.get("cache_write_1h", 0) / 1_000_000 * r["cache_write_1h"],
+    }
+
+
+def _event_date(e: dict) -> str:
+    ts = e.get("timestamp", "")
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return ""
+
+
+def _pct(part: float, whole: float) -> str:
+    return f"{(100 * part / whole):.0f}%" if whole > 0 else "0%"
+
+
+def _bar(part: float, whole: float, width: int = 20) -> str:
+    filled = int(round(width * part / whole)) if whole > 0 else 0
+    return "█" * filled + "·" * (width - filled)
+
+
+def print_explore(events: list[dict], date_str: str,
+                  hook_by_source: dict | None = None,
+                  hook_by_session: dict | None = None,
+                  show_energy: bool = False,
+                  project_filter: str | None = None):
+    """Drill into a single day: where the money went (by token class), and
+    which models, projects, sessions and machines drove it. Costs are
+    JSONL-derived estimates; where the statusline hook covered a source its
+    authoritative cost is shown alongside so an inflated estimate is obvious.
+
+    With `project_filter`, the view is restricted to sessions whose project
+    (the basename of each event's working directory) matches, and a detail
+    block prints the full cwd, git branch and source file per session so an
+    unfamiliar project label can be traced to a real location on disk."""
+    hook_by_source = hook_by_source or {}
+    hook_by_session = hook_by_session or {}
+
+    day_events = [e for e in events if _event_date(e) == date_str]
+
+    title = "cctrack — Explore " + date_str
+    if project_filter:
+        title += f"  ·  project '{project_filter}'"
+    print(title)
+    print("══════════════════════════════════")
+    print()
+
+    def _matches_project(e: dict) -> bool:
+        if not project_filter:
+            return True
+        proj = e.get("project", "")
+        cwd = e.get("cwd", "")
+        return (proj == project_filter or proj.endswith(project_filter)
+                or project_filter in cwd)
+
+    if project_filter:
+        day_events = [e for e in day_events if _matches_project(e)]
+
+    if not day_events and (project_filter or not hook_by_source):
+        scope = f" for project '{project_filter}'" if project_filter else ""
+        print(f"No usage found for {date_str}{scope}.")
+        print()
+        return
+
+    # ── Totals: JSONL estimate vs authoritative hook, per source ──
+    jsonl_by_source: dict[str, float] = defaultdict(float)
+    classes = {"input": 0.0, "output": 0.0, "cache_read": 0.0,
+               "cache_write": 0.0, "cache_write_1h": 0.0}
+    tokens = {"input": 0, "output": 0, "cache_read": 0,
+              "cache_write": 0, "cache_write_1h": 0}
+    by_model: dict[str, dict] = defaultdict(lambda: {"cost": 0.0, "energy": 0.0, "events": 0})
+    by_project: dict[str, float] = defaultdict(float)
+    by_session: dict[tuple, dict] = defaultdict(
+        lambda: {"cost": 0.0, "models": set(), "project": "", "source": "",
+                 "cwds": set(), "branches": set(), "files": set(), "events": 0})
+    energy_total = 0.0
+
+    for e in day_events:
+        bd = _event_cost_breakdown(e, date_str)
+        cost = sum(bd.values())
+        src = e.get("source", "local")
+        jsonl_by_source[src] += cost
+        for k in classes:
+            classes[k] += bd[k]
+            tokens[k] += e.get(k, 0)
+        wh = estimate_energy_wh(e.get("model", ""), e.get("input", 0), e.get("output", 0),
+                                e.get("cache_read", 0), e.get("cache_write", 0),
+                                e.get("cache_write_1h", 0))
+        energy_total += wh
+        model = e.get("model", "") or "(unknown)"
+        by_model[model]["cost"] += cost
+        by_model[model]["energy"] += wh
+        by_model[model]["events"] += 1
+        by_project[e.get("project", "(unknown)")] += cost
+        skey = (src, e.get("session_id", ""))
+        s = by_session[skey]
+        s["cost"] += cost
+        s["events"] += 1
+        if e.get("model"):
+            s["models"].add(e["model"])
+        s["project"] = e.get("project", "(unknown)")
+        s["source"] = src
+        if e.get("cwd"):
+            s["cwds"].add(e["cwd"])
+        if e.get("git_branch"):
+            s["branches"].add(e["git_branch"])
+        if e.get("_source_file"):
+            s["files"].add(e["_source_file"])
+
+    jsonl_total = sum(jsonl_by_source.values())
+
+    print(f"Total (JSONL-estimated):  ${jsonl_total:,.2f}")
+    if hook_by_source:
+        hook_total = sum(hook_by_source.values())
+        print(f"Total (hook-authoritative): ${hook_total:,.2f}")
+        if jsonl_total > 0 and hook_total > 0:
+            ratio = jsonl_total / hook_total
+            if ratio > 1.15 or ratio < 0.87:
+                print(f"  ⚠ JSONL estimate is {ratio:.2f}× the authoritative hook cost —")
+                print(f"    the breakdown below is JSONL-derived and may be distorted.")
+    if show_energy:
+        print(f"Energy (est):             {format_energy(energy_total)}")
+    print()
+
+    # ── Where the money went: dollar decomposition by token class ──
+    print("Where it went (by token class):")
+    order = [("output", "Output"), ("cache_write_1h", "Cache write 1h"),
+             ("cache_write", "Cache write 5m"), ("input", "Input"),
+             ("cache_read", "Cache read")]
+    for key, label in sorted(order, key=lambda kv: -classes[kv[0]]):
+        amt = classes[key]
+        if amt <= 0:
+            continue
+        print(f"  {label:<15} ${amt:>10,.2f}  {_pct(amt, jsonl_total):>4}  "
+              f"{_bar(amt, jsonl_total)}  {format_tokens(tokens[key])} tok")
+    print()
+
+    # ── By model ──
+    print("By model:")
+    saw_unknown = False
+    for model, d in sorted(by_model.items(), key=lambda kv: -kv[1]["cost"]):
+        mark = "" if is_known_model(model) else " ?"
+        if mark:
+            saw_unknown = True
+        short = model[len("claude-"):] if model.startswith("claude-") else model
+        energy_col = f"  {format_energy(d['energy']):>10}" if show_energy else ""
+        print(f"  {short + mark:<22} ${d['cost']:>10,.2f}  {_pct(d['cost'], jsonl_total):>4}  "
+              f"{d['events']:>5} req{energy_col}")
+    print()
+
+    # ── By project ──
+    if len(by_project) > 1 or (by_project and "(unknown)" not in by_project):
+        print("By project:")
+        for proj, cost in sorted(by_project.items(), key=lambda kv: -kv[1]):
+            print(f"  {proj:<28} ${cost:>10,.2f}  {_pct(cost, jsonl_total):>4}")
+        print()
+
+    # ── By source (machine) ──
+    if len(jsonl_by_source) > 1:
+        print("By machine:")
+        for src in sorted(jsonl_by_source, key=lambda s: -jsonl_by_source[s]):
+            j = jsonl_by_source[src]
+            h = hook_by_source.get(src)
+            hook_note = f"   (hook: ${h:,.2f})" if h is not None else "   (no hook — estimate)"
+            print(f"  {src:<16} ${j:>10,.2f}  {_pct(j, jsonl_total):>4}{hook_note}")
+        print()
+
+    # ── Top sessions ──
+    ranked = sorted(by_session.items(), key=lambda kv: -kv[1]["cost"])
+    if ranked:
+        print(f"Top sessions ({min(len(ranked), 10)} of {len(ranked)}):")
+        print(f"  {'Session':<14} {'Project':<20} {'Model':<14} {'JSONL $':>10} {'Hook $':>10}")
+        print(f"  {'─'*14} {'─'*20} {'─'*14} {'─'*10} {'─'*10}")
+        for (src, sid), d in ranked[:10]:
+            hook_cost = hook_by_session.get((src, sid))
+            hook_str = f"${hook_cost:>8,.2f}" if hook_cost is not None else "     —"
+            models = "+".join(sorted(
+                m[len("claude-"):] if m.startswith("claude-") else m for m in d["models"]
+            )) or "(unknown)"
+            sid_short = (sid[:12] + "…") if len(sid) > 13 else (sid or "(none)")
+            print(f"  {sid_short:<14} {d['project'][:20]:<20} {models[:14]:<14} "
+                  f"${d['cost']:>8,.2f} {hook_str:>10}")
+        print()
+
+    if saw_unknown:
+        print("  ? = unrecognized model — priced at default Sonnet rates; update the rate card")
+        print()
+
+    # ── Session sources (where the events physically live) ──
+    # Always show for a filtered view; otherwise only when a project's label is
+    # ambiguous (its cwd is a container path, or one basename spans several dirs).
+    def _needs_tracing() -> bool:
+        cwds_by_project: dict[str, set] = defaultdict(set)
+        for d in by_session.values():
+            cwds_by_project[d["project"]].update(d["cwds"])
+        for cwds in cwds_by_project.values():
+            if len(cwds) > 1:
+                return True
+            for c in cwds:
+                # container/automation paths rarely match a host project dir
+                if c.startswith(("/workspace", "/root", "/tmp", "/mnt")):
+                    return True
+        return False
+
+    if ranked and (project_filter or _needs_tracing()):
+        print("Session sources (trace a project label to its real location):")
+        for (src, sid), d in ranked:
+            if not project_filter and not any(
+                c.startswith(("/workspace", "/root", "/tmp", "/mnt")) for c in d["cwds"]
+            ) and len(d["cwds"]) <= 1:
+                continue
+            sid_short = (sid[:12] + "…") if len(sid) > 13 else (sid or "(none)")
+            branch = ", ".join(sorted(d["branches"])) or "-"
+            print(f"  {sid_short}  ${d['cost']:,.2f}  ({d['events']} ev, branch {branch})")
+            for cwd in sorted(d["cwds"]) or ["(no cwd recorded)"]:
+                print(f"     cwd:  {cwd}")
+            for fpath in sorted(d["files"]):
+                print(f"     file: {fpath}")
+        print()
+
+    print("Costs are JSONL-derived estimates. Where a machine runs the statusline")
+    print("hook, its authoritative cost is shown for comparison; large gaps mean the")
+    print("estimate (not the hook) is off.")
+    if not project_filter and ranked and _needs_tracing():
+        print("Re-run with --explore <date> --project <name> to trace one project.")
+    print()
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────
+
+def resolve_date(token: str) -> str:
+    """Resolve a --explore argument to a YYYY-MM-DD string.
+    Accepts an explicit date, or 'today'/'yesterday'."""
+    t = token.strip().lower()
+    now = datetime.now(timezone.utc)
+    if t in ("today", "now"):
+        return now.strftime("%Y-%m-%d")
+    if t == "yesterday":
+        return (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    # Validate an explicit date; raise for anything else so the CLI can report it.
+    datetime.strptime(token.strip(), "%Y-%m-%d")
+    return token.strip()
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1464,6 +1751,17 @@ def main():
         "--energy", action="store_true",
         help="Show estimated inference energy (kWh). Rough estimate — see the "
              "note printed with the report. Scale with CCTRACK_ENERGY_SCALE."
+    )
+    parser.add_argument(
+        "--explore", metavar="DATE",
+        help="Break down a single day (YYYY-MM-DD, or 'yesterday'/'today') by "
+             "token class, model, project, session and machine."
+    )
+    parser.add_argument(
+        "--project", metavar="NAME",
+        help="With --explore, restrict to one project and show each session's "
+             "full working directory, git branch and source file (traces an "
+             "unfamiliar project label to a real location)."
     )
     parser.add_argument(
         "--install-hook", action="store_true",
@@ -1528,7 +1826,8 @@ def main():
 
     all_events = list(local_events)
     sources = [{"name": "local", "daily": local_daily,
-                "hook_daily": local_hook_daily, "install_date": local_install}]
+                "hook_daily": local_hook_daily, "install_date": local_install,
+                "deltas": local_hook_events}]
 
     # ── One source per remote host. Deltas are computed per host so a
     # session's cumulative history never mixes across hosts. ──
@@ -1546,14 +1845,37 @@ def main():
             remote_install = min(remote_hook_daily.keys()) if remote_hook_daily else None
 
             sources.append({"name": host, "daily": remote_daily,
-                            "hook_daily": remote_hook_daily, "install_date": remote_install})
-
-    # Global aggregates feed the token columns; cost is composed per source.
-    daily, monthly = aggregate(all_events)
+                            "hook_daily": remote_hook_daily, "install_date": remote_install,
+                            "deltas": remote_deltas})
 
     # Suggest hook if not installed
     if not is_hook_installed():
         prompt_hook_install()
+
+    # ── Explore a single day (run and exit) ──
+    if args.explore:
+        try:
+            target = resolve_date(args.explore)
+        except ValueError:
+            print(f"Invalid --explore date: {args.explore!r} "
+                  f"(use YYYY-MM-DD, 'today', or 'yesterday')", file=sys.stderr)
+            return
+        hook_by_source: dict[str, float] = defaultdict(float)
+        hook_by_session: dict[tuple, float] = defaultdict(float)
+        for src in sources:
+            for d in src.get("deltas", []):
+                if d["date_str"] == target:
+                    hook_by_source[src["name"]] += d["cost_usd"]
+                    hook_by_session[(src["name"], d["session_id"])] += d["cost_usd"]
+        print_explore(all_events, target,
+                      hook_by_source=dict(hook_by_source),
+                      hook_by_session=dict(hook_by_session),
+                      show_energy=args.energy,
+                      project_filter=args.project)
+        return
+
+    # Global aggregates feed the token columns; cost is composed per source.
+    daily, monthly = aggregate(all_events)
 
     print_report(daily, monthly, days=args.days, sources=sources,
                  show_energy=args.energy)

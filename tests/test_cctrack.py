@@ -20,6 +20,8 @@ def make_event(
     cache_read=200,
     cache_write=100,
     event_type="assistant",
+    cwd="/home/user/myproject",
+    git_branch="main",
 ):
     """Build a JSONL event dict."""
     return {
@@ -27,6 +29,8 @@ def make_event(
         "sessionId": session_id,
         "requestId": request_id,
         "timestamp": timestamp,
+        "cwd": cwd,
+        "gitBranch": git_branch,
         "message": {
             "model": model,
             "role": "assistant",
@@ -833,3 +837,237 @@ def test_end_to_end():
 
         expected_cost = opus_cost + sonnet_cost
         assert abs(daily["2026-03-15"]["cost"] - expected_cost) < 0.001
+
+
+# ── Attribution: project / session / source on parsed events ────────────
+
+def test_parse_lines_captures_project_and_session():
+    lines = [json.dumps(make_event(cwd="/home/user/webapp", session_id="s1"))]
+    events = cctrack.parse_lines(lines)
+    assert events[0]["project"] == "webapp"
+    assert events[0]["cwd"] == "/home/user/webapp"
+    assert events[0]["session_id"] == "s1"
+    assert events[0]["source"] == "local"
+    assert events[0]["git_branch"] == "main"
+
+
+def test_parse_lines_source_label():
+    lines = [json.dumps(make_event())]
+    events = cctrack.parse_lines(lines, source="dgx")
+    assert events[0]["source"] == "dgx"
+
+
+def test_parse_lines_missing_cwd_is_unknown_project():
+    e = make_event()
+    del e["cwd"]
+    events = cctrack.parse_lines([json.dumps(e)])
+    assert events[0]["project"] == "(unknown)"
+
+
+def test_project_name_helper():
+    assert cctrack._project_name("/a/b/cctrack") == "cctrack"
+    assert cctrack._project_name("") == "(unknown)"
+
+
+# ── Date resolution for --explore ───────────────────────────────────────
+
+def test_resolve_date_explicit():
+    assert cctrack.resolve_date("2026-08-03") == "2026-08-03"
+
+
+def test_resolve_date_keywords():
+    from unittest.mock import patch
+    from datetime import datetime, timezone
+    fake = datetime(2026, 8, 4, 12, 0, 0, tzinfo=timezone.utc)
+    with patch("cctrack.datetime") as m:
+        m.now.return_value = fake
+        m.strptime = datetime.strptime
+        assert cctrack.resolve_date("today") == "2026-08-04"
+        assert cctrack.resolve_date("yesterday") == "2026-08-03"
+
+
+def test_resolve_date_invalid_raises():
+    import pytest
+    with pytest.raises(ValueError):
+        cctrack.resolve_date("not-a-date")
+
+
+# ── Event cost breakdown ────────────────────────────────────────────────
+
+def test_event_cost_breakdown_by_class():
+    e = {"model": "claude-opus-5", "input": 1_000_000, "output": 1_000_000,
+         "cache_read": 1_000_000, "cache_write": 1_000_000, "cache_write_1h": 1_000_000}
+    bd = cctrack._event_cost_breakdown(e, "2026-08-03")
+    assert abs(bd["input"] - 5.0) < 1e-9
+    assert abs(bd["output"] - 25.0) < 1e-9
+    assert abs(bd["cache_read"] - 0.5) < 1e-9
+    assert abs(bd["cache_write"] - 6.25) < 1e-9
+    assert abs(bd["cache_write_1h"] - 10.0) < 1e-9
+
+
+def test_event_cost_breakdown_is_date_aware():
+    e = {"model": "claude-sonnet-5", "input": 1_000_000, "output": 0,
+         "cache_read": 0, "cache_write": 0, "cache_write_1h": 0}
+    intro = cctrack._event_cost_breakdown(e, "2026-08-31")
+    later = cctrack._event_cost_breakdown(e, "2026-09-01")
+    assert abs(intro["input"] - 2.0) < 1e-9
+    assert abs(later["input"] - 3.0) < 1e-9
+
+
+# ── print_explore ───────────────────────────────────────────────────────
+
+def _mk(model, sid, project, out=0, cr=0, cw1h=0, inp=0, source="local",
+        ts="2026-08-03T10:00:00Z", cwd=None, git_branch="main", source_file=None):
+    return {"model": model, "timestamp": ts, "input": inp, "output": out,
+            "cache_read": cr, "cache_write": 0, "cache_write_1h": cw1h,
+            "session_id": sid, "project": project, "source": source,
+            "cwd": cwd if cwd is not None else f"/home/user/{project}",
+            "git_branch": git_branch,
+            "_source_file": source_file or f"/logs/{project}/{sid}.jsonl"}
+
+
+def test_explore_no_data(capsys):
+    cctrack.print_explore([], "2026-08-03")
+    out = capsys.readouterr().out
+    assert "No usage found for 2026-08-03" in out
+
+
+def test_explore_filters_to_date(capsys):
+    events = [
+        _mk("claude-opus-5", "s1", "proj", out=1_000_000, ts="2026-08-03T10:00:00Z"),
+        _mk("claude-opus-5", "s2", "proj", out=1_000_000, ts="2026-08-02T10:00:00Z"),
+    ]
+    cctrack.print_explore(events, "2026-08-03")
+    out = capsys.readouterr().out
+    # Only the 08-03 event: 1M opus output = $25.00
+    assert "$25.00" in out
+    assert "s2" not in out
+
+
+def test_explore_token_class_decomposition(capsys):
+    # $25 output vs $10 1h-cache-write on opus → output ranks first.
+    events = [_mk("claude-opus-5", "s1", "proj", out=1_000_000, cw1h=1_000_000)]
+    cctrack.print_explore(events, "2026-08-03")
+    out = capsys.readouterr().out
+    assert "Where it went" in out
+    body = out.split("Where it went")[1]
+    assert body.index("Output") < body.index("Cache write 1h")
+
+
+def test_explore_by_model_and_project(capsys):
+    events = [
+        _mk("claude-fable-5", "s1", "monorepo", out=1_000_000),   # $50
+        _mk("claude-opus-5", "s2", "webapp", out=100_000),        # $2.50
+    ]
+    cctrack.print_explore(events, "2026-08-03")
+    out = capsys.readouterr().out
+    assert "fable-5" in out and "opus-5" in out
+    assert "monorepo" in out and "webapp" in out
+    # fable-5 dominates → listed first
+    assert out.index("fable-5") < out.index("opus-5")
+
+
+def test_explore_hook_reconciliation_and_flag(capsys):
+    # JSONL prices this session at $50; hook says $200 → estimate is 0.25× → warn.
+    events = [_mk("claude-fable-5", "runaway", "monorepo", out=1_000_000, source="air")]
+    cctrack.print_explore(
+        events, "2026-08-03",
+        hook_by_source={"air": 200.0},
+        hook_by_session={("air", "runaway"): 200.0},
+    )
+    out = capsys.readouterr().out
+    assert "hook-authoritative" in out
+    assert "$200.00" in out
+    assert "⚠" in out
+    # session row shows both estimate and authoritative
+    assert "$50.00" in out
+
+
+def test_explore_flags_unknown_model(capsys):
+    events = [_mk("claude-brandnew-9", "s1", "proj", out=1_000_000)]
+    cctrack.print_explore(events, "2026-08-03")
+    out = capsys.readouterr().out
+    assert "?" in out
+    assert "unrecognized model" in out
+
+
+def test_explore_by_machine_only_when_multiple(capsys):
+    events = [
+        _mk("claude-opus-5", "s1", "p", out=1_000_000, source="air"),
+        _mk("claude-opus-5", "s2", "p", out=1_000_000, source="dgx"),
+    ]
+    cctrack.print_explore(events, "2026-08-03",
+                          hook_by_source={"air": 20.0})
+    out = capsys.readouterr().out
+    assert "By machine:" in out
+    assert "air" in out and "dgx" in out
+    assert "no hook" in out  # dgx has no hook coverage
+
+
+def test_explore_single_machine_no_machine_section(capsys):
+    events = [_mk("claude-opus-5", "s1", "p", out=1_000_000)]
+    cctrack.print_explore(events, "2026-08-03")
+    out = capsys.readouterr().out
+    assert "By machine:" not in out
+
+
+# ── Explore project drill-down / traceability ──────────────────────────
+
+def test_parse_events_tags_source_file():
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as d:
+        path = write_jsonl(d, "proj/s.jsonl", [make_event(cwd="/home/u/proj")])
+        events = cctrack.parse_events([path])
+        assert events[0]["_source_file"] == path
+
+
+def test_explore_project_filter_restricts(capsys):
+    events = [
+        _mk("claude-opus-5", "s1", "team-inbox", out=1_000_000),
+        _mk("claude-opus-5", "s2", "other", out=1_000_000),
+    ]
+    cctrack.print_explore(events, "2026-08-03", project_filter="team-inbox")
+    out = capsys.readouterr().out
+    assert "project 'team-inbox'" in out
+    assert "team-inbox" in out
+    assert "other" not in out
+    # Only the team-inbox event's $25 counts.
+    assert "$25.00" in out
+
+
+def test_explore_project_filter_shows_cwd_and_file(capsys):
+    events = [_mk("claude-opus-5", "s1", "team-inbox", out=1_000_000,
+                  cwd="/workspace/team-inbox",
+                  source_file="/home/u/.sandy/sandboxes/sb7/claude/projects/x/s1.jsonl")]
+    cctrack.print_explore(events, "2026-08-03", project_filter="team-inbox")
+    out = capsys.readouterr().out
+    assert "Session sources" in out
+    assert "/workspace/team-inbox" in out          # the real cwd
+    assert "sandboxes/sb7" in out                    # which sandbox it lives in
+
+
+def test_explore_project_filter_no_match(capsys):
+    events = [_mk("claude-opus-5", "s1", "realproj", out=1_000_000)]
+    cctrack.print_explore(events, "2026-08-03", project_filter="ghost")
+    out = capsys.readouterr().out
+    assert "No usage found for 2026-08-03 for project 'ghost'" in out
+
+
+def test_explore_flags_container_path_for_tracing(capsys):
+    """An unfiltered view surfaces the trace hint + sources when a cwd is a
+    container/automation path that won't match a host project directory."""
+    events = [_mk("claude-opus-5", "s1", "team-inbox", out=1_000_000,
+                  cwd="/workspace/team-inbox")]
+    cctrack.print_explore(events, "2026-08-03")
+    out = capsys.readouterr().out
+    assert "Session sources" in out
+    assert "--project" in out       # suggests the drill-down
+
+
+def test_explore_normal_paths_no_trace_noise(capsys):
+    """Ordinary host projects don't trigger the Session-sources block."""
+    events = [_mk("claude-opus-5", "s1", "webapp", out=1_000_000,
+                  cwd="/home/user/webapp")]
+    cctrack.print_explore(events, "2026-08-03")
+    out = capsys.readouterr().out
+    assert "Session sources" not in out

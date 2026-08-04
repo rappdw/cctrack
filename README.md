@@ -59,6 +59,32 @@ Daily breakdown:
 4. Calculates cost using Anthropic's published rates per model
 5. Prints daily breakdown with input/output/cache token splits and monthly summaries
 
+## Explore a day
+
+When a day's cost looks wrong or surprisingly high, `--explore` breaks it down:
+
+```bash
+cctrack --explore 2026-08-03          # a specific day
+cctrack --explore yesterday           # or 'today'
+cctrack --explore yesterday --remote air dgx   # across machines
+```
+
+It reports, for that day:
+
+- **Where it went** — the day's cost decomposed by token class (output, 1h/5m cache writes, input, cache reads), so a cache-write blowup or a runaway output loop is obvious at a glance.
+- **By model / by project / by machine** — cost and share for each, so you can see which model, which repo, and which host drove it.
+- **Top sessions** — ranked by cost, each with its project and model, and — where the statusline hook covered that session — its **authoritative** cost next to the JSONL estimate.
+
+The day's JSONL-estimated total is shown next to the hook-authoritative total. If they diverge by more than ~15% the report says so: a big gap means the estimate is off (incomplete logs, or a model the rate card doesn't know), not that you actually spent that much. This is the fastest way to tell a real expensive day from an accounting artifact.
+
+The project label is the basename of each session's working directory (`cwd`). When that's an unfamiliar name — a container path like `/workspace/team-inbox`, or a directory you don't recognize — trace it to its real location:
+
+```bash
+cctrack --explore 2026-08-03 --project team-inbox
+```
+
+This restricts the view to that project and prints each session's full `cwd`, git branch, and the log file on disk (which reveals the host directory or the specific Sandy sandbox it came from). The unfiltered view flags this automatically when a `cwd` looks like a container path. `scripts/trace_project.py` and `scripts/diagnose_session_cost.py` are standalone versions of the trace and per-session cost diagnostics.
+
 ## Remote aggregation
 
 With `--remote`, cctrack SSHs to each host and streams back both the JSONL logs and the host's statusline hook data (`~/.claude/cctrack/`) for local parsing, so authoritative hook costs from every machine are summed per day. Requires SSH key auth.
