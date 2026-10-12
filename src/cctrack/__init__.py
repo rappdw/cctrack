@@ -281,12 +281,83 @@ def format_energy(wh: float) -> str:
 
 # ── File discovery ──────────────────────────────────────────────────────
 
+# Sandy sandboxes (https://github.com/rappdw/sandy). Per sandy's host-side path
+# contract, each sandbox root holds one directory per agent home — claude/
+# (mounted at ~/.claude inside the sandbox) and codex/ (~/.codex). Everything
+# else under a sandbox root is private. Roots are found via `sandy
+# --print-state` (sandboxes[].path, which follows $SANDY_HOME); without sandy on
+# PATH we fall back to $SANDY_HOME/sandboxes/* (default ~/.sandy). Dot-entries
+# are never sandboxes: an in-progress `sandy --rsync-from` pull lives in a
+# hidden .rsync-from.<name>.<pid>/ copy, and counting it would double the
+# sandbox's spend.
+
+def sandy_home() -> Path:
+    return Path(os.environ.get("SANDY_HOME") or (Path.home() / ".sandy"))
+
+
+def _sandy_print_state() -> list[str] | None:
+    """sandboxes[].path from `sandy --print-state`, or None if unavailable."""
+    import shutil
+    if not shutil.which("sandy"):
+        return None
+    try:
+        r = subprocess.run(["sandy", "--print-state"], capture_output=True,
+                           text=True, timeout=30)
+        if r.returncode != 0:
+            return None
+        state = json.loads(r.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError):
+        return None
+    boxes = state.get("sandboxes") if isinstance(state, dict) else None
+    if not isinstance(boxes, list):
+        return None
+    return [b["path"] for b in boxes if isinstance(b, dict) and b.get("path")]
+
+
+def _is_sandbox_name(name: str, has_workspace_json: bool | None) -> bool:
+    """Which entries of sandboxes/ are real sandboxes. A sandbox is named
+    <workspace basename>-<sha8> and nothing strips a leading dot, so a workspace
+    like ~/.dotfiles gets a REAL sandbox ".dotfiles-1a2b3c4d". Among dot-entries:
+    .rsync-from.* is an in-progress copy of another sandbox (counting it double
+    counts); *.lock dirs hold only a pid; any other dot-dir is a sandbox iff it
+    holds WORKSPACE.json (written at every launch since sandy 0.10.1).
+    `has_workspace_json` None means "unknown" (trust the source)."""
+    if name in (".", ".."):
+        return False
+    if not name.startswith("."):
+        return True
+    if name.startswith(".rsync-from.") or name.endswith(".lock"):
+        return False
+    return has_workspace_json is not False
+
+
+def sandbox_roots() -> list[Path]:
+    """Root directory of every Sandy sandbox on this machine.
+
+    Uses `sandy --print-state` when available, else every entry of
+    $SANDY_HOME/sandboxes/. Dot-named sandboxes are always added by scanning
+    sandboxes/ directly: sandy's own enumeration (and so --print-state) skips
+    them today, which would silently drop their usage."""
+    base = sandy_home() / "sandboxes"
+    entries = sorted(p for p in base.iterdir() if p.is_dir()) if base.is_dir() else []
+    paths = _sandy_print_state()
+    candidates = [Path(p) for p in paths] if paths is not None else list(entries)
+    candidates += [p for p in entries if p.name.startswith(".")]
+    roots = {p for p in candidates
+             if _is_sandbox_name(p.name, (p / "WORKSPACE.json").is_file()
+                                 if p.name.startswith(".") else None)}
+    return sorted(roots)
+
+
 def default_dirs() -> list[str]:
-    home = Path.home()
-    dirs = [str(home / ".claude" / "projects")]
-    sandy = home / ".sandy" / "sandboxes"
-    if sandy.exists():
-        dirs.append(str(sandy))
+    """Claude Code transcript dirs: the host's ~/.claude/projects plus each
+    sandbox's claude/projects. Only projects/ holds transcripts — claude/ also
+    has history.jsonl, job timelines and tool-audit logs, which aren't."""
+    dirs = [str(Path.home() / ".claude" / "projects")]
+    for root in sandbox_roots():
+        proj = root / "claude" / "projects"
+        if proj.is_dir():
+            dirs.append(str(proj))
     return dirs
 
 
@@ -304,14 +375,75 @@ def discover_files(dirs: list[str]) -> list[str]:
 
 # ── Remote host support ────────────────────────────────────────────────
 
-REMOTE_DIRS = "~/.claude/projects ~/.sandy/sandboxes"
+_STATE_END = "___CCTRACK_SANDY_STATE_END___"
+_remote_roots_cache: dict[str, list[str]] = {}
+
+
+def remote_sandbox_roots(host: str) -> list[str]:
+    """Sandy sandbox roots on a remote host, found the same way as locally:
+    `sandy --print-state` if the host has sandy, else the shell glob of
+    $SANDY_HOME/sandboxes/*/, plus dot-named sandboxes (dot-dirs holding
+    WORKSPACE.json), filtered by _is_sandbox_name. One SSH call, cached."""
+    if host in _remote_roots_cache:
+        return _remote_roots_cache[host]
+    remote_cmd = (
+        "command -v sandy >/dev/null 2>&1 && sandy --print-state 2>/dev/null; "
+        f"echo '{_STATE_END}'; "
+        'B="${SANDY_HOME:-$HOME/.sandy}/sandboxes"; '
+        'ls -1d "$B"/*/ 2>/dev/null; '
+        f"echo '{_STATE_END}'; "
+        'for d in "$B"/.*/; do [ -f "$d/WORKSPACE.json" ] && echo "$d"; done 2>/dev/null; true'
+    )
+    cmd = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, remote_cmd]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout or ""
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        out = ""
+    if not isinstance(out, str):
+        out = ""
+    state_part, _, rest = out.partition(_STATE_END)
+    glob_part, _, dot_part = rest.partition(_STATE_END)
+    paths = None
+    try:
+        state = json.loads(state_part) if state_part.strip() else None
+        boxes = state.get("sandboxes") if isinstance(state, dict) else None
+        if isinstance(boxes, list):
+            paths = [b["path"] for b in boxes if isinstance(b, dict) and b.get("path")]
+    except (json.JSONDecodeError, ValueError):
+        paths = None
+    if paths is None:
+        paths = [l.strip() for l in glob_part.splitlines() if l.strip()]
+    # Dot-dirs listed here were confirmed to hold WORKSPACE.json remotely.
+    dot_paths = [l.strip() for l in dot_part.splitlines() if l.strip()]
+    roots = set()
+    for p in paths:
+        p = p.rstrip("/")
+        name = p.rsplit("/", 1)[-1]
+        if _is_sandbox_name(name, None if not name.startswith(".") else
+                            any(d.rstrip("/") == p for d in dot_paths)):
+            roots.add(p)
+    for d in dot_paths:
+        d = d.rstrip("/")
+        if _is_sandbox_name(d.rsplit("/", 1)[-1], True):
+            roots.add(d)
+    roots = sorted(roots)
+    _remote_roots_cache[host] = roots
+    return roots
+
+
+def _q(path: str) -> str:
+    import shlex
+    return shlex.quote(path)
 
 
 def fetch_remote_jsonl(host: str) -> str:
-    """SSH to host and cat all JSONL files from default dirs. Returns raw output."""
+    """SSH to host and cat Claude transcripts: ~/.claude/projects plus each
+    sandbox's claude/projects. Returns raw output."""
+    dirs = " ".join(['"$HOME/.claude/projects"']
+                    + [_q(f"{r}/claude/projects") for r in remote_sandbox_roots(host)])
     cmd = [
         "ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host,
-        f"find {REMOTE_DIRS} -name '*.jsonl' -exec echo '___CCTRACK_FILE_SEP___' \\; -exec cat {{}} \\; 2>/dev/null"
+        f"find {dirs} -name '*.jsonl' -exec echo '___CCTRACK_FILE_SEP___' \\; -exec cat {{}} \\; 2>/dev/null"
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -350,18 +482,20 @@ BASELINE_FILE_SEP = "___CCTRACK_BASELINE_FILE___"
 
 # Hook data locations on remote hosts: the host's own cctrack dir plus any
 # Sandy sandbox equivalents (mirrors discover_hook_data_dirs).
-REMOTE_HOOK_DIRS = "~/.claude/cctrack ~/.sandy/sandboxes"
 
 
 def fetch_remote_hook_data(host: str) -> str:
-    """SSH to host and cat all statusline JSONL + monthly summary files.
+    """SSH to host and cat all statusline JSONL + monthly summary files from
+    ~/.claude/cctrack and each sandbox's claude/cctrack.
     Returns raw output with file-type separators."""
+    hook_dirs = " ".join(['"$HOME/.claude/cctrack"']
+                         + [_q(f"{r}/claude/cctrack") for r in remote_sandbox_roots(host)])
     remote_cmd = (
-        f"find {REMOTE_HOOK_DIRS} -name 'statusline*.jsonl' "
+        f"find {hook_dirs} -name 'statusline*.jsonl' "
         f"-exec echo '{HOOK_FILE_SEP}' \\; -exec cat {{}} \\; 2>/dev/null; "
-        f"find {REMOTE_HOOK_DIRS} -name 'monthly-*.json' "
+        f"find {hook_dirs} -name 'monthly-*.json' "
         f"-exec echo '{MONTHLY_FILE_SEP}' \\; -exec cat {{}} \\; 2>/dev/null; "
-        f"find {REMOTE_HOOK_DIRS} -name 'session-baselines.json' "
+        f"find {hook_dirs} -name 'session-baselines.json' "
         f"-exec echo '{BASELINE_FILE_SEP}' \\; -exec cat {{}} \\; 2>/dev/null; "
         f"true"
     )
@@ -510,17 +644,15 @@ def cctrack_dir() -> Path:
 
 
 def discover_hook_data_dirs() -> list[Path]:
-    """Return all directories that may contain cctrack hook data.
-    Includes the host's ~/.claude/cctrack and any Sandy sandbox equivalents
-    at ~/.sandy/sandboxes/*/claude/cctrack."""
+    """Return all directories that may contain cctrack hook data: the host's
+    ~/.claude/cctrack and each Sandy sandbox's claude/cctrack."""
     dirs = []
     if CCTRACK_DIR.exists():
         dirs.append(CCTRACK_DIR)
-    sandy = Path.home() / ".sandy" / "sandboxes"
-    if sandy.exists():
-        for candidate in sandy.glob("*/claude/cctrack"):
-            if candidate.is_dir() and candidate not in dirs:
-                dirs.append(candidate)
+    for root in sandbox_roots():
+        candidate = root / "claude" / "cctrack"
+        if candidate.is_dir() and candidate not in dirs:
+            dirs.append(candidate)
     return dirs
 
 
@@ -710,7 +842,12 @@ if cctrack_dir.exists():
         print("ssh command not found", file=sys.stderr)
 
 
-DEFAULT_ACCURACY_FACTOR = 1.25
+# Ratio of hook (Claude Code's own) cost to JSONL-priced cost, used only when
+# it can't be measured from overlapping days. It was once 1.25 on the belief
+# that logs undercount ~20-25%; that gap was entirely rate-card error, and with
+# correct prices measured ratios sit at 0.99-1.02x. A stale 1.25 inflated every
+# unmeasured day by a quarter.
+DEFAULT_ACCURACY_FACTOR = 1.0
 
 
 def prompt_hook_install() -> None:
@@ -867,14 +1004,36 @@ def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
 
 
-def discover_codex_files(home: Path | None = None) -> list[str]:
-    """Rollout files (plain and .zst) under sessions/ and archived_sessions/.
+def codex_homes() -> list[Path]:
+    """The host's Codex home plus each Sandy sandbox's codex/ (sandy mounts it
+    at ~/.codex inside the sandbox and never sets CODEX_HOME). A sandbox only
+    has codex/ once Codex has run in it. Deduplicated by real path, in case
+    CODEX_HOME points into a sandbox."""
+    homes, seen = [], set()
+    for h in [codex_home()] + [r / "codex" for r in sandbox_roots()]:
+        if not h.is_dir():
+            continue
+        key = h.resolve()
+        if key not in seen:
+            seen.add(key)
+            homes.append(h)
+    return homes
+
+
+def discover_codex_files(home: Path | list[Path] | None = None) -> list[str]:
+    """Rollout files (plain and .zst) under sessions/ and archived_sessions/ of
+    one Codex home, a list of them, or (default) every home on this machine.
     When both a plain file and its .zst sibling exist, the plain one wins
     (Codex materialises a .zst back to plain when it appends)."""
-    home = home or codex_home()
+    if home is None:
+        homes = codex_homes()
+    elif isinstance(home, (list, tuple)):
+        homes = list(home)
+    else:
+        homes = [home]
     found: dict[str, str] = {}
-    for sub in ("sessions", "archived_sessions"):
-        root = home / sub
+    for sub, h in ((sub, h) for h in homes for sub in ("sessions", "archived_sessions")):
+        root = h / sub
         if not root.exists():
             continue
         for f in root.rglob("rollout-*.jsonl*"):
@@ -1031,14 +1190,15 @@ REMOTE_CODEX_SEP = "___CCTRACK_CODEX_FILE___"
 
 
 def fetch_remote_codex(host: str) -> str:
-    """SSH to host and stream its Codex rollouts (decompressing .zst remotely
-    when the host has `zstd`)."""
+    """SSH to host and stream its Codex rollouts — its own Codex home plus each
+    sandbox's codex/ — decompressing .zst remotely when the host has `zstd`."""
+    homes = ['"${CODEX_HOME:-$HOME/.codex}"'] + [_q(f"{r}/codex") for r in remote_sandbox_roots(host)]
+    dirs = " ".join(f"{h}/sessions {h}/archived_sessions" for h in homes)
     remote_cmd = (
-        'CH="${CODEX_HOME:-$HOME/.codex}"; '
-        f'find "$CH/sessions" "$CH/archived_sessions" -name "rollout-*.jsonl" '
+        f'find {dirs} -name "rollout-*.jsonl" '
         f"-exec echo '{REMOTE_CODEX_SEP}' \\; -exec cat {{}} \\; 2>/dev/null; "
         'if command -v zstd >/dev/null 2>&1; then '
-        f'find "$CH/sessions" "$CH/archived_sessions" -name "rollout-*.jsonl.zst" '
+        f'find {dirs} -name "rollout-*.jsonl.zst" '
         f"-exec echo '{REMOTE_CODEX_SEP}' \\; -exec zstd -dc {{}} \\; 2>/dev/null; fi; true"
     )
     cmd = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, remote_cmd]
@@ -1636,8 +1796,16 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
         return s
 
     # Header
-    print("cctrack — Claude Code Cost Report")
-    print("══════════════════════════════════")
+    agents_present = {src.get("agent", "claude") for src in sources
+                      if src["daily"] or src["hook_daily"]}
+    if agents_present == {"codex"}:
+        title = "cctrack — Codex Cost Report"
+    elif "codex" in agents_present:
+        title = "cctrack — Claude Code + Codex Cost Report"
+    else:
+        title = "cctrack — Claude Code Cost Report"
+    print(title)
+    print("═" * len(title))
     print()
 
     # Current month-to-date
@@ -1699,7 +1867,7 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
             print(f"  Sessions:       {mtd_sessions:>15}")
 
         if hooks_exist and est_days > 0:
-            factor_source = "measured" if factor_is_measured else "estimated ~20-25%"
+            factor_source = "measured" if factor_is_measured else "default"
             cost_note = f" ({accuracy_factor:.2f}x adjustment, {factor_source})"
             if auth_days > 0:
                 cost_note = f" ({auth_days}d authoritative, {est_days}d adjusted {accuracy_factor:.2f}x)"
@@ -1777,7 +1945,7 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
             if factor_is_measured:
                 print(f"  ~ = estimated (JSONL-derived, {accuracy_factor:.1f}x undercount measured from hook data)")
             else:
-                print("  ~ = estimated (JSONL-derived, may undercount by ~20-25%)")
+                print("  ~ = estimated (JSONL-derived; no hook overlap yet to measure accuracy)")
 
     # Previous months summary
     prev_months = [m for m in sorted_months if m != current_month]
@@ -2128,7 +2296,7 @@ def main():
     )
     parser.add_argument(
         "--dirs", nargs="+", default=None,
-        help="Custom log directories to scan (default: ~/.claude/projects and ~/.sandy/sandboxes)"
+        help="Custom Claude transcript directories to scan (default: ~/.claude/projects plus each Sandy sandbox's claude/projects)"
     )
     parser.add_argument(
         "--remote", nargs="+", default=None, metavar="HOST",

@@ -1180,7 +1180,8 @@ def test_adjusted_cost_with_measured_factor(capsys):
 
 
 def test_adjusted_cost_without_overlap_uses_default(capsys):
-    """Without overlap, uses default 1.25x factor for adjustment."""
+    """Without overlap, the default factor applies. It is 1.0: with correct
+    prices, logs and Claude Code's own cost agree (measured 0.99-1.02x)."""
     fake_now = datetime(2026, 4, 17, 12, 0, 0, tzinfo=timezone.utc)
 
     daily = {
@@ -1200,12 +1201,13 @@ def test_adjusted_cost_without_overlap_uses_default(capsys):
                              hook_install_date="2026-04-15")
 
     out = capsys.readouterr().out
-    # MTD: adjusted(4*1.25 + 4*1.25) + hook(5) = 10 + 5 = 15.00
-    assert "15.00" in out
-    # Tilde on estimated days
+    # MTD: estimated(4 + 4) + hook(5) = 13.00 — no unmeasured inflation
+    assert cctrack.DEFAULT_ACCURACY_FACTOR == 1.0
+    assert "13.00" in out
+    # Tilde on estimated days, and the legend says why
     assert "~" in out
-    # Legend mentions 20-25%
-    assert "20-25%" in out
+    assert "no hook overlap" in out
+    assert "20-25%" not in out
 
 
 # ── Previous month accuracy estimation ─────────────────────────────────
@@ -1215,7 +1217,7 @@ def test_previous_month_estimated_actual(capsys):
     fake_now = datetime(2026, 4, 17, 12, 0, 0, tzinfo=timezone.utc)
 
     daily = {
-        "2026-04-15": make_bucket(input=1000, cost=4.00),
+        "2026-04-16": make_bucket(input=1000, cost=4.00),
         "2026-03-20": make_bucket(input=2000, cost=8.00),
         "2026-03-21": make_bucket(input=1500, cost=6.00),
     }
@@ -1224,7 +1226,9 @@ def test_previous_month_estimated_actual(capsys):
         "2026-03": make_bucket(input=3500, cost=14.00),
     }
     hook_daily = {
-        "2026-04-15": {"cost": 5.00, "sessions": 1},  # 1.25x factor
+        # post-install overlap → a MEASURED 1.25x factor (the install day
+        # itself is excluded from measurement)
+        "2026-04-16": {"cost": 5.00, "sessions": 1},
     }
 
     with patch("cctrack.datetime") as mock_dt:
@@ -1235,7 +1239,7 @@ def test_previous_month_estimated_actual(capsys):
                              hook_install_date="2026-04-15")
 
     out = capsys.readouterr().out
-    # Previous month cost is JSONL-only: (8+6)*1.25 = 17.50 (adjusted per day)
+    # Previous month cost is JSONL-only: (8+6) × measured 1.25 = 17.50
     assert "Previous months:" in out
     assert "17.50" in out
     assert "~" in out
@@ -1468,8 +1472,10 @@ def test_discover_hook_data_dirs_host_only():
             assert len(dirs) == 1
 
 
-def test_discover_hook_data_dirs_with_sandy():
-    """Finds both host and Sandy sandbox cctrack dirs."""
+def test_discover_hook_data_dirs_with_sandy(monkeypatch):
+    """Finds both host and Sandy sandbox cctrack dirs.
+    With SANDY_HOME unset, sandboxes default to ~/.sandy/sandboxes."""
+    monkeypatch.delenv("SANDY_HOME", raising=False)
     with tempfile.TemporaryDirectory() as home:
         cctrack_dir = Path(home) / ".claude" / "cctrack"
         cctrack_dir.mkdir(parents=True)
@@ -1487,8 +1493,10 @@ def test_discover_hook_data_dirs_with_sandy():
             assert len(dirs) == 3
 
 
-def test_discover_hook_data_dirs_sandy_only():
-    """Finds Sandy sandbox dirs even when host dir doesn't exist."""
+def test_discover_hook_data_dirs_sandy_only(monkeypatch):
+    """Finds Sandy sandbox dirs even when host dir doesn't exist.
+    With SANDY_HOME unset, sandboxes default to ~/.sandy/sandboxes."""
+    monkeypatch.delenv("SANDY_HOME", raising=False)
     with tempfile.TemporaryDirectory() as home:
         cctrack_dir = Path(home) / ".claude" / "cctrack"
         # Don't create host dir

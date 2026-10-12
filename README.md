@@ -25,7 +25,7 @@ cctrack --days 7
 cctrack --remote dgx macbook-air
 
 # Custom log directories
-cctrack --dirs ~/.claude/projects ~/.sandy/sandboxes
+cctrack --dirs ~/.claude/projects ~/old-machine/projects
 
 # Only one coding agent (default: all found)
 cctrack --agent claude
@@ -57,7 +57,7 @@ Daily breakdown:
 
 ## What it does
 
-1. Walks `~/.claude/projects/` and `~/.sandy/sandboxes/` for JSONL log files
+1. Walks `~/.claude/projects/` — and each [Sandy](#sandy-sandboxes) sandbox's `claude/projects/` — for Claude Code transcripts, and each Codex home for Codex rollouts
 2. Parses `assistant` events with token usage
 3. Deduplicates by `requestId` (last event wins, matching Claude Code's semantics)
 4. Calculates cost using Anthropic's published rates per model
@@ -65,7 +65,7 @@ Daily breakdown:
 
 ## Codex CLI
 
-cctrack also reads [Codex CLI](https://github.com/openai/codex) usage from `$CODEX_HOME` (default `~/.codex`) — `sessions/` and `archived_sessions/` — and with `--remote`, from each host. When both agents have spend, the month-to-date block and `--explore` show a per-agent split.
+cctrack also reads [Codex CLI](https://github.com/openai/codex) usage from `$CODEX_HOME` (default `~/.codex`) and from every [Sandy sandbox](#sandy-sandboxes)'s `codex/` — `sessions/` and `archived_sessions/` — and with `--remote`, from each host. When both agents have spend, the month-to-date block and `--explore` show a per-agent split.
 
 How it's counted (verified against the Codex source, not inferred):
 
@@ -75,6 +75,18 @@ How it's counted (verified against the Codex source, not inferred):
 - **Compressed rollouts.** Codex compresses older rollouts to `.jsonl.zst`. Python's standard library only reads zstd from 3.14, so on older Pythons cctrack uses the `zstd` command if it's installed, and otherwise skips those files and says how many it skipped.
 
 Costs are at OpenAI's **API list prices**. If you use Codex through a ChatGPT plan, that's an API-equivalent value, not what you're billed — the same is true of Claude Code on a Claude subscription.
+
+## Sandy sandboxes
+
+cctrack finds every [Sandy](https://github.com/rappdw/sandy) sandbox on the machine (and on `--remote` hosts) and includes its Claude Code and Codex usage. It follows sandy's published host-side path contract:
+
+- **Finding sandboxes:** `sandy --print-state` (`sandboxes[].path`) when sandy is installed, which follows `$SANDY_HOME`; otherwise `$SANDY_HOME/sandboxes/*` (default `~/.sandy/sandboxes`).
+- **Per sandbox:** Claude Code transcripts from `claude/projects/`, statusline-hook data from `claude/cctrack/`, Codex rollouts from `codex/sessions/` and `codex/archived_sessions/`. Other files under `claude/` (`history.jsonl`, job timelines, tool-audit logs) aren't transcripts and are ignored.
+- **Never double counted:** the hidden `.rsync-from.<name>.<pid>/` copy that exists while `sandy --rsync-from` is pulling a sandbox in is skipped, as are `.lock` directories. A sandbox's Codex home is never shared with the host's `~/.codex`, and anything copied between hosts with `sandy --rsync` is deduplicated by request/response id.
+
+- **Dot-named sandboxes count:** a workspace named like a dotfile directory (e.g. `~/.dotfiles`) gets a sandbox whose name starts with a dot. Sandy's own listing currently omits these, so cctrack scans for them itself — any dot-directory holding `WORKSPACE.json` is a real sandbox.
+
+Orphaned sandboxes (workspace deleted, sandbox not yet removed) still count: their usage is real history.
 
 ## Explore a day
 
