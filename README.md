@@ -1,6 +1,6 @@
 # cctrack
 
-A lightweight CLI tool that scans [Claude Code](https://docs.anthropic.com/en/docs/claude-code) JSONL logs and reports token usage and estimated cost. Zero dependencies, runs anywhere Python 3.10+ is available.
+A lightweight CLI tool that scans [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex) logs and reports token usage and estimated cost. Zero dependencies, runs anywhere Python 3.10+ is available.
 
 ## Install
 
@@ -26,6 +26,10 @@ cctrack --remote dgx macbook-air
 
 # Custom log directories
 cctrack --dirs ~/.claude/projects ~/.sandy/sandboxes
+
+# Only one coding agent (default: all found)
+cctrack --agent claude
+cctrack --agent codex
 ```
 
 ## Example output
@@ -58,6 +62,19 @@ Daily breakdown:
 3. Deduplicates by `requestId` (last event wins, matching Claude Code's semantics)
 4. Calculates cost using Anthropic's published rates per model
 5. Prints daily breakdown with input/output/cache token splits and monthly summaries
+
+## Codex CLI
+
+cctrack also reads [Codex CLI](https://github.com/openai/codex) usage from `$CODEX_HOME` (default `~/.codex`) — `sessions/` and `archived_sessions/` — and with `--remote`, from each host. When both agents have spend, the month-to-date block and `--explore` show a per-agent split.
+
+How it's counted (verified against the Codex source, not inferred):
+
+- **Per-response usage.** Newer Codex versions log a `token_usage_record` for every API response with a unique `response_id`; those are counted and deduplicated across files, so forked and resumed threads (which replay their parent's history) aren't double counted. Older versions only log `token_count` events, which are re-emitted with unchanged totals — only events whose running total moved are counted.
+- **Cached tokens are inside `input_tokens`.** Codex reports cached reads and cache writes as parts of `input_tokens`, and reasoning tokens as part of `output_tokens`. Billable uncached input is `input − cached − cache_write`; reasoning is never added on top.
+- **Its own cost source.** Codex spend is priced directly from its logs and is never replaced by, or scaled with, Claude Code's statusline-hook figures.
+- **Compressed rollouts.** Codex compresses older rollouts to `.jsonl.zst`. Python's standard library only reads zstd from 3.14, so on older Pythons cctrack uses the `zstd` command if it's installed, and otherwise skips those files and says how many it skipped.
+
+Costs are at OpenAI's **API list prices**. If you use Codex through a ChatGPT plan, that's an API-equivalent value, not what you're billed — the same is true of Claude Code on a Claude subscription.
 
 ## Explore a day
 
@@ -99,22 +116,50 @@ cctrack --install-hook --remote dgx macbook-air
 
 ## Rate card
 
-Prices per million tokens, from [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing). Cache writes are priced per TTL: 5-minute at 1.25× input, 1-hour at 2× input.
+Prices per million tokens. Claude prices are from [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing); cache writes are priced per TTL (5-minute and 1-hour).
 
-| Model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
+| Claude model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
 |---|---|---|---|---|---|
+| Fable 5.1 / Mythos 5.1 | $10.00 | $50.00 | $0.25 | $12.50 | $20.00 |
 | Fable 5 / Mythos 5 | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
+| Opus 5.5 | $4.00 | $20.00 | $0.20 | $5.00 | $8.00 |
 | Opus 5 / 4.8 / 4.7 / 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
-| Opus 4 / 4.1 | $15.00 | $75.00 | $1.50 | $18.75 | $30.00 |
-| Sonnet 5 (through 2026-08-31) | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
-| Sonnet 5 (from 2026-09-01) / 4.x / 3.7 | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
-| Haiku 4.x | $1.00 | $5.00 | $0.10 | $1.25 | $2.00 |
+| Opus 4.1 / 4 | $15.00 | $75.00 | $1.50 | $18.75 | $30.00 |
+| Sonnet 5.5 | $2.00 | $10.00 | $0.10 | $2.50 | $4.00 |
+| Sonnet 5 | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
+| Sonnet 4.6 / 4.5 / 4 / 3.7 | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
+| Haiku 5.5 (prompt ≤ 100K) | $0.10 | $0.50 | $0.01 | $0.125 | $0.20 |
+| Haiku 5.5 (prompt > 100K) | $0.50 | $2.50 | $0.05 | $0.625 | $1.00 |
+| Haiku 4.5 | $1.00 | $5.00 | $0.10 | $1.25 | $2.00 |
 | Haiku 3.5 | $0.80 | $4.00 | $0.08 | $1.00 | $1.60 |
 | Haiku 3 | $0.25 | $1.25 | $0.03 | $0.30 | $0.50 |
 
-Usage is priced with the rates in effect on the day it happened, so time-limited introductory pricing is applied correctly to past usage.
+OpenAI prices (for Codex) are from [OpenAI's pricing page](https://developers.openai.com/api/docs/pricing), Standard tier. OpenAI has a single cache-write price, listed only for some models; elsewhere cache writes bill as ordinary input.
 
-Unknown models fall back to Sonnet rates and are flagged with `?` in the report's Model column — a prompt to update the rate card rather than a silent guess.
+| OpenAI model | Input | Cached input | Output | Cache write | Over 272K input |
+|---|---|---|---|---|---|
+| gpt-6-astra | $10.00 | $1.00 | $50.00 | $12.50 | $20 / $2 / $75 / $25 |
+| gpt-6.1-sol | $2.00 | $0.10 | $10.00 | $2.50 | $4 / $0.20 / $15 / $5 |
+| gpt-6-sol | $2.00 | $0.20 | $10.00 | $2.50 | $4 / $0.40 / $15 / $5 |
+| gpt-6-luna | $0.10 | $0.01 | $0.50 | $0.125 | $0.20 / $0.02 / $0.75 / $0.25 |
+| gpt-5.6-sol | $4.00 | $0.40 | $20.00 | $5.00 | $8 / $0.80 / $30 / $10 |
+| gpt-5.6-terra | $2.00 | $0.20 | $12.00 | $2.50 | $4 / $0.40 / $18 / $5 |
+| gpt-5.6-luna | $0.20 | $0.02 | $1.20 | $0.25 | $0.40 / $0.04 / $1.80 / $0.50 |
+| gpt-5.5 | $5.00 | $0.50 | $30.00 | — | $10 / $1 / $45 |
+| gpt-5.5-pro / gpt-5.4-pro | $30.00 | — | $180.00 | — | $60 / — / $270 |
+| gpt-5.4 | $2.50 | $0.25 | $15.00 | — | $5 / $0.50 / $22.50 |
+| gpt-5.4-mini | $0.75 | $0.075 | $4.50 | — | |
+| gpt-5.4-nano | $0.20 | $0.02 | $1.25 | — | |
+| gpt-5.3-codex / gpt-5.2 | $1.75 | $0.175 | $14.00 | — | |
+| gpt-5.2-pro | $21.00 | — | $168.00 | — | |
+| gpt-5.1 / gpt-5 | $1.25 | $0.125 | $10.00 | — | |
+| gpt-5-pro | $15.00 | — | $120.00 | — | |
+| gpt-5-mini | $0.25 | $0.025 | $2.00 | — | |
+| gpt-5-nano | $0.05 | $0.005 | $0.40 | — | |
+
+Codex variants without their own price (e.g. `gpt-5.1-codex`) are priced as their base model, consistent with the one variant OpenAI does list (`gpt-5.3-codex` = `gpt-5.2`). Long-context and Haiku 5.5 prompt-length tiers are applied per request.
+
+**Every model version has its own row.** A model only matches a row if it is that version or a dated snapshot of it — never a newer minor version. So a newly released model (say `claude-opus-5-7`, or `gpt-5.1-codex-mini`) shows as unknown and is flagged with `?` in the Model column, rather than silently inheriting its predecessor's price. Unknown Claude models are estimated at Sonnet rates, unknown OpenAI models at GPT-5 rates. Pricing is date-aware, so any time-limited introductory price applies only to usage on the days it was in effect.
 
 ## Energy estimate
 

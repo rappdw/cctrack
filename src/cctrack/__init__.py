@@ -24,60 +24,185 @@ from pathlib import Path
 
 # ── Rate card (per million tokens) ──────────────────────────────────────
 
-# Longer/more-specific prefixes MUST come first — "claude-opus-4-6" would
-# otherwise match "claude-opus-4" and get the wrong rate.
-# cache_write is the 5-minute TTL rate (1.25× input); cache_write_1h is the
-# 1-hour TTL rate (2× input). Claude Code hits the 1h tier heavily in practice.
-# "claude-opus-4" (legacy Opus 4.0/4.1 at 15/75) MUST come after every
-# claude-opus-4-x entry — a new opus-4-N missing here would silently price 3× high.
+def _oa(family, tier, inp, cached, out, cache_write=None, lc=None):
+    """Build an OpenAI rate-card row (see the OpenAI block in RATES)."""
+    row = {"family": family, "tier": tier, "provider": "openai",
+           "input": inp, "output": out,
+           "cache_read": inp if cached is None else cached}
+    row["cache_write"] = row["cache_write_1h"] = inp if cache_write is None else cache_write
+    if lc:
+        l_in, l_cached, l_out, *l_cw = lc
+        row["long_context"] = {
+            "over": 272_000, "input": l_in, "output": l_out,
+            "cache_read": l_in if l_cached is None else l_cached,
+        }
+        row["long_context"]["cache_write"] = row["long_context"]["cache_write_1h"] = (
+            l_cw[0] if l_cw else l_in)
+    return row
+
+
+# Every model VERSION gets its own row. Matching (see _family_matches) only lets
+# a family absorb dated snapshots and non-version suffixes — never a new minor
+# version — so a newly released model shows up as unknown ("?") instead of
+# silently inheriting its predecessor's price. (claude-opus-5-5 once inherited
+# Opus 5's $5/$25 when it actually costs $4/$20 with 0.05× cache reads.)
+# cache_write is the 5-minute TTL rate; cache_write_1h the 1-hour TTL rate.
 # "tier" selects the energy model (see ENERGY_WH_PER_MTOK), not the price.
 # "intro" is a time-limited launch price applying to usage on/before "until".
-# Source: https://platform.claude.com/docs/en/about-claude/pricing (2026-07-28).
+# "long_context" rates apply to a whole request whose prompt (input + cache
+# reads + cache writes) exceeds "over".
+# Source: https://platform.claude.com/docs/en/about-claude/pricing (2026-10-12).
+def _an(family, tier, inp, cw5, cw1h, read, out, lc=None):
+    """Build an Anthropic rate-card row."""
+    row = {"family": family, "tier": tier, "provider": "anthropic", "input": inp,
+           "output": out, "cache_read": read, "cache_write": cw5, "cache_write_1h": cw1h}
+    if lc:
+        l_in, l_cw5, l_cw1h, l_read, l_out, over = lc
+        row["long_context"] = {"over": over, "input": l_in, "output": l_out,
+                               "cache_read": l_read, "cache_write": l_cw5,
+                               "cache_write_1h": l_cw1h}
+    return row
+
+
 RATES = [
-    {"family": "claude-fable-5",    "tier": "frontier", "input": 10.0,  "output": 50.0,  "cache_read": 1.00,  "cache_write": 12.50,  "cache_write_1h": 20.0},
-    {"family": "claude-mythos",     "tier": "frontier", "input": 10.0,  "output": 50.0,  "cache_read": 1.00,  "cache_write": 12.50,  "cache_write_1h": 20.0},
-    {"family": "claude-opus-5",     "tier": "opus",     "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25,   "cache_write_1h": 10.0},
-    {"family": "claude-opus-4-8",   "tier": "opus",     "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25,   "cache_write_1h": 10.0},
-    {"family": "claude-opus-4-7",   "tier": "opus",     "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25,   "cache_write_1h": 10.0},
-    {"family": "claude-opus-4-6",   "tier": "opus",     "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25,   "cache_write_1h": 10.0},
-    {"family": "claude-opus-4-5",   "tier": "opus",     "input": 5.0,   "output": 25.0,  "cache_read": 0.50,  "cache_write": 6.25,   "cache_write_1h": 10.0},
-    {"family": "claude-opus-4",     "tier": "opus",     "input": 15.0,  "output": 75.0,  "cache_read": 1.50,  "cache_write": 18.75,  "cache_write_1h": 30.0},
-    {"family": "claude-sonnet-5",   "tier": "sonnet",   "input": 3.0,   "output": 15.0,  "cache_read": 0.30,  "cache_write": 3.75,   "cache_write_1h": 6.0,
-     "intro": {"until": "2026-08-31", "input": 2.0, "output": 10.0, "cache_read": 0.20, "cache_write": 2.50, "cache_write_1h": 4.0}},
-    {"family": "claude-sonnet-4",   "tier": "sonnet",   "input": 3.0,   "output": 15.0,  "cache_read": 0.30,  "cache_write": 3.75,   "cache_write_1h": 6.0},
-    {"family": "claude-sonnet-3",   "tier": "sonnet",   "input": 3.0,   "output": 15.0,  "cache_read": 0.30,  "cache_write": 3.75,   "cache_write_1h": 6.0},
-    {"family": "claude-haiku-4",    "tier": "haiku",    "input": 1.0,   "output": 5.0,   "cache_read": 0.10,  "cache_write": 1.25,   "cache_write_1h": 2.0},
-    {"family": "claude-haiku-3-5",  "tier": "haiku",    "input": 0.80,  "output": 4.0,   "cache_read": 0.08,  "cache_write": 1.00,   "cache_write_1h": 1.60},
-    {"family": "claude-haiku-3",    "tier": "haiku",    "input": 0.25,  "output": 1.25,  "cache_read": 0.03,  "cache_write": 0.30,   "cache_write_1h": 0.50},
+    _an("claude-fable-5-1",      "frontier", 10.00, 12.50, 20.00, 0.25,  50.00),
+    _an("claude-mythos-5-1",     "frontier", 10.00, 12.50, 20.00, 0.25,  50.00),
+    _an("claude-fable-5",        "frontier", 10.00, 12.50, 20.00, 1.00,  50.00),
+    _an("claude-mythos-5",       "frontier", 10.00, 12.50, 20.00, 1.00,  50.00),
+    # Mythos Preview predates the current price list; kept at Mythos 5 rates.
+    _an("claude-mythos-preview", "frontier", 10.00, 12.50, 20.00, 1.00,  50.00),
+    _an("claude-opus-5-5",       "opus",      4.00,  5.00,  8.00, 0.20,  20.00),
+    _an("claude-opus-5",         "opus",      5.00,  6.25, 10.00, 0.50,  25.00),
+    _an("claude-opus-4-8",       "opus",      5.00,  6.25, 10.00, 0.50,  25.00),
+    _an("claude-opus-4-7",       "opus",      5.00,  6.25, 10.00, 0.50,  25.00),
+    _an("claude-opus-4-6",       "opus",      5.00,  6.25, 10.00, 0.50,  25.00),
+    _an("claude-opus-4-5",       "opus",      5.00,  6.25, 10.00, 0.50,  25.00),
+    _an("claude-opus-4-1",       "opus",     15.00, 18.75, 30.00, 1.50,  75.00),
+    _an("claude-opus-4",         "opus",     15.00, 18.75, 30.00, 1.50,  75.00),
+    _an("claude-sonnet-5-5",     "sonnet",    2.00,  2.50,  4.00, 0.10,  10.00),
+    # Sonnet 5's $2/$10 launch price became permanent; the scheduled Sep 1 2026
+    # rise to $3/$15 was cancelled.
+    _an("claude-sonnet-5",       "sonnet",    2.00,  2.50,  4.00, 0.20,  10.00),
+    _an("claude-sonnet-4-6",     "sonnet",    3.00,  3.75,  6.00, 0.30,  15.00),
+    _an("claude-sonnet-4-5",     "sonnet",    3.00,  3.75,  6.00, 0.30,  15.00),
+    _an("claude-sonnet-4",       "sonnet",    3.00,  3.75,  6.00, 0.30,  15.00),
+    _an("claude-sonnet-3-7",     "sonnet",    3.00,  3.75,  6.00, 0.30,  15.00),
+    _an("claude-sonnet-3-5",     "sonnet",    3.00,  3.75,  6.00, 0.30,  15.00),
+    _an("claude-haiku-5-5",      "haiku",     0.10,  0.125, 0.20, 0.01,   0.50,
+        lc=(0.50, 0.625, 1.00, 0.05, 2.50, 100_000)),
+    _an("claude-haiku-4-5",      "haiku",     1.00,  1.25,  2.00, 0.10,   5.00),
+    _an("claude-haiku-3-5",      "haiku",     0.80,  1.00,  1.60, 0.08,   4.00),
+    _an("claude-haiku-3",        "haiku",     0.25,  0.30,  0.50, 0.03,   1.25),
+] + [
+    # ── OpenAI (Codex CLI). Source: https://developers.openai.com/api/docs/pricing
+    # (Standard tier, fetched 2026-10-12). OpenAI has one cache-write tier, so
+    # cache_write == cache_write_1h. Where the price list shows no cache-write
+    # price, cache writes are ordinary input and bill at the input rate; where it
+    # shows no cached-input price (the -pro models), cached tokens bill at input.
+    # "long_context" rates apply to a whole request whose input exceeds "over".
+    # Codex variants without their own row (gpt-5.1-codex, …) price as their base
+    # model — consistent with the one listed variant (gpt-5.3-codex == gpt-5.2).
+    # "tier" is a price-class proxy for the energy model only.
+    _oa("gpt-6-astra",   "frontier", 10.00, 1.00,  50.00, 12.50, lc=(20.00, 2.00, 75.00, 25.00)),
+    _oa("gpt-6.1-sol",   "sonnet",    2.00, 0.10,  10.00,  2.50, lc=(4.00, 0.20, 15.00, 5.00)),
+    _oa("gpt-6-sol",     "sonnet",    2.00, 0.20,  10.00,  2.50, lc=(4.00, 0.40, 15.00, 5.00)),
+    _oa("gpt-6-luna",    "haiku",     0.10, 0.01,   0.50,  0.125, lc=(0.20, 0.02, 0.75, 0.25)),
+    _oa("gpt-5.6-sol",   "opus",      4.00, 0.40,  20.00,  5.00, lc=(8.00, 0.80, 30.00, 10.00)),
+    _oa("gpt-5.6-terra", "sonnet",    2.00, 0.20,  12.00,  2.50, lc=(4.00, 0.40, 18.00, 5.00)),
+    _oa("gpt-5.6-luna",  "haiku",     0.20, 0.02,   1.20,  0.25, lc=(0.40, 0.04, 1.80, 0.50)),
+    _oa("gpt-5.5-pro",   "frontier", 30.00, None, 180.00, lc=(60.00, None, 270.00)),
+    _oa("gpt-5.5",       "opus",      5.00, 0.50,  30.00, lc=(10.00, 1.00, 45.00)),
+    _oa("gpt-5.4-pro",   "frontier", 30.00, None, 180.00, lc=(60.00, None, 270.00)),
+    _oa("gpt-5.4-mini",  "haiku",     0.75, 0.075,  4.50),
+    _oa("gpt-5.4-nano",  "haiku",     0.20, 0.02,   1.25),
+    _oa("gpt-5.4",       "sonnet",    2.50, 0.25,  15.00, lc=(5.00, 0.50, 22.50)),
+    _oa("gpt-5.3-codex", "sonnet",    1.75, 0.175, 14.00),
+    _oa("gpt-5.2-pro",   "frontier", 21.00, None, 168.00),
+    _oa("gpt-5.2",       "sonnet",    1.75, 0.175, 14.00),
+    _oa("gpt-5.1",       "sonnet",    1.25, 0.125, 10.00),
+    _oa("gpt-5-pro",     "frontier", 15.00, None, 120.00),
+    _oa("gpt-5-mini",    "haiku",     0.25, 0.025,  2.00),
+    _oa("gpt-5-nano",    "haiku",     0.05, 0.005,  0.40),
+    _oa("gpt-5",         "sonnet",    1.25, 0.125, 10.00),
 ]
 
 SONNET_RATES = next(r for r in RATES if r["family"] == "claude-sonnet-4")  # fallback
+# Unknown OpenAI/Codex models fall back to the base GPT-5 rates (and are flagged
+# "?"), not to Claude Sonnet — the two price lists are unrelated.
+OPENAI_FALLBACK_RATES = next(r for r in RATES if r["family"] == "gpt-5")
+
+# Suffix words that denote a DIFFERENT size/price tier. A model whose id adds
+# one of these past a family's prefix (e.g. gpt-5.1-codex-mini vs gpt-5.1) must
+# not silently inherit that family's price — it's treated as unknown instead.
+_TIER_WORDS = {"mini", "nano", "pro", "max", "luna", "terra", "sol", "astra"}
 
 
-def get_rates(model: str, date_str: str | None = None) -> dict:
-    """Match model name by prefix. Unknown models fall back to Sonnet.
-    When `date_str` (YYYY-MM-DD) falls within a family's introductory-pricing
-    window, the introductory rates are returned instead of the standard ones."""
+def _family_matches(model: str, family: str) -> bool:
+    """A model belongs to a family if it IS the family, or extends it at a
+    hyphen boundary without naming a different minor version or size tier. So
+    "gpt-5" matches "gpt-5-2025-08-07" and "gpt-5-codex" but not "gpt-5.5" or
+    "gpt-5-mini", and "claude-opus-4" matches "claude-opus-4-20250514" but not
+    "claude-opus-4-1" (which has its own row)."""
+    if not model.startswith(family):
+        return False
+    rest = model[len(family):]
+    if not rest:
+        return True
+    if not rest.startswith("-"):
+        return False
+    parts = rest[1:].lower().split("-")
+    # A short number right after the family is a different minor version
+    # (claude-opus-5 → claude-opus-5-5); a long one is a date snapshot
+    # (claude-opus-4-20250514, gpt-5-2025-08-07), which belongs to the family.
+    if parts[0].isdigit() and len(parts[0]) <= 2:
+        return False
+    return not (_TIER_WORDS & set(parts))
+
+
+def _is_openai_model(model: str) -> bool:
+    return model.startswith(("gpt-", "codex", "o1", "o3", "o4"))
+
+
+def _find_rate_row(model: str) -> dict | None:
     for r in RATES:
-        if model.startswith(r["family"]):
-            intro = r.get("intro")
-            if intro and date_str and date_str <= intro["until"]:
-                merged = dict(r)
-                merged.update({k: v for k, v in intro.items() if k != "until"})
-                return merged
+        if _family_matches(model, r["family"]):
             return r
-    return SONNET_RATES
+    return None
+
+
+def get_rates(model: str, date_str: str | None = None,
+              request_input: int | None = None) -> dict:
+    """Match model name to a rate-card family. Unknown models fall back to
+    Sonnet (Claude) or GPT-5 (OpenAI). When `date_str` (YYYY-MM-DD) falls within
+    a family's introductory-pricing window the introductory rates apply; when
+    `request_input` (the request's total input tokens) exceeds a family's
+    long-context threshold, the long-context rates apply."""
+    r = _find_rate_row(model)
+    if r is None:
+        return OPENAI_FALLBACK_RATES if _is_openai_model(model) else SONNET_RATES
+    intro = r.get("intro")
+    if intro and date_str and date_str <= intro["until"]:
+        merged = dict(r)
+        merged.update({k: v for k, v in intro.items() if k != "until"})
+        return merged
+    lc = r.get("long_context")
+    if lc and request_input is not None and request_input > lc["over"]:
+        merged = dict(r)
+        merged.update({k: v for k, v in lc.items() if k != "over"})
+        return merged
+    return r
 
 
 def is_known_model(model: str) -> bool:
     """True if the model matches a rate-card family (i.e. wasn't priced by fallback)."""
-    return any(model.startswith(r["family"]) for r in RATES)
+    return _find_rate_row(model) is not None
 
 
 def calculate_cost(model: str, input_t: int, output_t: int, cache_read: int,
                    cache_write: int, cache_write_1h: int = 0,
-                   date_str: str | None = None) -> float:
-    r = get_rates(model, date_str)
+                   date_str: str | None = None,
+                   request_input: int | None = None) -> float:
+    r = get_rates(model, date_str, request_input)
     return (
         input_t / 1_000_000 * r["input"]
         + output_t / 1_000_000 * r["output"]
@@ -130,10 +255,8 @@ def energy_scale() -> float:
 
 def get_energy_rates(model: str) -> dict:
     """Wh per million tokens for a model's compute tier."""
-    for r in RATES:
-        if model.startswith(r["family"]):
-            return ENERGY_WH_PER_MTOK[r["tier"]]
-    return ENERGY_WH_PER_MTOK[DEFAULT_ENERGY_TIER]
+    r = _find_rate_row(model)
+    return ENERGY_WH_PER_MTOK[r["tier"] if r else DEFAULT_ENERGY_TIER]
 
 
 def estimate_energy_wh(model: str, input_t: int, output_t: int, cache_read: int,
@@ -670,6 +793,10 @@ def parse_lines(lines: list[str], source: str = "local") -> list[dict]:
             "project": _project_name(cwd),
             "cwd": cwd,
             "git_branch": event.get("gitBranch", ""),
+            "agent": "claude",
+            # Prompt length for per-request long-context tiers: all input,
+            # including cache reads and writes (Anthropic's definition).
+            "_request_input": input_t + cache_read + cache_write + cache_write_1h,
         }
 
         if req_id:
@@ -712,6 +839,225 @@ def parse_events(files: list[str]) -> list[dict]:
         except (OSError, IOError):
             continue
     return dedup_events(event_lists)
+
+
+# ── Codex CLI logs ──────────────────────────────────────────────────────
+#
+# Codex writes one rollout file per thread under $CODEX_HOME (default ~/.codex):
+#   sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl   (and archived_sessions/)
+# Older rollouts are compressed in place to `.jsonl.zst`.
+# Each line is {"timestamp", "type": <item>, "payload": {...}}. Usage comes from:
+#   * "token_usage_record" — one per completed API response, with a unique
+#     response_id. Newer CLIs write these; they are exact and dedupable.
+#   * "event_msg" / payload.type == "token_count" — legacy. info.last_token_usage
+#     is the latest response's usage and info.total_token_usage the thread's
+#     running total. The event is re-emitted (e.g. for rate-limit updates) with
+#     unchanged totals, so only events whose running total moved are counted.
+# Token semantics (from the Codex source and its own test fixtures):
+#   input_tokens INCLUDES cached_input_tokens and cache_write_input_tokens;
+#   output_tokens INCLUDES reasoning_output_tokens. So billable uncached input
+#   is input − cached − cache_write, and reasoning is never added on top.
+# Model and cwd come from the most recent "turn_context"; thread id and git
+# branch from "session_meta".
+
+AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex"}
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+
+
+def discover_codex_files(home: Path | None = None) -> list[str]:
+    """Rollout files (plain and .zst) under sessions/ and archived_sessions/.
+    When both a plain file and its .zst sibling exist, the plain one wins
+    (Codex materialises a .zst back to plain when it appends)."""
+    home = home or codex_home()
+    found: dict[str, str] = {}
+    for sub in ("sessions", "archived_sessions"):
+        root = home / sub
+        if not root.exists():
+            continue
+        for f in root.rglob("rollout-*.jsonl*"):
+            name = f.name
+            if name.endswith(".jsonl"):
+                found[str(f)] = str(f)
+            elif name.endswith(".jsonl.zst"):
+                found.setdefault(str(f)[: -len(".zst")], str(f))
+    return sorted(found.values())
+
+
+def _read_zstd(path: str) -> str | None:
+    """Decompress a .zst rollout. Stdlib only gained zstd in Python 3.14, so
+    older interpreters fall back to the `zstd` CLI; returns None if neither."""
+    try:
+        from compression import zstd  # type: ignore  # Python 3.14+
+        with zstd.open(path, "rt", errors="replace") as f:
+            return f.read()
+    except ImportError:
+        pass
+    except OSError:
+        return None
+    import shutil
+    if not shutil.which("zstd"):
+        return None
+    try:
+        r = subprocess.run(["zstd", "-dc", path], capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.decode("utf-8", errors="replace") if r.returncode == 0 else None
+
+
+def _codex_usage_event(usage: dict, ts: str, key: str, ctx: dict, source: str) -> dict | None:
+    inp = int(usage.get("input_tokens") or 0)
+    cached = int(usage.get("cached_input_tokens") or 0)
+    cache_write = int(usage.get("cache_write_input_tokens") or 0)
+    out = int(usage.get("output_tokens") or 0)
+    uncached = max(0, inp - cached - cache_write)
+    if not (uncached or cached or cache_write or out):
+        return None
+    cwd = ctx.get("cwd", "")
+    return {
+        "model": ctx.get("model", ""),
+        "timestamp": ts,
+        "input": uncached,
+        "output": out,
+        "cache_read": cached,
+        "cache_write": cache_write,
+        "cache_write_1h": 0,
+        "_request_id": key,
+        "_request_input": inp,
+        "source": source,
+        "session_id": ctx.get("session_id", ""),
+        "project": _project_name(cwd),
+        "cwd": cwd,
+        "git_branch": ctx.get("git_branch", ""),
+        "agent": "codex",
+    }
+
+
+def parse_codex_lines(lines, source: str = "local") -> list[dict]:
+    """Parse one Codex rollout file into usage events (same shape as Claude
+    events, tagged agent="codex"). Prefers per-response token_usage_record
+    items; legacy token_count events are used only for the part of the file
+    before the first record (a session started on an older CLI and resumed on
+    a newer one), so no response is counted twice."""
+    ctx: dict = {}
+    records: list[dict] = []
+    legacy: list[tuple[str, dict]] = []
+    first_record_ts = None
+    prev_total = None
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        payload = item.get("payload") or {}
+        ts = item.get("timestamp", "")
+        if not isinstance(payload, dict):
+            continue
+
+        if kind == "session_meta":
+            ctx["session_id"] = payload.get("id") or payload.get("session_id") or ""
+            ctx.setdefault("cwd", payload.get("cwd", ""))
+            git = payload.get("git") or {}
+            if isinstance(git, dict) and git.get("branch"):
+                ctx["git_branch"] = git["branch"]
+        elif kind == "turn_context":
+            if payload.get("model"):
+                ctx["model"] = payload["model"]
+            if payload.get("cwd"):
+                ctx["cwd"] = payload["cwd"]
+        elif kind == "token_usage_record":
+            usage = payload.get("usage") or {}
+            rid = payload.get("response_id") or ""
+            if not ctx.get("session_id") and payload.get("thread_id"):
+                ctx["session_id"] = payload["thread_id"]
+            key = f"codex:resp:{rid}" if rid else f"codex:rec:{ts}"
+            ev = _codex_usage_event(usage, ts, key, ctx, source)
+            if ev:
+                records.append(ev)
+            if first_record_ts is None:
+                first_record_ts = ts
+        elif kind == "event_msg" and payload.get("type") == "token_count":
+            info = payload.get("info") or {}
+            total = (info.get("total_token_usage") or {}).get("total_tokens")
+            last = info.get("last_token_usage") or {}
+            if total is None or total == prev_total:
+                continue  # re-emission with an unchanged running total
+            prev_total = total
+            ev = _codex_usage_event(last, ts, f"codex:tc:{ts}:{total}", ctx, source)
+            if ev:
+                legacy.append((ts, ev))
+
+    if first_record_ts is None:
+        return [ev for _, ev in legacy]
+    return records + [ev for ts, ev in legacy if ts < first_record_ts]
+
+
+def parse_codex_events(files: list[str], source: str = "local") -> tuple[list[dict], int]:
+    """Parse Codex rollouts. Dedups by response id across files (forked and
+    resumed threads replay their parent's history). Returns (events, skipped)
+    where `skipped` counts .zst files that couldn't be decompressed."""
+    event_lists = []
+    skipped = 0
+    for path in files:
+        if path.endswith(".zst"):
+            text = _read_zstd(path)
+            if text is None:
+                skipped += 1
+                continue
+            lines = text.splitlines()
+        else:
+            try:
+                with open(path, "r", errors="replace") as f:
+                    lines = f.readlines()
+            except OSError:
+                continue
+        events = parse_codex_lines(lines, source=source)
+        for e in events:
+            e["_source_file"] = path
+        event_lists.append(events)
+    return dedup_events(event_lists), skipped
+
+
+REMOTE_CODEX_SEP = "___CCTRACK_CODEX_FILE___"
+
+
+def fetch_remote_codex(host: str) -> str:
+    """SSH to host and stream its Codex rollouts (decompressing .zst remotely
+    when the host has `zstd`)."""
+    remote_cmd = (
+        'CH="${CODEX_HOME:-$HOME/.codex}"; '
+        f'find "$CH/sessions" "$CH/archived_sessions" -name "rollout-*.jsonl" '
+        f"-exec echo '{REMOTE_CODEX_SEP}' \\; -exec cat {{}} \\; 2>/dev/null; "
+        'if command -v zstd >/dev/null 2>&1; then '
+        f'find "$CH/sessions" "$CH/archived_sessions" -name "rollout-*.jsonl.zst" '
+        f"-exec echo '{REMOTE_CODEX_SEP}' \\; -exec zstd -dc {{}} \\; 2>/dev/null; fi; true"
+    )
+    cmd = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, remote_cmd]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return result.stdout or ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def parse_remote_codex_events(host: str) -> list[dict]:
+    raw = fetch_remote_codex(host)
+    if not raw:
+        return []
+    events = dedup_events(parse_codex_lines(chunk.splitlines(), source=host)
+                          for chunk in raw.split(REMOTE_CODEX_SEP))
+    for e in events:
+        e["_source_file"] = f"(remote {host})"
+    return events
 
 
 # ── Hook data parsing ──────────────────────────────────────────────────
@@ -1081,7 +1427,8 @@ def aggregate(events: list[dict]) -> tuple[dict, dict]:
         cache_1h = e.get("cache_write_1h", 0)
         cost = calculate_cost(e["model"], e["input"], e["output"],
                               e["cache_read"], e["cache_write"], cache_1h,
-                              date_str=date_str)
+                              date_str=date_str,
+                              request_input=e.get("_request_input"))
         energy = estimate_energy_wh(e["model"], e["input"], e["output"],
                                     e["cache_read"], e["cache_write"], cache_1h)
         model = e.get("model", "")
@@ -1183,6 +1530,7 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
         print("Looked in:")
         for d in default_dirs():
             print(f"  {d}")
+        print(f"  {codex_home() / 'sessions'}  (Codex)")
         return
 
     hooks_exist = any(src.get("install_date") or src["hook_daily"] for src in sources)
@@ -1215,6 +1563,12 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
         hook_cost = src["hook_daily"].get(date_str, {}).get("cost", 0.0)
         jsonl_cost = src["daily"].get(date_str, {}).get("cost", 0.0)
         install = src.get("install_date")
+
+        if src.get("exact"):
+            # Priced directly from per-response usage the agent logs itself
+            # (Codex). There is no hook to defer to, and the Claude-derived
+            # accuracy factor says nothing about these logs.
+            return (jsonl_cost, "auth") if jsonl_cost > 0 else (0.0, None)
 
         if install and date_str == install:
             adjusted = jsonl_cost * accuracy_factor if jsonl_cost > 0 else 0.0
@@ -1355,6 +1709,16 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
         else:
             print(f"  Total cost:     ${mtd_cost:.2f}")
 
+        # Per-agent split, shown once more than one coding agent has spend.
+        agent_cost: dict[str, float] = defaultdict(float)
+        for src in sources:
+            for d in current_days_all:
+                agent_cost[src.get("agent", "claude")] += _source_date_cost(src, d)[0]
+        if sum(1 for v in agent_cost.values() if v > 0) > 1:
+            parts = [f"{AGENT_LABELS.get(a, a)} ${c:,.2f}"
+                     for a, c in sorted(agent_cost.items(), key=lambda kv: -kv[1]) if c > 0]
+            print(f"  By agent:       {' · '.join(parts)}")
+
         if days_active > 0:
             avg_daily = mtd_cost / days_active
             projected = avg_daily * 30
@@ -1481,7 +1845,7 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
 def _event_cost_breakdown(e: dict, date_str: str) -> dict:
     """Per-token-class dollar cost of one event, at the rates in effect on its
     own date. Keys: input, output, cache_read, cache_write, cache_write_1h."""
-    r = get_rates(e.get("model", ""), date_str)
+    r = get_rates(e.get("model", ""), date_str, e.get("_request_input"))
     return {
         "input": e.get("input", 0) / 1_000_000 * r["input"],
         "output": e.get("output", 0) / 1_000_000 * r["output"],
@@ -1553,6 +1917,10 @@ def print_explore(events: list[dict], date_str: str,
 
     # ── Totals: JSONL estimate vs authoritative hook, per source ──
     jsonl_by_source: dict[str, float] = defaultdict(float)
+    # The statusline hook only covers Claude Code, so hook comparisons use the
+    # Claude-only slice of the JSONL estimate.
+    claude_by_source: dict[str, float] = defaultdict(float)
+    by_agent: dict[str, float] = defaultdict(float)
     classes = {"input": 0.0, "output": 0.0, "cache_read": 0.0,
                "cache_write": 0.0, "cache_write_1h": 0.0}
     tokens = {"input": 0, "output": 0, "cache_read": 0,
@@ -1569,6 +1937,10 @@ def print_explore(events: list[dict], date_str: str,
         cost = sum(bd.values())
         src = e.get("source", "local")
         jsonl_by_source[src] += cost
+        agent = e.get("agent", "claude")
+        by_agent[agent] += cost
+        if agent == "claude":
+            claude_by_source[src] += cost
         for k in classes:
             classes[k] += bd[k]
             tokens[k] += e.get(k, 0)
@@ -1598,14 +1970,17 @@ def print_explore(events: list[dict], date_str: str,
 
     jsonl_total = sum(jsonl_by_source.values())
 
+    claude_total = sum(claude_by_source.values())
     print(f"Total (JSONL-estimated):  ${jsonl_total:,.2f}")
     if hook_by_source:
         hook_total = sum(hook_by_source.values())
-        print(f"Total (hook-authoritative): ${hook_total:,.2f}")
-        if jsonl_total > 0 and hook_total > 0:
-            ratio = jsonl_total / hook_total
+        mixed = claude_total < jsonl_total - 0.005
+        label = "Claude Code (hook-authoritative)" if mixed else "Total (hook-authoritative)"
+        print(f"{label}: ${hook_total:,.2f}")
+        if claude_total > 0 and hook_total > 0:
+            ratio = claude_total / hook_total
             if ratio > 1.15 or ratio < 0.87:
-                print(f"  ⚠ JSONL estimate is {ratio:.2f}× the authoritative hook cost —")
+                print(f"  ⚠ Claude JSONL estimate is {ratio:.2f}× the authoritative hook cost —")
                 print(f"    the breakdown below is JSONL-derived and may be distorted.")
     if show_energy:
         print(f"Energy (est):             {format_energy(energy_total)}")
@@ -1623,6 +1998,13 @@ def print_explore(events: list[dict], date_str: str,
         print(f"  {label:<15} ${amt:>10,.2f}  {_pct(amt, jsonl_total):>4}  "
               f"{_bar(amt, jsonl_total)}  {format_tokens(tokens[key])} tok")
     print()
+
+    # ── By agent ──
+    if len([a for a, c in by_agent.items() if c > 0]) > 1:
+        print("By agent:")
+        for agent, cost in sorted(by_agent.items(), key=lambda kv: -kv[1]):
+            print(f"  {AGENT_LABELS.get(agent, agent):<22} ${cost:>10,.2f}  {_pct(cost, jsonl_total):>4}")
+        print()
 
     # ── By model ──
     print("By model:")
@@ -1650,7 +2032,12 @@ def print_explore(events: list[dict], date_str: str,
         for src in sorted(jsonl_by_source, key=lambda s: -jsonl_by_source[s]):
             j = jsonl_by_source[src]
             h = hook_by_source.get(src)
-            hook_note = f"   (hook: ${h:,.2f})" if h is not None else "   (no hook — estimate)"
+            if h is not None:
+                hook_note = f"   (Claude hook: ${h:,.2f})"
+            elif claude_by_source.get(src, 0) > 0:
+                hook_note = "   (no hook — estimate)"
+            else:
+                hook_note = ""
             print(f"  {src:<16} ${j:>10,.2f}  {_pct(j, jsonl_total):>4}{hook_note}")
         print()
 
@@ -1771,7 +2158,14 @@ def main():
         "--uninstall-hook", action="store_true",
         help="Uninstall the cctrack statusline hook"
     )
+    parser.add_argument(
+        "--agent", choices=("all", "claude", "codex"), default="all",
+        help="Which coding agents to include (default: all found). Codex logs "
+             "are read from $CODEX_HOME or ~/.codex."
+    )
     args = parser.parse_args()
+    want_claude = args.agent in ("all", "claude")
+    want_codex = args.agent in ("all", "codex")
 
     # Hook management (run and exit)
     if args.install_hook:
@@ -1791,7 +2185,7 @@ def main():
 
     # ── Local source: JSONL events + hook data ──
     dirs = args.dirs if args.dirs else default_dirs()
-    files = discover_files(dirs)
+    files = discover_files(dirs) if want_claude else []
     local_events = parse_events(files)
     local_daily, _ = aggregate(local_events)
 
@@ -1806,7 +2200,7 @@ def main():
 
     local_hook_events: list[dict] = []
     local_hook_monthly: dict[str, dict] = {}
-    for hdir in discover_hook_data_dirs():
+    for hdir in (discover_hook_data_dirs() if want_claude else []):
         rollup_old_hook_files(hdir)
         baselines = load_session_baselines(hdir)
         local_hook_events.extend(compute_hook_deltas(parse_hook_rows(hdir), baselines))
@@ -1825,14 +2219,36 @@ def main():
             local_install = earliest
 
     all_events = list(local_events)
-    sources = [{"name": "local", "daily": local_daily,
+    sources = [{"name": "local", "agent": "claude", "daily": local_daily,
                 "hook_daily": local_hook_daily, "install_date": local_install,
                 "deltas": local_hook_events}]
+
+    # Codex is its own source on each machine: it's priced from the per-response
+    # usage Codex logs, and must never be displaced by Claude's hook coverage.
+    def _add_codex_source(name: str, events: list[dict]) -> None:
+        if not events:
+            return
+        all_events.extend(events)
+        codex_daily, _ = aggregate(events)
+        sources.append({"name": name, "agent": "codex", "exact": True,
+                        "daily": codex_daily, "hook_daily": {},
+                        "install_date": None, "deltas": []})
+
+    if want_codex:
+        codex_events, zst_skipped = parse_codex_events(discover_codex_files())
+        _add_codex_source("local", codex_events)
+        if zst_skipped:
+            print(f"  Note: skipped {zst_skipped} compressed Codex rollout(s) (.jsonl.zst) — "
+                  f"install `zstd` (or use Python 3.14+) to include them.", file=sys.stderr)
 
     # ── One source per remote host. Deltas are computed per host so a
     # session's cumulative history never mixes across hosts. ──
     if args.remote:
         for host in args.remote:
+            if want_codex:
+                _add_codex_source(host, parse_remote_codex_events(host))
+            if not want_claude:
+                continue
             remote_events = parse_remote_events(host)
             all_events.extend(remote_events)
             remote_daily, _ = aggregate(remote_events)
@@ -1844,12 +2260,12 @@ def main():
                 remote_hook_daily = aggregate_hook_data(remote_deltas, remote_monthly)
             remote_install = min(remote_hook_daily.keys()) if remote_hook_daily else None
 
-            sources.append({"name": host, "daily": remote_daily,
+            sources.append({"name": host, "agent": "claude", "daily": remote_daily,
                             "hook_daily": remote_hook_daily, "install_date": remote_install,
                             "deltas": remote_deltas})
 
-    # Suggest hook if not installed
-    if not is_hook_installed():
+    # Suggest hook if not installed (it only matters for Claude Code)
+    if want_claude and not is_hook_installed():
         prompt_hook_install()
 
     # ── Explore a single day (run and exit) ──

@@ -88,7 +88,7 @@ def test_get_rates_opus_4():
 
 def test_get_rates_opus_4_1():
     r = cctrack.get_rates("claude-opus-4-1-20250501")
-    assert r["family"] == "claude-opus-4"
+    assert r["family"] == "claude-opus-4-1"
     assert r["input"] == 15.0
 
 
@@ -100,22 +100,22 @@ def test_get_rates_sonnet():
 
 
 def test_get_rates_sonnet_4_6():
-    """Sonnet 4.6 still matches the claude-sonnet-4 prefix."""
+    """Sonnet 4.6 has its own row (a minor version never inherits a price)."""
     r = cctrack.get_rates("claude-sonnet-4-6-20260301")
-    assert r["family"] == "claude-sonnet-4"
+    assert r["family"] == "claude-sonnet-4-6"
     assert r["input"] == 3.0
 
 
 def test_get_rates_sonnet_3_7():
-    """Deprecated Sonnet 3.7 matches claude-sonnet-3 prefix."""
+    """Retired Sonnet 3.7 keeps its own row for historical usage."""
     r = cctrack.get_rates("claude-sonnet-3-7-20250219")
-    assert r["family"] == "claude-sonnet-3"
+    assert r["family"] == "claude-sonnet-3-7"
     assert r["input"] == 3.0
 
 
 def test_get_rates_haiku_4_5():
     r = cctrack.get_rates("claude-haiku-4-5-20251001")
-    assert r["family"] == "claude-haiku-4"
+    assert r["family"] == "claude-haiku-4-5"
     assert r["input"] == 1.0
     assert r["output"] == 5.0
 
@@ -154,17 +154,27 @@ def test_get_rates_fable_and_mythos():
         assert r["cache_write_1h"] == 20.0, m
 
 
-def test_get_rates_sonnet_5_introductory_pricing():
-    """Sonnet 5 bills at $2/$10 through 2026-08-31, $3/$15 from Sep 1."""
-    intro = cctrack.get_rates("claude-sonnet-5", "2026-08-31")
-    assert intro["input"] == 2.0 and intro["output"] == 10.0
-    assert intro["cache_read"] == 0.20 and intro["cache_write_1h"] == 4.0
+def test_get_rates_sonnet_5_launch_price_is_permanent():
+    """Sonnet 5's $2/$10 launch price became standard — the scheduled Sep 1
+    2026 rise to $3/$15 was cancelled. Same price on every date."""
+    for d in ("2026-08-31", "2026-09-01", "2026-10-12", None):
+        r = cctrack.get_rates("claude-sonnet-5", d)
+        assert r["input"] == 2.0 and r["output"] == 10.0
+        assert r["cache_read"] == 0.20 and r["cache_write_1h"] == 4.0
 
-    standard = cctrack.get_rates("claude-sonnet-5", "2026-09-01")
-    assert standard["input"] == 3.0 and standard["output"] == 15.0
 
+def test_intro_pricing_mechanism(monkeypatch):
+    """The generic intro-pricing mechanism applies on/before `until` only."""
+    row = {"family": "claude-test-9", "tier": "sonnet", "input": 3.0, "output": 15.0,
+           "cache_read": 0.3, "cache_write": 3.75, "cache_write_1h": 6.0,
+           "intro": {"until": "2026-08-31", "input": 2.0, "output": 10.0}}
+    monkeypatch.setattr(cctrack, "RATES", [row] + cctrack.RATES)
+    assert cctrack.get_rates("claude-test-9", "2026-08-31")["input"] == 2.0
+    assert cctrack.get_rates("claude-test-9", "2026-09-01")["input"] == 3.0
     # No date given → standard rates (never silently apply a past promo).
-    assert cctrack.get_rates("claude-sonnet-5")["input"] == 3.0
+    assert cctrack.get_rates("claude-test-9")["input"] == 3.0
+    assert abs(cctrack.calculate_cost("claude-test-9", 1_000_000, 0, 0, 0,
+                                      date_str="2026-07-28") - 2.0) < 1e-9
 
 
 def test_intro_pricing_does_not_leak_to_other_families():
@@ -172,11 +182,39 @@ def test_intro_pricing_does_not_leak_to_other_families():
     assert cctrack.get_rates("claude-opus-5", "2026-08-01")["input"] == 5.0
 
 
-def test_calculate_cost_honours_event_date():
-    intro = cctrack.calculate_cost("claude-sonnet-5", 1_000_000, 0, 0, 0, date_str="2026-07-28")
-    later = cctrack.calculate_cost("claude-sonnet-5", 1_000_000, 0, 0, 0, date_str="2026-09-15")
-    assert abs(intro - 2.0) < 0.001
-    assert abs(later - 3.0) < 0.001
+def test_new_minor_versions_never_inherit_a_price():
+    """claude-opus-5-5 once silently inherited Opus 5's price. Each minor
+    version must have its own row; an unlisted one is flagged unknown."""
+    r = cctrack.get_rates("claude-opus-5-5")
+    assert r["family"] == "claude-opus-5-5"
+    assert (r["input"], r["output"], r["cache_read"]) == (4.0, 20.0, 0.20)
+    assert cctrack.get_rates("claude-fable-5-1")["cache_read"] == 0.25
+    assert cctrack.get_rates("claude-sonnet-5-5")["cache_read"] == 0.10
+    assert not cctrack.is_known_model("claude-opus-5-7")      # hypothetical future
+    assert not cctrack.is_known_model("claude-haiku-4-9")
+    # dated snapshots still belong to their family
+    assert cctrack.get_rates("claude-opus-4-20250514")["family"] == "claude-opus-4"
+
+
+def test_haiku_5_5_prompt_length_tier():
+    """Haiku 5.5 requests whose prompt (input + cache reads + writes) exceeds
+    100K tokens bill at the higher tier."""
+    small = cctrack.get_rates("claude-haiku-5-5", request_input=100_000)
+    big = cctrack.get_rates("claude-haiku-5-5", request_input=100_001)
+    assert (small["input"], small["cache_read"], small["output"]) == (0.10, 0.01, 0.50)
+    assert (big["input"], big["cache_read"], big["output"]) == (0.50, 0.05, 2.50)
+
+
+def test_claude_event_request_input_counts_cache():
+    """Prompt length for the tier includes cache reads and writes."""
+    import json as _j
+    ev = make_event(model="claude-haiku-5-5", input_tokens=1_000,
+                    output_tokens=10, cache_read=95_000, cache_write=5_000)
+    [e] = cctrack.parse_lines([_j.dumps(ev)])
+    assert e["_request_input"] == 101_000
+    daily, _ = cctrack.aggregate([e])
+    expected = (1_000 * 0.50 + 10 * 2.50 + 95_000 * 0.05 + 5_000 * 0.625) / 1e6
+    assert abs(daily["2026-03-15"]["cost"] - expected) < 1e-12
 
 
 def test_every_rate_entry_has_an_energy_tier():
@@ -241,10 +279,12 @@ def test_calculate_cost_1h_vs_5m_cache_write_differ():
 
 
 def test_get_rates_include_1h_cache_write():
-    # Every family should expose a cache_write_1h rate at 2× input.
+    # Every family exposes cache_write_1h; Anthropic prices it at 2× input
+    # (OpenAI has a single cache-write tier, so its rows carry one price).
     for r in cctrack.RATES:
         assert "cache_write_1h" in r
-        assert abs(r["cache_write_1h"] - 2.0 * r["input"]) < 0.001
+        if r.get("provider") != "openai":
+            assert abs(r["cache_write_1h"] - 2.0 * r["input"]) < 0.001
 
 
 def test_parse_lines_extracts_1h_cache_split():
@@ -905,8 +945,12 @@ def test_event_cost_breakdown_by_class():
     assert abs(bd["cache_write_1h"] - 10.0) < 1e-9
 
 
-def test_event_cost_breakdown_is_date_aware():
-    e = {"model": "claude-sonnet-5", "input": 1_000_000, "output": 0,
+def test_event_cost_breakdown_is_date_aware(monkeypatch):
+    row = {"family": "claude-test-9", "tier": "sonnet", "input": 3.0, "output": 15.0,
+           "cache_read": 0.3, "cache_write": 3.75, "cache_write_1h": 6.0,
+           "intro": {"until": "2026-08-31", "input": 2.0}}
+    monkeypatch.setattr(cctrack, "RATES", [row] + cctrack.RATES)
+    e = {"model": "claude-test-9", "input": 1_000_000, "output": 0,
          "cache_read": 0, "cache_write": 0, "cache_write_1h": 0}
     intro = cctrack._event_cost_breakdown(e, "2026-08-31")
     later = cctrack._event_cost_breakdown(e, "2026-09-01")
