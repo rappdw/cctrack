@@ -107,7 +107,7 @@ def test_model_and_attribution_from_context():
     lines = [session_meta(thread="thr-9", cwd="/home/u/payments", branch="feat/x"),
              turn_context("2026-10-10T09:00:01.000Z", model="gpt-5.4",
                           cwd="/home/u/payments"),
-             record("2026-10-10T09:00:02.000Z", "r1", usage(inp=10, out=5))]
+             record("2026-10-10T09:00:02.000Z", "r1", usage(inp=10, out=5), "thr-9")]
     [e] = cctrack.parse_codex_lines(lines, source="air")
     assert e["model"] == "gpt-5.4"
     assert e["agent"] == "codex"

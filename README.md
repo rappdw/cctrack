@@ -114,6 +114,26 @@ cctrack --explore 2026-08-03 --project team-inbox
 
 This restricts the view to that project and prints each session's full `cwd`, git branch, and the log file on disk (which reveals the host directory or the specific Sandy sandbox it came from). The unfiltered view flags this automatically when a `cwd` looks like a container path. `scripts/trace_project.py` and `scripts/diagnose_session_cost.py` are standalone versions of the trace and per-session cost diagnostics.
 
+## Sessions, time buckets and coverage (JSON / CSV)
+
+For attributing cost to sessions, roles or time windows. All times and day boundaries are **UTC**; output holds ids, paths, counts and money only, never prompt or response content.
+
+```bash
+cctrack --sessions --since 2026-10-11T02:30:04Z --until 2026-10-12   # per-session table
+cctrack --bucket hour --since 2026-10-11 --until 2026-10-12          # cost per UTC hour
+cctrack --coverage                                                   # what data exists, and gaps
+cctrack --json --since 2026-10-11 > report.json                      # everything, one document
+cctrack --csv sessions                                               # or buckets | coverage | rates
+cctrack --json --redact                                              # hash paths and names
+```
+
+- `--since` / `--until` take ISO-8601 (zones converted to UTC; naive times are UTC) or `YYYY-MM-DD`. The window is `since <= t < until`, and a bare `--until` date includes that whole day.
+- **Sessions**: one row per session, with Claude subagent (sidechain) turns as their own rows linked by `parent_session_id`. Codex subagent threads are separate sessions that carry their parent's id. Each row has agent, host, Sandy sandbox, project/cwd, git branch, first and last record time, models, request count, tokens and cost in five classes (input, output, cache read, 5-minute and 1-hour cache write), mean and max cache-read and context tokens per request, and compactions.
+- **Cost basis**: `cost_usd` is always API list price from the built-in rate card. The rates applied (per model, $/Mtok per class), the card's version and its sources are in the JSON (`rate_card`, `cost_basis`) and in `--csv rates`. For Claude, `hook_cost_usd` is Claude Code's own cost counter. It's booked per UTC day, so it's only filled in for day-aligned windows. Logs don't say whether you're on API or subscription billing, so record that with `--billing-mode subscription` (or `claude=subscription,codex=api`, or `CCTRACK_BILLING_MODE`). It's shown on each row and doesn't change cost.
+- **Coverage**: for each log directory (per host and sandbox), the file count, usage records, earliest and latest timestamp, and any unparseable lines or unreadable files (status `UNKNOWN`). Days in the window with no records are listed as UNKNOWN, since idle days and lost logs look the same. Where the statusline hook saw Claude spend but no transcript exists, the day and session are flagged with tokens UNKNOWN. That's the signature of lost logs.
+- `--redact` hashes cwd, project, sandbox, branch and file paths, but not session ids. Set `CCTRACK_REDACT_SALT` so the hashes of guessable repo names can't be reversed.
+- JSON and CSV carry `schema_version` (currently 1). Field names are stable within a schema version.
+
 ## Remote aggregation
 
 With `--remote`, cctrack SSHs to each host and streams back both the JSONL logs and the host's statusline hook data (`~/.claude/cctrack/`) for local parsing, so authoritative hook costs from every machine are summed per day. Requires SSH key auth.
