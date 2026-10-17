@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cctrack"
-version = "0.10.0"
+version = "0.11.0"
 description = "Claude Code cost tracker — scans JSONL logs and reports token usage + estimated cost"
 readme = "README.md"
 license = "MIT"
@@ -34,3 +34,14 @@ cctrack = "cctrack:main"
 Homepage = "https://github.com/rappdw/cctrack"
 Repository = "https://github.com/rappdw/cctrack"
 Issues = "https://github.com/rappdw/cctrack/issues"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/scripts",
+    "/README.md",
+    "/CLAUDE.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]

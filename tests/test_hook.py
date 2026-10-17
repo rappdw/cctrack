@@ -516,7 +516,7 @@ def test_remote_install_hook_success(capsys):
     """remote_install_hook prints success on clean SSH run."""
     fake_result = subprocess.CompletedProcess(
         args=[], returncode=0,
-        stdout="Hook script: /home/user/.claude/hooks/cctrack-hook.py\nData dir:    /home/user/.claude/cctrack\nSettings:    /home/user/.claude/settings.json\n",
+        stdout='CCTRACK_RESULT {"wrapped": null}\n',
         stderr="",
     )
     with patch("subprocess.run", return_value=fake_result) as mock_run:
@@ -589,7 +589,7 @@ def test_remote_uninstall_hook_success(capsys):
     """remote_uninstall_hook prints success on clean SSH run."""
     fake_result = subprocess.CompletedProcess(
         args=[], returncode=0,
-        stdout="uninstalled\nData preserved: /home/user/.claude/cctrack/statusline.jsonl\n",
+        stdout='CCTRACK_RESULT {"status_line": "removed", "restored": null}\n',
         stderr="",
     )
     with patch("subprocess.run", return_value=fake_result):
@@ -648,3 +648,164 @@ def test_main_uninstall_hook_remote(capsys):
         with patch("sys.argv", ["cctrack", "--uninstall-hook", "--remote", "dgx"]):
             cctrack.main()
     mock_remote.assert_called_once_with("dgx")
+
+
+
+# ── Wrapping an existing status line ─────────────────────────────────
+
+def _paths(home: Path):
+    return dict(settings=home / ".claude" / "settings.json",
+                hook=home / ".claude" / "hooks" / "cctrack-hook.py",
+                config=home / ".claude" / "cctrack" / "config.json")
+
+
+def _install(home: Path):
+    p = _paths(home)
+    with patch.object(cctrack, "CCTRACK_DIR", p["config"].parent), \
+         patch.object(cctrack, "HOOK_SCRIPT_PATH", p["hook"]), \
+         patch.object(cctrack, "HOOK_CONFIG_PATH", p["config"]), \
+         patch.object(cctrack, "CLAUDE_SETTINGS_PATH", p["settings"]):
+        cctrack.install_hook()
+
+
+def _uninstall(home: Path):
+    p = _paths(home)
+    with patch.object(cctrack, "CCTRACK_DIR", p["config"].parent), \
+         patch.object(cctrack, "HOOK_SCRIPT_PATH", p["hook"]), \
+         patch.object(cctrack, "HOOK_CONFIG_PATH", p["config"]), \
+         patch.object(cctrack, "CLAUDE_SETTINGS_PATH", p["settings"]):
+        cctrack.uninstall_hook()
+
+
+def _run_hook(home: Path, payload: dict) -> subprocess.CompletedProcess:
+    env = {**os.environ, "HOME": str(home)}
+    return subprocess.run([sys.executable, str(_paths(home)["hook"])],
+                          input=json.dumps(payload), capture_output=True, text=True,
+                          env=env, timeout=30)
+
+
+PAYLOAD = {"session_id": "s1", "cost": {"total_cost_usd": 1.25},
+           "model": {"id": "claude-opus-5-5"}}
+
+
+def test_install_wraps_existing_status_line_and_passes_output_through(tmp_path, capsys):
+    p = _paths(tmp_path)
+    p["settings"].parent.mkdir(parents=True)
+    # The user's own status line reads the session JSON from stdin.
+    mine = {"type": "command", "padding": 2,
+            "command": f"{sys.executable} -c \"import json,sys; d=json.load(sys.stdin); "
+                       f"print('MINE', d['model']['id']); sys.exit(3)\""}
+    p["settings"].write_text(json.dumps({"theme": "dark", "statusLine": mine}))
+
+    _install(tmp_path)
+    assert "Wrapping your status line" in capsys.readouterr().out
+    settings = json.loads(p["settings"].read_text())
+    assert settings["statusLine"]["command"] == cctrack._hook_command()
+    assert settings["statusLine"]["padding"] == 2          # other keys kept
+    assert settings["theme"] == "dark"
+    assert json.loads(p["config"].read_text())["wrapped_status_line"] == mine
+
+    r = _run_hook(tmp_path, PAYLOAD)
+    assert r.stdout == "MINE claude-opus-5-5\n"             # output passed through
+    assert r.returncode == 3                                # exit code too
+    [rec] = [json.loads(l) for f in p["config"].parent.glob("statusline-*.jsonl")
+             for l in f.read_text().splitlines()]
+    assert rec["session_id"] == "s1" and rec["cost_usd"] == 1.25   # and still recorded
+
+
+def test_hook_without_wrapped_status_line_prints_nothing(tmp_path):
+    _install(tmp_path)
+    r = _run_hook(tmp_path, PAYLOAD)
+    assert r.returncode == 0 and r.stdout == ""
+    assert list(_paths(tmp_path)["config"].parent.glob("statusline-*.jsonl"))
+
+
+def test_reinstall_keeps_wrapped_status_line_and_install_date(tmp_path):
+    p = _paths(tmp_path)
+    p["settings"].parent.mkdir(parents=True)
+    mine = {"type": "command", "command": "echo mine"}
+    p["settings"].write_text(json.dumps({"statusLine": mine}))
+    _install(tmp_path)
+    first = json.loads(p["config"].read_text())
+    _install(tmp_path)  # must not wrap itself
+    again = json.loads(p["config"].read_text())
+    assert again["wrapped_status_line"] == mine
+    assert again["installed_at"] == first["installed_at"]
+
+
+def test_uninstall_restores_wrapped_status_line(tmp_path, capsys):
+    p = _paths(tmp_path)
+    p["settings"].parent.mkdir(parents=True)
+    mine = {"type": "command", "command": "echo mine", "padding": 0}
+    p["settings"].write_text(json.dumps({"theme": "dark", "statusLine": mine}))
+    _install(tmp_path)
+    _uninstall(tmp_path)
+    assert "Status line restored: echo mine" in capsys.readouterr().out
+    settings = json.loads(p["settings"].read_text())
+    assert settings == {"theme": "dark", "statusLine": mine}
+    assert not p["hook"].exists() and not p["config"].exists()
+
+
+def test_uninstall_leaves_a_status_line_changed_since_install(tmp_path, capsys):
+    p = _paths(tmp_path)
+    _install(tmp_path)
+    newer = {"type": "command", "command": "echo newer"}
+    p["settings"].write_text(json.dumps({"statusLine": newer}))
+    _uninstall(tmp_path)
+    assert json.loads(p["settings"].read_text())["statusLine"] == newer
+    assert "left as is" in capsys.readouterr().out
+
+
+def _local_ssh(home: Path):
+    """Stand-in for subprocess.run that runs the program shipped to
+    `ssh host python3 -` locally, with HOME pointing at a temp dir."""
+    real_run = subprocess.run
+
+    def run(cmd, **kw):
+        assert cmd[0] == "ssh" and cmd[-2:] == ["python3", "-"]
+        return real_run([sys.executable, "-"], input=kw["input"], capture_output=True,
+                        text=True, env={**os.environ, "HOME": str(home)}, timeout=30)
+    return run
+
+
+def test_remote_install_and_uninstall_wrap_and_restore_for_real(tmp_path, capsys):
+    p = _paths(tmp_path)
+    p["settings"].parent.mkdir(parents=True)
+    mine = {"type": "command", "command": "echo remote-mine"}
+    p["settings"].write_text(json.dumps({"statusLine": mine}))
+
+    with patch("subprocess.run", side_effect=_local_ssh(tmp_path)):
+        cctrack.remote_install_hook("dgx")
+    out = capsys.readouterr().out
+    assert "installed on dgx" in out and "Wrapping your status line: echo remote-mine" in out
+    assert p["hook"].read_text() == cctrack.HOOK_SCRIPT
+    assert json.loads(p["settings"].read_text())["statusLine"]["command"] == cctrack._hook_command()
+    assert _run_hook(tmp_path, PAYLOAD).stdout == "remote-mine\n"
+
+    with patch("subprocess.run", side_effect=_local_ssh(tmp_path)):
+        cctrack.remote_uninstall_hook("dgx")
+    out = capsys.readouterr().out
+    assert "uninstalled on dgx" in out and "Status line restored: echo remote-mine" in out
+    assert json.loads(p["settings"].read_text())["statusLine"] == mine
+
+
+def test_reinstall_over_older_install_upgrades_script_and_keeps_settings(tmp_path):
+    """An install from before wrapping existed: absolute-path command, extra
+    statusLine keys, config without wrapped_status_line, stale hook script."""
+    p = _paths(tmp_path)
+    p["hook"].parent.mkdir(parents=True)
+    p["config"].parent.mkdir(parents=True)
+    p["hook"].write_text("# old hook\n")
+    p["config"].write_text(json.dumps({"installed_at": "2026-04-01T00:00:00+00:00",
+                                       "version": "0.3.0"}))
+    p["settings"].write_text(json.dumps({"statusLine": {
+        "type": "command", "padding": 1,
+        "command": f"python3 {p['hook']}"}}))
+    _install(tmp_path)
+    settings = json.loads(p["settings"].read_text())
+    assert settings["statusLine"] == {"type": "command", "padding": 1,
+                                      "command": cctrack._hook_command()}
+    config = json.loads(p["config"].read_text())
+    assert config["installed_at"] == "2026-04-01T00:00:00+00:00"
+    assert "wrapped_status_line" not in config      # nothing to wrap: it was ours
+    assert p["hook"].read_text() == cctrack.HOOK_SCRIPT

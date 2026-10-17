@@ -85,8 +85,10 @@ RATES = [
     # rise to $3/$15 was cancelled.
     _an("claude-sonnet-5",       "sonnet",    2.00,  2.50,  4.00, 0.20,  10.00),
     _an("claude-sonnet-4-6",     "sonnet",    3.00,  3.75,  6.00, 0.30,  15.00),
-    _an("claude-sonnet-4-5",     "sonnet",    3.00,  3.75,  6.00, 0.30,  15.00),
-    _an("claude-sonnet-4",       "sonnet",    3.00,  3.75,  6.00, 0.30,  15.00),
+    _an("claude-sonnet-4-5",     "sonnet",    3.00,  3.75,  6.00, 0.30,  15.00,
+        lc=(6.00, 7.50, 12.00, 0.60, 22.50, 200_000)),
+    _an("claude-sonnet-4",       "sonnet",    3.00,  3.75,  6.00, 0.30,  15.00,
+        lc=(6.00, 7.50, 12.00, 0.60, 22.50, 200_000)),
     _an("claude-sonnet-3-7",     "sonnet",    3.00,  3.75,  6.00, 0.30,  15.00),
     _an("claude-sonnet-3-5",     "sonnet",    3.00,  3.75,  6.00, 0.30,  15.00),
     _an("claude-haiku-5-5",      "haiku",     0.10,  0.125, 0.20, 0.01,   0.50,
@@ -127,13 +129,56 @@ RATES = [
     _oa("gpt-5",         "sonnet",    1.25, 0.125, 10.00),
 ]
 
+# Explicit aliases only: never guess a newly released model's price.
+MODEL_ALIASES = {
+    "gpt-5.1-codex-mini": "gpt-5-mini",
+    "gpt-5.1-codex-max": "gpt-5.1",
+    "gpt-5.6": "gpt-5.6-sol",
+}
+
+# Per-model premiums/discounts; an unlisted tier is not inferred from a peer.
+# Historical Claude Opus 4.6/4.7 fast rates were 6x, later Opus fast is 2x.
+FAST_MULTIPLIERS = {
+    "claude-opus-4-6": 6.0, "claude-opus-4-7": 6.0,
+    "claude-opus-4-8": 2.0, "claude-opus-5": 2.0, "claude-opus-5-5": 2.0,
+    "gpt-5.5": 2.5,
+    **dict.fromkeys(("gpt-5.3-codex", "gpt-5.4", "gpt-5.6-sol", "gpt-5.6-terra",
+                     "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol",
+                     "gpt-6-luna"), 2.0),
+}
+FLEX_MODELS = {
+    "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna",
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.5-pro",
+    "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro",
+    "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-5-nano",
+}
+
+
+def normalize_service_tier(value) -> str | None:
+    if value in ("fast", "priority"):
+        return "fast"
+    if value in ("standard", "default"):
+        return "standard"
+    return "flex" if value == "flex" else None
+
+
+def _canonical_model(model: str) -> str:
+    model = re.sub(r"-fast$", "", model)
+    # Older Claude ids put the version before the family name.
+    model = re.sub(r"^claude-(\d+(?:-\d+)?)-(sonnet|haiku|opus)(?=-|$)",
+                   r"claude-\2-\1", model)
+    for alias in sorted(MODEL_ALIASES, key=len, reverse=True):
+        if model == alias or re.fullmatch(re.escape(alias) + r"-(?:\d{8}|\d{4}-\d{2}-\d{2})", model):
+            return MODEL_ALIASES[alias] + model[len(alias):]
+    return model
+
 SONNET_RATES = next(r for r in RATES if r["family"] == "claude-sonnet-4")  # fallback
 # Unknown OpenAI/Codex models fall back to the base GPT-5 rates (and are flagged
 # "?"), not to Claude Sonnet — the two price lists are unrelated.
 OPENAI_FALLBACK_RATES = next(r for r in RATES if r["family"] == "gpt-5")
 
 # Suffix words that denote a DIFFERENT size/price tier. A model whose id adds
-# one of these past a family's prefix (e.g. gpt-5.1-codex-mini vs gpt-5.1) must
+# one of these past a family's prefix (e.g. an unlisted gpt-5.9-codex-mini vs gpt-5.9) must
 # not silently inherit that family's price — it's treated as unknown instead.
 _TIER_WORDS = {"mini", "nano", "pro", "max", "luna", "terra", "sol", "astra"}
 
@@ -165,14 +210,16 @@ def _is_openai_model(model: str) -> bool:
 
 
 def _find_rate_row(model: str) -> dict | None:
-    for r in RATES:
+    model = _canonical_model(model)
+    for r in sorted(RATES, key=lambda r: len(r["family"]), reverse=True):
         if _family_matches(model, r["family"]):
             return r
     return None
 
 
 def get_rates(model: str, date_str: str | None = None,
-              request_input: int | None = None) -> dict:
+              request_input: int | None = None,
+              service_tier: str | None = None) -> dict:
     """Match model name to a rate-card family. Unknown models fall back to
     Sonnet (Claude) or GPT-5 (OpenAI). When `date_str` (YYYY-MM-DD) falls within
     a family's introductory-pricing window the introductory rates apply; when
@@ -185,12 +232,20 @@ def get_rates(model: str, date_str: str | None = None,
     if intro and date_str and date_str <= intro["until"]:
         merged = dict(r)
         merged.update({k: v for k, v in intro.items() if k != "until"})
-        return merged
+        r = merged
     lc = r.get("long_context")
     if lc and request_input is not None and request_input > lc["over"]:
         merged = dict(r)
         merged.update({k: v for k, v in lc.items() if k != "over"})
-        return merged
+        r = merged
+    tier = normalize_service_tier(service_tier)
+    if tier is None and model.endswith("-fast"):
+        tier = "fast"
+    multiplier = (FAST_MULTIPLIERS.get(r["family"], 1.0) if tier == "fast" else
+                  0.5 if tier == "flex" and r["family"] in FLEX_MODELS else 1.0)
+    if multiplier != 1.0:
+        r = {**r, **{k: r[k] * multiplier for k in
+                    ("input", "output", "cache_read", "cache_write", "cache_write_1h")}}
     return r
 
 
@@ -202,8 +257,9 @@ def is_known_model(model: str) -> bool:
 def calculate_cost(model: str, input_t: int, output_t: int, cache_read: int,
                    cache_write: int, cache_write_1h: int = 0,
                    date_str: str | None = None,
-                   request_input: int | None = None) -> float:
-    r = get_rates(model, date_str, request_input)
+                   request_input: int | None = None,
+                   service_tier: str | None = None) -> float:
+    r = get_rates(model, date_str, request_input, service_tier)
     return (
         input_t / 1_000_000 * r["input"]
         + output_t / 1_000_000 * r["output"]
@@ -489,14 +545,14 @@ def _remote_parse(host: str, raw: str, sep: str, parser, file_stats: dict | None
         if file_stats is not None and path:
             file_stats[label] = st
         for e in events:
-            e["_source_file"] = label
+            _tag_event_file(e, label)
         lists.append(events)
     return dedup_events(lists)
 
 
 def parse_remote_events(host: str, file_stats: dict | None = None) -> list[dict]:
     """Fetch and parse JSONL from a remote host via SSH.
-    Dedup by request_id across the host's files (resumed sessions).
+    Dedup by API message identity across the host's files (resumed sessions).
     Events are tagged with `host` as their source."""
     print(f"  Fetching from {host}...", file=sys.stderr)
     raw = fetch_remote_jsonl(host)
@@ -609,15 +665,20 @@ def merge_monthly_summaries(target: dict, source: dict) -> None:
 
 HOOK_SCRIPT = """\
 #!/usr/bin/env python3
-\"\"\"cctrack statusline hook — appends Claude Code session data to JSONL.\"\"\"
+\"\"\"cctrack statusline hook — appends Claude Code session data to JSONL, then
+runs the status line command it replaced at install time (if any), so that
+status line keeps showing.\"\"\"
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-def main():
+CCTRACK_DIR = Path.home() / ".claude" / "cctrack"
+
+
+def record(raw):
     try:
-        raw = sys.stdin.read()
         if not raw.strip():
             return
         data = json.loads(raw)
@@ -636,7 +697,7 @@ def main():
         cache_read = usage.get("cache_read_input_tokens", 0)
         cache_write = usage.get("cache_creation_input_tokens", 0)
 
-        record = {
+        rec = {
             "_ts": datetime.now(timezone.utc).isoformat(),
             "session_id": session_id,
             "cost_usd": cost_usd,
@@ -647,17 +708,49 @@ def main():
             "cache_write": cache_write,
         }
 
-        out_dir = Path.home() / ".claude" / "cctrack"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        CCTRACK_DIR.mkdir(parents=True, exist_ok=True)
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        out_path = out_dir / f"statusline-{today}.jsonl"
+        out_path = CCTRACK_DIR / f"statusline-{today}.jsonl"
         with open(out_path, "a") as f:
-            f.write(json.dumps(record) + "\\n")
+            f.write(json.dumps(rec) + "\\n")
     except Exception:
         pass
 
+
+def wrapped_command():
+    try:
+        cfg = json.loads((CCTRACK_DIR / "config.json").read_text())
+        cmd = (cfg.get("wrapped_status_line") or {}).get("command")
+    except Exception:
+        return None
+    if not isinstance(cmd, str) or not cmd.strip() or "cctrack-hook.py" in cmd:
+        return None
+    return cmd
+
+
+def main():
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        raw = ""
+    record(raw)
+    cmd = wrapped_command()
+    if cmd is None:
+        return 0
+    # Claude Code runs status line commands through the shell with the session
+    # JSON on stdin; do the same and pass the output through untouched.
+    try:
+        r = subprocess.run(cmd, shell=True, input=raw.encode("utf-8"),
+                           stdout=subprocess.PIPE, timeout=30)
+    except Exception:
+        return 0
+    sys.stdout.buffer.write(r.stdout)
+    sys.stdout.flush()
+    return r.returncode
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 """
 
 CCTRACK_DIR = Path.home() / ".claude" / "cctrack"
@@ -717,158 +810,208 @@ def read_hook_config() -> dict | None:
         return None
 
 
-def install_hook() -> None:
-    """Install the cctrack statusline hook."""
-    CCTRACK_DIR.mkdir(parents=True, exist_ok=True)
-    HOOK_SCRIPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+def _apply_hook_install(settings_path, hook_path, config_path, hook_script, hook_cmd):
+    """Install the hook, wrapping any existing status line. Self-contained (it
+    is also shipped to remote hosts as source), so imports stay inside.
 
-    HOOK_SCRIPT_PATH.write_text(HOOK_SCRIPT)
-    HOOK_SCRIPT_PATH.chmod(HOOK_SCRIPT_PATH.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    A status line that isn't ours is saved in config.json as
+    `wrapped_status_line`; the hook runs it and passes its output through, and
+    uninstall puts it back. Re-installing keeps the saved one and the original
+    install date (which marks where hook coverage starts). Returns a dict
+    describing what happened."""
+    import json
+    import stat
+    from datetime import datetime, timezone
+    from pathlib import Path
 
-    CLAUDE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    settings: dict = {}
-    if CLAUDE_SETTINGS_PATH.exists():
+    settings_path, hook_path, config_path = Path(settings_path), Path(hook_path), Path(config_path)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    hook_path.parent.mkdir(parents=True, exist_ok=True)
+    hook_path.write_text(hook_script)
+    hook_path.chmod(hook_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    settings = {}
+    if settings_path.exists():
         try:
-            settings = json.loads(CLAUDE_SETTINGS_PATH.read_text())
-        except (json.JSONDecodeError, OSError):
+            settings = json.loads(settings_path.read_text())
+        except (ValueError, OSError):
             settings = {}
-    settings["statusLine"] = {"type": "command", "command": _hook_command()}
-    CLAUDE_SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n")
+    if not isinstance(settings, dict):
+        settings = {}
+    old_config = {}
+    if config_path.exists():
+        try:
+            old_config = json.loads(config_path.read_text())
+        except (ValueError, OSError):
+            old_config = {}
+    if not isinstance(old_config, dict):
+        old_config = {}
 
-    config = {
-        "installed_at": datetime.now(timezone.utc).isoformat(),
-        "version": "0.3.0",
-    }
-    HOOK_CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n")
+    current = settings.get("statusLine")
+    ours = isinstance(current, dict) and "cctrack-hook.py" in str(current.get("command", ""))
+    if ours:
+        wrapped = old_config.get("wrapped_status_line")
+    elif isinstance(current, dict) and current.get("command"):
+        wrapped = current
+    else:
+        wrapped = None
 
+    # Keep the status line's other settings (e.g. padding): from our own
+    # entry on a re-install, else from the line being wrapped.
+    base = current if ours else wrapped
+    new_line = dict(base) if isinstance(base, dict) else {}
+    new_line.update({"type": "command", "command": hook_cmd})
+    settings["statusLine"] = new_line
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+
+    config = {"installed_at": old_config.get("installed_at")
+              or datetime.now(timezone.utc).isoformat(),
+              "version": "0.3.0"}
+    if wrapped:
+        config["wrapped_status_line"] = wrapped
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+    return {"wrapped": (wrapped or {}).get("command")}
+
+
+def _apply_hook_uninstall(settings_path, hook_path, config_path):
+    """Remove the hook. If it wrapped a status line, put that back; if the
+    status line was changed to something else since, leave it alone.
+    Self-contained (shipped to remote hosts). Returns what happened."""
+    import json
+    from pathlib import Path
+
+    settings_path, hook_path, config_path = Path(settings_path), Path(hook_path), Path(config_path)
+    wrapped = None
+    if config_path.exists():
+        try:
+            wrapped = json.loads(config_path.read_text()).get("wrapped_status_line")
+        except (ValueError, OSError, AttributeError):
+            wrapped = None
+    result = "none"
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text())
+            current = settings.get("statusLine")
+            if isinstance(current, dict) and "cctrack-hook.py" in str(current.get("command", "")):
+                if isinstance(wrapped, dict) and wrapped.get("command"):
+                    settings["statusLine"] = wrapped
+                    result = "restored"
+                else:
+                    del settings["statusLine"]
+                    result = "removed"
+                settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+            elif current is not None:
+                result = "left"
+        except (ValueError, OSError, AttributeError):
+            pass
+    if hook_path.exists():
+        hook_path.unlink()
+    if config_path.exists():
+        config_path.unlink()
+    return {"status_line": result,
+            "restored": (wrapped or {}).get("command") if result == "restored" else None}
+
+
+def install_hook() -> None:
+    """Install the cctrack statusline hook (wrapping any existing status line)."""
+    info = _apply_hook_install(CLAUDE_SETTINGS_PATH, HOOK_SCRIPT_PATH, HOOK_CONFIG_PATH,
+                               HOOK_SCRIPT, _hook_command())
     print(f"cctrack hook installed successfully.")
     print(f"  Hook script: {HOOK_SCRIPT_PATH}")
     print(f"  Data dir:    {CCTRACK_DIR}")
     print(f"  Settings:    {CLAUDE_SETTINGS_PATH}")
+    if info["wrapped"]:
+        print(f"  Wrapping your status line: {info['wrapped']}")
 
 
 def uninstall_hook() -> None:
     """Uninstall the cctrack statusline hook, keeping data."""
-    if CLAUDE_SETTINGS_PATH.exists():
-        try:
-            settings = json.loads(CLAUDE_SETTINGS_PATH.read_text())
-            if "statusLine" in settings:
-                del settings["statusLine"]
-                CLAUDE_SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n")
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    if HOOK_SCRIPT_PATH.exists():
-        HOOK_SCRIPT_PATH.unlink()
-    if HOOK_CONFIG_PATH.exists():
-        HOOK_CONFIG_PATH.unlink()
-
+    info = _apply_hook_uninstall(CLAUDE_SETTINGS_PATH, HOOK_SCRIPT_PATH, HOOK_CONFIG_PATH)
     print(f"cctrack hook uninstalled.")
+    _print_uninstall_note(info)
     if CCTRACK_DIR.exists():
         print(f"  Data preserved: {CCTRACK_DIR}")
 
 
-def remote_install_hook(host: str) -> None:
-    """Install the cctrack statusline hook on a remote host via SSH."""
-    encoded_script = base64.b64encode(HOOK_SCRIPT.encode()).decode()
+def _print_uninstall_note(info: dict) -> None:
+    if info["status_line"] == "restored":
+        print(f"  Status line restored: {info['restored']}")
+    elif info["status_line"] == "left":
+        print("  Status line left as is (it no longer pointed at cctrack).")
 
-    installer = f"""\
-import base64, json, os, stat, sys
-from datetime import datetime, timezone
-from pathlib import Path
 
-hook_script = base64.b64decode("{encoded_script}").decode()
-home = Path.home()
-cctrack_dir = home / ".claude" / "cctrack"
-hooks_dir = home / ".claude" / "hooks"
-hook_path = hooks_dir / "cctrack-hook.py"
-config_path = cctrack_dir / "config.json"
-settings_path = home / ".claude" / "settings.json"
-hook_cmd = "python3 ~/.claude/hooks/cctrack-hook.py"
+def _remote_hook_program(func, *call_args: str) -> str:
+    """Python source that defines `func` and prints its result as JSON, for
+    `ssh host python3 -`. Paths are expressions evaluated on the remote."""
+    import inspect
+    return ("import json\nfrom pathlib import Path\nhome = Path.home()\n"
+            + inspect.getsource(func)
+            + f"\nprint('CCTRACK_RESULT ' + json.dumps({func.__name__}({', '.join(call_args)})))\n")
 
-cctrack_dir.mkdir(parents=True, exist_ok=True)
-hooks_dir.mkdir(parents=True, exist_ok=True)
-hook_path.write_text(hook_script)
-hook_path.chmod(hook_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-settings_path.parent.mkdir(parents=True, exist_ok=True)
-settings = {{}}
-if settings_path.exists():
-    try:
-        settings = json.loads(settings_path.read_text())
-    except Exception:
-        settings = {{}}
-settings["statusLine"] = {{"type": "command", "command": hook_cmd}}
-settings_path.write_text(json.dumps(settings, indent=2) + "\\n")
+def _remote_result(stdout: str) -> dict | None:
+    for line in (stdout or "").splitlines():
+        if line.startswith("CCTRACK_RESULT "):
+            try:
+                return json.loads(line[len("CCTRACK_RESULT "):])
+            except ValueError:
+                return None
+    return None
 
-config = {{"installed_at": datetime.now(timezone.utc).isoformat(), "version": "0.3.0"}}
-config_path.write_text(json.dumps(config, indent=2) + "\\n")
 
-print(f"Hook script: {{hook_path}}")
-print(f"Data dir:    {{cctrack_dir}}")
-print(f"Settings:    {{settings_path}}")
-"""
+_REMOTE_PATHS = ('home / ".claude" / "settings.json"',
+                 'home / ".claude" / "hooks" / "cctrack-hook.py"',
+                 'home / ".claude" / "cctrack" / "config.json"')
 
+
+def _run_remote_python(host: str, program: str) -> subprocess.CompletedProcess | None:
     cmd = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, "python3", "-"]
     try:
-        result = subprocess.run(cmd, input=installer, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0 and "Hook script:" in result.stdout:
-            print(f"cctrack hook installed on {host}.")
-            for line in result.stdout.strip().splitlines():
-                print(f"  {line}")
-        else:
-            print(f"Hook install on {host} failed: {result.stderr.strip()}", file=sys.stderr)
+        return subprocess.run(cmd, input=program, capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         print(f"SSH to {host} timed out", file=sys.stderr)
     except FileNotFoundError:
         print("ssh command not found", file=sys.stderr)
+    return None
+
+
+def remote_install_hook(host: str) -> None:
+    """Install the cctrack statusline hook on a remote host via SSH, wrapping
+    any status line already configured there."""
+    encoded = base64.b64encode(HOOK_SCRIPT.encode()).decode()
+    program = _remote_hook_program(
+        _apply_hook_install, *_REMOTE_PATHS,
+        f'__import__("base64").b64decode("{encoded}").decode()', repr(_hook_command()))
+    result = _run_remote_python(host, program)
+    if result is None:
+        return
+    info = _remote_result(result.stdout)
+    if result.returncode == 0 and info is not None:
+        print(f"cctrack hook installed on {host}.")
+        print("  Hook script: ~/.claude/hooks/cctrack-hook.py")
+        print("  Data dir:    ~/.claude/cctrack")
+        print("  Settings:    ~/.claude/settings.json")
+        if info.get("wrapped"):
+            print(f"  Wrapping your status line: {info['wrapped']}")
+    else:
+        print(f"Hook install on {host} failed: {result.stderr.strip()}", file=sys.stderr)
 
 
 def remote_uninstall_hook(host: str) -> None:
-    """Uninstall the cctrack statusline hook on a remote host via SSH."""
-    uninstaller = """\
-import json
-from pathlib import Path
-
-home = Path.home()
-hook_path = home / ".claude" / "hooks" / "cctrack-hook.py"
-cctrack_dir = home / ".claude" / "cctrack"
-config_path = cctrack_dir / "config.json"
-settings_path = home / ".claude" / "settings.json"
-
-if settings_path.exists():
-    try:
-        settings = json.loads(settings_path.read_text())
-        if "statusLine" in settings:
-            del settings["statusLine"]
-            settings_path.write_text(json.dumps(settings, indent=2) + "\\n")
-    except Exception:
-        pass
-
-if hook_path.exists():
-    hook_path.unlink()
-if config_path.exists():
-    config_path.unlink()
-
-print("uninstalled")
-if cctrack_dir.exists():
-    print(f"Data preserved: {cctrack_dir}")
-"""
-
-    cmd = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, "python3", "-"]
-    try:
-        result = subprocess.run(cmd, input=uninstaller, capture_output=True, text=True, timeout=30)
-        if "uninstalled" in result.stdout:
-            print(f"cctrack hook uninstalled on {host}.")
-            for line in result.stdout.strip().splitlines():
-                if line != "uninstalled":
-                    print(f"  {line}")
-        else:
-            print(f"Hook uninstall on {host} failed: {result.stderr.strip()}", file=sys.stderr)
-    except subprocess.TimeoutExpired:
-        print(f"SSH to {host} timed out", file=sys.stderr)
-    except FileNotFoundError:
-        print("ssh command not found", file=sys.stderr)
+    """Uninstall the cctrack statusline hook on a remote host via SSH,
+    restoring the status line it wrapped."""
+    program = _remote_hook_program(_apply_hook_uninstall, *_REMOTE_PATHS)
+    result = _run_remote_python(host, program)
+    if result is None:
+        return
+    info = _remote_result(result.stdout)
+    if result.returncode == 0 and info is not None:
+        print(f"cctrack hook uninstalled on {host}.")
+        _print_uninstall_note(info)
+        print("  Data preserved: ~/.claude/cctrack")
+    else:
+        print(f"Hook uninstall on {host} failed: {result.stderr.strip()}", file=sys.stderr)
 
 
 # Ratio of hook (Claude Code's own) cost to JSONL-priced cost, used only when
@@ -935,13 +1078,12 @@ def _note_compaction(stats: dict, key: tuple, marker: str, ts: str) -> None:
 
 def parse_lines(lines: list[str], source: str = "local",
                 stats: dict | None = None) -> list[dict]:
-    """Parse JSONL lines from a single file. Dedup by request_id (last wins).
+    """Parse JSONL lines from a single file, retaining the fullest message usage.
     `source` labels which machine the events came from (host name, or 'local').
     Each event also carries its project (from `cwd`), session id and git branch
     so the explore view can attribute spend, plus its subagent (sidechain) id.
     When `stats` (see new_parse_stats) is given it's updated in place."""
-    by_request_id: dict[str, dict] = {}
-    no_request_id: list[dict] = []
+    entries: list[dict] = []
 
     for line in lines:
         line = line.strip()
@@ -966,10 +1108,16 @@ def parse_lines(lines: list[str], source: str = "local",
                                  event.get("uuid") or event.get("timestamp", ""),
                                  event.get("timestamp", ""))
 
-        if event.get("type") != "assistant":
+        if event.get("type") == "progress":
+            nested = (event.get("data") or {}).get("message") or {}
+            if isinstance(nested, dict) and isinstance(nested.get("message"), dict):
+                event = {"sessionId": event.get("sessionId", ""), **nested}
+        if event.get("type") not in (None, "assistant"):
             continue
-
-        usage = event.get("message", {}).get("usage", {})
+        message = event.get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("usage"), dict):
+            continue
+        usage = message["usage"]
         input_t = usage.get("input_tokens", 0)
         output_t = usage.get("output_tokens", 0)
         cache_read = usage.get("cache_read_input_tokens", 0)
@@ -984,11 +1132,23 @@ def parse_lines(lines: list[str], source: str = "local",
         if not cc:
             cache_write = usage.get("cache_creation_input_tokens", 0)
 
+        req_id = event.get("requestId", "")
+        # Advisor calls are separately billable; ordinary message iterations
+        # are already included in the enclosing usage and must not be added.
+        for i, iteration in enumerate(usage.get("iterations") or []):
+            if (not isinstance(iteration, dict) or iteration.get("type") != "advisor_message"
+                    or not iteration.get("model")):
+                continue
+            advisor = dict(event)
+            advisor["message"] = {"model": iteration["model"], "usage": iteration,
+                                  "id": f"{message['id']}:advisor:{i}" if message.get("id") else ""}
+            advisor["requestId"] = f"{req_id}:advisor:{i}" if req_id else ""
+            entries.extend(parse_lines([json.dumps(advisor)], source=source))
+
         if (input_t == 0 and output_t == 0 and cache_read == 0
                 and cache_write == 0 and cache_write_1h == 0):
             continue
 
-        req_id = event.get("requestId", "")
         cwd = event.get("cwd", "")
         entry = {
             "model": event.get("message", {}).get("model", ""),
@@ -999,6 +1159,8 @@ def parse_lines(lines: list[str], source: str = "local",
             "cache_write": cache_write,
             "cache_write_1h": cache_write_1h,
             "_request_id": req_id,
+            "_message_id": message.get("id", ""),
+            "service_tier": normalize_service_tier(usage.get("speed") or usage.get("service_tier")),
             "source": source,
             "session_id": event.get("sessionId", ""),
             "project": _project_name(cwd),
@@ -1014,36 +1176,209 @@ def parse_lines(lines: list[str], source: str = "local",
             "_request_input": input_t + cache_read + cache_write + cache_write_1h,
         }
 
-        if req_id:
-            by_request_id[req_id] = entry
-        else:
-            no_request_id.append(entry)
+        entries.append(entry)
 
+    out = dedup_events([entries])
     if stats is not None:
-        stats["records"] += len(by_request_id) + len(no_request_id)
-    return list(by_request_id.values()) + no_request_id
+        stats["records"] += len(out)
+    return out
+
+
+def _event_location(e: dict) -> dict:
+    return {"host": e.get("source", "local"), "path": e.get("_source_file", ""),
+            "session_id": e.get("session_id", ""), "cwd": e.get("cwd", "")}
+
+
+def _event_hosts(e: dict) -> set[str]:
+    return {e.get("source", "local"), *(loc["host"] for loc in e.get("_locations", []))}
+
+
+def _tag_event_file(e: dict, path: str) -> None:
+    e["_source_file"] = path
+    if e.get("agent") == "codex" and not e.get("session_id"):
+        # Older files can omit session_meta; a rollout's basename remains
+        # stable when copied between sandbox homes or machines.
+        e["session_id"] = Path(path).name.removesuffix(".zst").removesuffix(".jsonl")
+        if e.get("_codex_legacy") and not e.get("_response_id"):
+            e["_request_id"] = f"codex:tc:{e['session_id']}:{e['_request_id']}"
+        for loc in e.get("_locations", []):
+            loc["session_id"] = e["session_id"]
+    for loc in e.get("_locations", []):
+        if not loc["path"]:
+            loc["path"] = path
+
+
+def _event_identities(e: dict) -> list[tuple]:
+    agent = e.get("agent", "claude")
+    rid, mid = e.get("_request_id"), e.get("_message_id")
+    if agent == "codex":
+        keys = [(agent, rid)] if rid else []
+        keys.extend((agent, "snapshot", e.get("session_id", ""), tuple(v))
+                    for v in e.get("_snapshot_aliases", []))
+        return keys
+    if mid:
+        if rid:
+            keys = [(agent, "message", mid, rid)]
+        else:
+            keys = [(agent, "message", mid, e.get("session_id", ""),
+                     "" if mid.startswith("msg_") else e.get("timestamp", ""))]
+        return keys
+    return [(agent, "request", rid)] if rid else []
+
+
+def _event_quality(e: dict) -> tuple:
+    # Prefer original parent messages over their sidechain replay, then full
+    # usage over partial streaming snapshots, then explicit billing metadata.
+    return (not (e.get("agent", "claude") == "claude" and e.get("is_sidechain")),
+            sum(e.get(k, 0) for k in ("input", "output", "cache_read", "cache_write", "cache_write_1h")),
+            bool(e.get("_response_id")), bool(e.get("_model_explicit")),
+            e.get("service_tier") is not None)
+
+
+def _merge_usage_copies(a: dict, b: dict) -> dict:
+    def order(e):
+        return (iso_z(_event_dt(e)) or "", e.get("source", "local") != "local",
+                e.get("source", "local"), e.get("_source_file", ""))
+    winner, other = (a, b) if (_event_quality(a) > _event_quality(b) or
+                              (_event_quality(a) == _event_quality(b) and order(a) <= order(b))) else (b, a)
+    out = dict(winner)
+    # Record every copy's location without treating a replay as another call.
+    locations = [*a.get("_locations", []), _event_location(a),
+                 *b.get("_locations", []), _event_location(b)]
+    out["_locations"] = [dict(v) for v in sorted(
+        {tuple(sorted(loc.items())) for loc in locations})]
+    out["_snapshot_aliases"] = sorted({tuple(v) for e in (a, b)
+                                       for v in e.get("_snapshot_aliases", [])})
+    if a.get("_fork_history") or b.get("_fork_history"):
+        out["_fork_history"] = max((a.get("_fork_history", []), b.get("_fork_history", [])), key=len)
+    # A fuller copied transcript may omit settings that another copy retained.
+    if out.get("service_tier") is None and other.get("service_tier") is not None:
+        out["service_tier"] = other["service_tier"]
+    elif out.get("service_tier") != other.get("service_tier") and other.get("service_tier"):
+        out["service_tier"] = min((out["service_tier"], other["service_tier"]),
+                                  key={"standard": 0, "fast": 1, "flex": 2}.get)
+    return out
+
+
+def _remove_codex_fork_replays(events: list[dict]) -> list[dict]:
+    """Compare fork prefixes using usage order, not rewritten timestamps.
+
+    Keep a shared compact history on survivors so another merge remains
+    idempotent and a grandchild can still match a parent's inherited prefix.
+    """
+    histories = defaultdict(list)
+    for e in events:
+        if e.get("_codex_legacy") and not e.get("_is_compaction"):
+            histories[e.get("session_id", "")].append(e)
+    full, originals = {}, {}
+    for sid, history in histories.items():
+        history.sort(key=lambda e: (e.get("_legacy_sequence", 0), e.get("timestamp", "")))
+        usage_by_index, seen = {}, set()
+        for i, e in enumerate(history):
+            saved = e.get("_fork_history", [])
+            if id(saved) not in seen:
+                usage_by_index.update(saved)
+                seen.add(id(saved))
+            usage_by_index[e.get("_legacy_sequence", i)] = e["_raw_usage"]
+        full[sid] = usage_by_index
+        originals[sid] = {e.get("_legacy_sequence", i): e for i, e in enumerate(history)}
+    suppressed = set()
+    for sid, history in histories.items():
+        parent = next((e.get("_fork_parent") for e in history if e.get("_fork_parent")), None)
+        if not parent or parent == sid:
+            continue
+        prefix = full.get(parent, {})
+        if not prefix:
+            for e in history:
+                e["_unresolved_fork"] = parent
+            continue
+        saved = sorted(full[sid].items())
+        for e in history:
+            e.pop("_unresolved_fork", None)
+            e["_fork_history"] = saved
+        for i, child in enumerate(history):
+            index = child.get("_legacy_sequence", i)
+            if prefix.get(index) != child["_raw_usage"]:
+                break
+            suppressed.add(id(child))
+            original = originals[parent].get(index)
+            if original is not None:
+                original["_locations"] = _merge_usage_copies(original, child)["_locations"]
+    return [e for e in events if id(e) not in suppressed]
+
+
+def _expand_codex_snapshot_copies(events: list[dict]) -> list[dict]:
+    # A response plus a residual can represent one larger cumulative snapshot.
+    # Split any plain copied snapshot in exactly the same way BEFORE merging;
+    # otherwise its larger counter would replace the response while leaving
+    # the residual to be counted again.
+    records = {}
+    for e in events:
+        if e.get("_response_id"):
+            for signature in e.get("_snapshot_aliases", []):
+                records[(e.get("session_id", ""), tuple(signature))] = e
+    expanded = []
+    for e in events:
+        record = next((records[(e.get("session_id", ""), tuple(v))]
+                       for v in e.get("_snapshot_aliases", [])
+                       if (e.get("session_id", ""), tuple(v)) in records), None)
+        if e.get("_total_only") and not e.get("_response_id") and record:
+            copied = dict(record)
+            copied.update({k: e[k] for k in ("source", "_source_file", "_locations") if k in e})
+            expanded.append(copied)
+            remainder = _codex_snapshot_remainder(e, record)
+            if remainder:
+                expanded.append(remainder)
+        else:
+            expanded.append(e)
+    return expanded
 
 
 def dedup_events(event_lists) -> list[dict]:
-    """Dedup parsed events across files by request_id (last wins).
-    A session resumed via --resume/--continue writes a new JSONL file that
-    repeats earlier events with the same requestId — without cross-file dedup
-    those would be counted twice. Events without a requestId are kept as-is."""
-    by_request_id: dict[str, dict] = {}
-    no_request_id: list[dict] = []
-    for events in event_lists:
-        for e in events:
-            rid = e.get("_request_id", "")
-            if rid:
-                by_request_id[rid] = e
-            else:
-                no_request_id.append(e)
-    return list(by_request_id.values()) + no_request_id
+    """Normalize API identities across files, Sandy sandboxes and hosts.
+
+    Retain the fullest snapshot and all copy locations. Codex cumulative
+    identities are scoped to their thread; response ids are globally unique.
+    Claude request ids alone are insufficient when one request has multiple
+    messages, and Anthropic message ids can dedup logs without request ids.
+    """
+    indexed: dict[tuple, int] = {}
+    replay_routes: dict[tuple, list[int]] = defaultdict(list)
+    out: list[dict | None] = []
+    for e in _expand_codex_snapshot_copies([e for group in event_lists for e in group]):
+        keys = _event_identities(e)
+        indexes = {indexed[k] for k in keys if k in indexed and out[indexed[k]] is not None}
+        route = (e.get("_message_id"), e.get("session_id", ""))
+        if e.get("agent", "claude") == "claude" and route[0]:
+            for i in replay_routes[route]:
+                existing = out[i]
+                if existing is not None and (e.get("is_sidechain") or existing.get("is_sidechain")):
+                    indexes.add(i)
+        if indexes:
+            index = min(indexes)
+            merged = e
+            for i in sorted(indexes):
+                merged = _merge_usage_copies(out[i], merged)
+                if i != index:
+                    out[i] = None
+            out[index] = merged
+            # Redirect aliases of any groups this event joined.
+            if len(indexes) > 1:
+                indexed = {k: index if v in indexes else v for k, v in indexed.items()}
+        else:
+            index = len(out)
+            out.append(e)
+        for k in keys + _event_identities(out[index]):
+            indexed[k] = index
+        if route[0]:
+            if index not in replay_routes[route]:
+                replay_routes[route].append(index)
+    return _remove_codex_fork_replays([e for e in out if e is not None])
 
 
 def parse_events(files: list[str], file_stats: dict | None = None) -> list[dict]:
-    """Parse all local JSONL files. Dedup by request_id across all files
-    (last event wins), so resumed sessions aren't double counted. Each event
+    """Parse all local JSONL files. Dedup API message identities across files
+    so resumed sessions aren't double counted. Each event
     is tagged with the file it came from (`_source_file`) for traceability.
     `file_stats`, if given, receives {path: parse stats} (unreadable files get
     {"unreadable": True})."""
@@ -1060,7 +1395,7 @@ def parse_events(files: list[str], file_stats: dict | None = None) -> list[dict]
         if file_stats is not None:
             file_stats[path] = st
         for e in events:
-            e["_source_file"] = path
+            _tag_event_file(e, path)
             # Older subagent transcripts lack agentId; the file name has it.
             if e.get("is_sidechain") and not e.get("agent_id"):
                 name = Path(path).name
@@ -1076,12 +1411,10 @@ def parse_events(files: list[str], file_stats: dict | None = None) -> list[dict]
 #   sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl   (and archived_sessions/)
 # Older rollouts are compressed in place to `.jsonl.zst`.
 # Each line is {"timestamp", "type": <item>, "payload": {...}}. Usage comes from:
-#   * "token_usage_record" — one per completed API response, with a unique
-#     response_id. Newer CLIs write these; they are exact and dedupable.
-#   * "event_msg" / payload.type == "token_count" — legacy. info.last_token_usage
-#     is the latest response's usage and info.total_token_usage the thread's
-#     running total. The event is re-emitted (e.g. for rate-limit updates) with
-#     unchanged totals, so only events whose running total moved are counted.
+#   * "token_usage_record" — identified request usage, including compactions.
+#   * "event_msg" / payload.type == "token_count" — latest-response usage and/or
+#     running totals. These coexist with request records: reconcile matching
+#     snapshots, retain later requests, and ignore unchanged re-emissions.
 # Token semantics (from the Codex source and its own test fixtures):
 #   input_tokens INCLUDES cached_input_tokens and cache_write_input_tokens;
 #   output_tokens INCLUDES reasoning_output_tokens. So billable uncached input
@@ -1158,18 +1491,46 @@ def _read_zstd(path: str) -> str | None:
     return r.stdout.decode("utf-8", errors="replace") if r.returncode == 0 else None
 
 
+def _normalize_codex_usage(usage: dict) -> dict:
+    """Normalize rollout/API aliases; caches and reasoning are inclusive."""
+    def count(*keys):
+        for key in keys:
+            if usage.get(key) is not None:
+                try:
+                    return max(0, int(usage[key]))
+                except (TypeError, ValueError, OverflowError):
+                    return 0
+        return 0
+    inp = count("input_tokens", "prompt_tokens", "input")
+    cached = min(inp, count("cached_input_tokens", "cache_read_input_tokens", "cached_tokens"))
+    write = min(inp - cached, count("cache_write_input_tokens", "cache_creation_input_tokens"))
+    out = count("output_tokens", "completion_tokens", "output")
+    return {"input_tokens": inp, "cached_input_tokens": cached,
+            "cache_write_input_tokens": write, "output_tokens": out,
+            "reasoning_output_tokens": min(out, count("reasoning_output_tokens", "reasoning_tokens")),
+            "total_tokens": count("total_tokens") or inp + out}
+
+
+def _usage_signature(usage: dict) -> tuple:
+    return tuple(usage[k] for k in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                                    "output_tokens", "reasoning_output_tokens", "total_tokens"))
+
+
 def _codex_usage_event(usage: dict, ts: str, key: str, ctx: dict, source: str) -> dict | None:
-    inp = int(usage.get("input_tokens") or 0)
-    cached = int(usage.get("cached_input_tokens") or 0)
-    cache_write = int(usage.get("cache_write_input_tokens") or 0)
-    out = int(usage.get("output_tokens") or 0)
+    if _event_dt({"timestamp": ts}) is None:
+        return None
+    usage = _normalize_codex_usage(usage)
+    inp = usage["input_tokens"]
+    cached = usage["cached_input_tokens"]
+    cache_write = usage["cache_write_input_tokens"]
+    out = usage["output_tokens"]
     uncached = max(0, inp - cached - cache_write)
     if not (uncached or cached or cache_write or out):
         return None
     cwd = ctx.get("cwd", "")
     session_id = ctx.get("session_id", "")
     return {
-        "model": ctx.get("model", ""),
+        "model": ctx.get("model") or "codex-unknown",
         "timestamp": ts,
         "input": uncached,
         "output": out,
@@ -1184,6 +1545,8 @@ def _codex_usage_event(usage: dict, ts: str, key: str, ctx: dict, source: str) -
         "cwd": cwd,
         "git_branch": ctx.get("git_branch", ""),
         "agent": "codex",
+        "service_tier": ctx.get("service_tier"),
+        "_raw_usage": _usage_signature(usage),
         # A spawned subagent is its own thread; link it to its parent.
         "parent_session_id": ctx.get("parent_session_id", ""),
         "is_sidechain": bool(ctx.get("parent_session_id")),
@@ -1208,21 +1571,53 @@ def _codex_parent_id(meta: dict) -> str:
     return ""
 
 
-def parse_codex_lines(lines, source: str = "local", stats: dict | None = None) -> list[dict]:
-    """Parse one Codex rollout file into usage events (same shape as Claude
-    events, tagged agent="codex"). Prefers per-response token_usage_record
-    items; legacy token_count events are used only for the part of the file
-    before the first record (a session started on an older CLI and resumed on
-    a newer one), so no response is counted twice."""
-    ctx: dict = {}
-    records: list[dict] = []
-    legacy: list[tuple[str, dict]] = []
-    first_record_ts = None
-    prev_total = None
+def _codex_snapshot_remainder(snapshot: dict, record: dict) -> dict | None:
+    """A first total-only snapshot can include spend before the known record.
 
-    for line in lines:
-        line = line.strip()
-        if not line:
+    Preserve that remainder rather than replacing the entire cumulative delta
+    with the single response (400 cumulative minus a 300-token record leaves
+    100 real earlier tokens). A last-usage snapshot already names one request.
+    """
+    if not snapshot.get("_total_only"):
+        return None
+    usage = dict(zip(("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                      "output_tokens", "reasoning_output_tokens", "total_tokens"),
+                     (max(0, a - b) for a, b in zip(snapshot["_raw_usage"], record["_raw_usage"]))))
+    ctx = {"model": snapshot.get("model", ""), "session_id": snapshot.get("session_id", ""),
+           "cwd": snapshot.get("cwd", ""), "git_branch": snapshot.get("git_branch", ""),
+           "service_tier": snapshot.get("service_tier"),
+           "parent_session_id": snapshot.get("parent_session_id", "")}
+    remainder = _codex_usage_event(usage, snapshot["timestamp"],
+                                    snapshot["_request_id"] + ":remainder", ctx, snapshot["source"])
+    if remainder:
+        remainder.update({"_codex_legacy": True, "_codex_position": snapshot.get("_codex_position", 0),
+                          "_legacy_sequence": snapshot.get("_legacy_sequence", 0),
+                          "_fork_parent": snapshot.get("_fork_parent", "")})
+        for key in ("_source_file", "_locations"):
+            if key in snapshot:
+                remainder[key] = snapshot[key]
+    return remainder
+
+
+def parse_codex_lines(lines, source: str = "local", stats: dict | None = None) -> list[dict]:
+    """Reconcile request records with cumulative snapshots, including compactions.
+
+    A request record replaces its matching snapshot, not every later snapshot.
+    Legacy last-only and total-only formats remain supported. Preserve thread
+    and counter identities for replay detection after all sources are loaded.
+    """
+    ctx: dict = {}
+    events: list[dict | None] = []
+    previous = None
+    pending_record = None
+    latest_snapshot = None
+    fork_parent = ""
+    response_indexes = {}
+    compacted_ids = set()
+    legacy_sequence = 0
+
+    for position, line in enumerate(lines):
+        if not line.strip():
             continue
         if stats is not None:
             stats["lines"] += 1
@@ -1234,70 +1629,148 @@ def parse_codex_lines(lines, source: str = "local", stats: dict | None = None) -
             continue
         if not isinstance(item, dict):
             continue
-        kind = item.get("type")
-        payload = item.get("payload") or {}
-        ts = item.get("timestamp", "")
+        kind, payload, ts = item.get("type"), item.get("payload") or {}, item.get("timestamp", "")
         if not isinstance(payload, dict):
             continue
         if stats is not None:
             _note_ts(stats, ts)
-            if kind == "compacted" or (kind == "event_msg"
-                                       and payload.get("type") == "context_compacted"):
-                # Both are written for one compaction; count distinct seconds.
-                _note_compaction(stats, (ctx.get("session_id", ""), ""), ts[:19], ts)
+            if kind == "compacted" or (kind == "event_msg" and payload.get("type") == "context_compacted"):
+                _note_compaction(stats, (ctx.get("session_id", ""), ""),
+                                 payload.get("compaction_response_id") or ts[:19], ts)
 
         if kind == "session_meta":
             ctx["session_id"] = payload.get("id") or payload.get("session_id") or ""
-            # A spawned thread's session_meta names its parent; failing that, a
-            # thread whose id differs from its session id belongs to that session.
             parent = (_codex_parent_id(payload) or payload.get("forked_from_id")
                       or (payload.get("session_id") if payload.get("id") else "") or "")
             if parent and parent != ctx["session_id"]:
                 ctx["parent_session_id"] = parent
+            fork_parent = payload.get("forked_from_id") or ""
             ctx.setdefault("cwd", payload.get("cwd", ""))
             git = payload.get("git") or {}
             if isinstance(git, dict) and git.get("branch"):
                 ctx["git_branch"] = git["branch"]
-        elif kind == "turn_context":
             if payload.get("model"):
                 ctx["model"] = payload["model"]
-            if payload.get("cwd"):
-                ctx["cwd"] = payload["cwd"]
+        elif kind == "compacted":
+            response_id = payload.get("compaction_response_id")
+            if response_id:
+                compacted_ids.add(response_id)
+                if response_id in response_indexes:
+                    events[response_indexes[response_id]]["_is_compaction"] = True
+        elif kind == "turn_context":
+            for key in ("model", "cwd"):
+                if payload.get(key):
+                    ctx[key] = payload[key]
+            if "service_tier" in payload:
+                ctx["service_tier"] = normalize_service_tier(payload["service_tier"])
+        elif kind == "event_msg" and payload.get("type") == "thread_settings_applied":
+            settings = payload.get("thread_settings") or {}
+            if "service_tier" in settings:
+                ctx["service_tier"] = normalize_service_tier(settings["service_tier"])
+            if settings.get("model"):
+                ctx["model"] = settings["model"]
         elif kind == "token_usage_record":
-            usage = payload.get("usage") or {}
-            rid = payload.get("response_id") or ""
-            if not ctx.get("session_id") and payload.get("thread_id"):
-                ctx["session_id"] = payload["thread_id"]
-            key = f"codex:resp:{rid}" if rid else f"codex:rec:{ts}"
-            # The record names the thread that made the call: a fork replays
-            # its parent's records, which still belong to the parent.
+            usage = payload.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            rid = (payload.get("response_id") or "").strip()
             owner = dict(ctx)
-            if payload.get("thread_id") and payload["thread_id"] != ctx.get("session_id"):
+            if payload.get("thread_id"):
                 owner["session_id"] = payload["thread_id"]
-                owner.pop("parent_session_id", None)
+                if payload["thread_id"] != ctx.get("session_id"):
+                    owner.pop("parent_session_id", None)
             if (payload.get("session_id") and payload.get("thread_id")
                     and payload["session_id"] != payload["thread_id"]):
                 owner["parent_session_id"] = payload["session_id"]
+            if payload.get("model"):
+                owner["model"] = payload["model"]
+            if "service_tier" in payload:
+                owner["service_tier"] = normalize_service_tier(payload["service_tier"])
+            key = f"codex:resp:{rid}" if rid else f"codex:rec:{owner.get('session_id', '')}:{ts}"
             ev = _codex_usage_event(usage, ts, key, owner, source)
-            if ev:
-                records.append(ev)
-            if first_record_ts is None:
-                first_record_ts = ts
+            if not ev:
+                continue
+            ev["_response_id"] = rid
+            ev["_is_compaction"] = rid in compacted_ids
+            ev["_model_explicit"] = bool(payload.get("model"))
+            thread_total = payload.get("thread_token_usage")
+            ev["_thread_total"] = (_usage_signature(_normalize_codex_usage(thread_total))
+                                   if isinstance(thread_total, dict) else None)
+            if rid and rid in response_indexes:
+                i = response_indexes[rid]
+                events[i] = _merge_usage_copies(events[i], ev)
+                continue
+            # Some rollouts write the record after its cumulative snapshot.
+            if latest_snapshot is not None:
+                snapshot = events[latest_snapshot]
+                if snapshot and ev["_thread_total"] in snapshot.get("_snapshot_aliases", []):
+                    ev["_snapshot_aliases"] = snapshot["_snapshot_aliases"]
+                    remainder = _codex_snapshot_remainder(snapshot, ev)
+                    events[latest_snapshot] = remainder
+                    # A split residual must keep its own identity: aliases for
+                    # the whole cumulative snapshot belong to the request.
+            events.append(ev)
+            pending_record = len(events) - 1
+            if rid:
+                response_indexes[rid] = pending_record
         elif kind == "event_msg" and payload.get("type") == "token_count":
             info = payload.get("info") or {}
-            total = (info.get("total_token_usage") or {}).get("total_tokens")
-            last = info.get("last_token_usage") or {}
-            if total is None or total == prev_total:
-                continue  # re-emission with an unchanged running total
-            prev_total = total
-            ev = _codex_usage_event(last, ts, f"codex:tc:{ts}:{total}", ctx, source)
-            if ev:
-                legacy.append((ts, ev))
+            if not isinstance(info, dict):
+                continue
+            total = info.get("total_token_usage")
+            total = _normalize_codex_usage(total) if isinstance(total, dict) else None
+            signature = _usage_signature(total) if total is not None else None
+            if total is not None and previous is not None and signature == _usage_signature(previous):
+                continue
+            last = info.get("last_token_usage")
+            delta = ({k: max(0, v - (previous or {}).get(k, 0)) for k, v in total.items()}
+                     if total is not None else None)
+            if isinstance(last, dict):
+                usage = _normalize_codex_usage(last)
+            elif total is not None:
+                usage = delta
+            else:
+                continue
+            if total is not None:
+                previous = total
+            owner = dict(ctx)
+            if info.get("model") or payload.get("model"):
+                owner["model"] = payload.get("model") or info["model"]
+            if "service_tier" in payload:
+                owner["service_tier"] = normalize_service_tier(payload["service_tier"])
+            sid = owner.get("session_id", "")
+            identity = signature if signature is not None else (ts, *_usage_signature(usage))
+            key = f"codex:tc:{sid}:{identity}"
+            ev = _codex_usage_event(usage, ts, key, owner, source)
+            if not ev:
+                continue
+            ev.update({"_codex_legacy": True, "_codex_position": position,
+                       "_legacy_sequence": legacy_sequence,
+                       "_fork_parent": fork_parent,
+                       "_total_only": not isinstance(last, dict),
+                       "_snapshot_aliases": [signature] if signature else []})
+            legacy_sequence += 1
+            record = events[pending_record] if pending_record is not None else None
+            if record and (record["_raw_usage"] == ev["_raw_usage"] or
+                           (signature is not None and record.get("_thread_total") == signature)):
+                record["_snapshot_aliases"] = list({tuple(v) for v in
+                    [*record.get("_snapshot_aliases", []), *ev["_snapshot_aliases"]]})
+                record["_codex_legacy"] = True
+                record["_codex_position"] = position
+                record["_legacy_sequence"] = ev["_legacy_sequence"]
+                record["_fork_parent"] = fork_parent
+                # A response id remains the primary identity; keep its recorded
+                # model and timestamp while adopting the snapshot's counter key.
+                remainder = _codex_snapshot_remainder(ev, record)
+                if remainder:
+                    events.append(remainder)
+                latest_snapshot = pending_record
+            else:
+                events.append(ev)
+                latest_snapshot = len(events) - 1
+            pending_record = None
 
-    if first_record_ts is None:
-        out = [ev for _, ev in legacy]
-    else:
-        out = records + [ev for ts, ev in legacy if ts < first_record_ts]
+    out = dedup_events([[e for e in events if e is not None]])
     if stats is not None:
         stats["records"] += len(out)
     return out
@@ -1332,7 +1805,7 @@ def parse_codex_events(files: list[str], source: str = "local",
         if file_stats is not None:
             file_stats[path] = st
         for e in events:
-            e["_source_file"] = path
+            _tag_event_file(e, path)
         event_lists.append(events)
     return dedup_events(event_lists), skipped
 
@@ -1401,9 +1874,10 @@ def _hook_rows_from_lines(lines) -> list[dict]:
         except (ValueError, AttributeError):
             continue
 
+        dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
         rows.append({
             "session_id": session_id,
-            "ts": ts,
+            "ts": dt.isoformat(),
             "date_str": dt.strftime("%Y-%m-%d"),
             "cost_usd": float(entry.get("cost_usd", 0.0) or 0.0),
             "model": entry.get("model", ""),
@@ -1475,18 +1949,18 @@ def compute_hook_deltas(rows: list[dict], baselines: dict | None = None) -> list
     for r in rows:
         by_session[r["session_id"]].append(r)
 
-    day_cost: dict[tuple[str, str], float] = defaultdict(float)
-    day_model: dict[tuple[str, str], str] = {}
+    day_cost: dict[tuple, float] = defaultdict(float)
+    day_model: dict[tuple, str] = {}
 
     for sid, session_rows in by_session.items():
-        session_rows.sort(key=lambda r: r.get("ts") or r["date_str"])
+        session_rows.sort(key=lambda r: (r.get("ts") or r["date_str"], r.get("_source", "")))
         base = (baselines or {}).get(sid)
         # None → not yet observed; the first render sets the baseline and is
         # not counted. A rolled-up baseline is a real prior level to count from.
         prev = float(base["cost_usd"]) if base else None
         for r in session_rows:
             cur = float(r.get("cost_usd", 0.0))
-            key = (sid, r["date_str"])
+            key = (sid, r["date_str"], r.get("_source", ""))
             if r.get("model"):
                 day_model.setdefault(key, r["model"])
             if prev is None:
@@ -1498,14 +1972,15 @@ def compute_hook_deltas(rows: list[dict], baselines: dict | None = None) -> list
                 prev = cur
 
     result = []
-    for (sid, date_str), cost in day_cost.items():
+    for (sid, date_str, source), cost in day_cost.items():
         if cost <= 0.0:
             continue
         result.append({
             "date_str": date_str,
             "session_id": sid,
             "cost_usd": cost,
-            "model": day_model.get((sid, date_str), ""),
+            "model": day_model.get((sid, date_str, source), ""),
+            **({"source": source} if source else {}),
         })
     return result
 
@@ -1728,6 +2203,7 @@ def aggregate(events: list[dict]) -> tuple[dict, dict]:
         except (ValueError, AttributeError):
             continue
 
+        dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
         date_str = dt.strftime("%Y-%m-%d")
         month_str = dt.strftime("%Y-%m")
 
@@ -1735,7 +2211,8 @@ def aggregate(events: list[dict]) -> tuple[dict, dict]:
         cost = calculate_cost(e["model"], e["input"], e["output"],
                               e["cache_read"], e["cache_write"], cache_1h,
                               date_str=date_str,
-                              request_input=e.get("_request_input"))
+                              request_input=e.get("_request_input"),
+                              service_tier=e.get("service_tier"))
         energy = estimate_energy_wh(e["model"], e["input"], e["output"],
                                     e["cache_read"], e["cache_write"], cache_1h)
         model = e.get("model", "")
@@ -1755,6 +2232,45 @@ def aggregate(events: list[dict]) -> tuple[dict, dict]:
 
 
 # ── Output ──────────────────────────────────────────────────────────────
+
+def reconcile_sources(events: list[dict], sources: list[dict]) -> list[dict]:
+    """Deduplicate collected usage and rebuild every report's source totals.
+
+    Matching identities are billed once, with all locations retained. Hook
+    histories are merged before differencing so rsynced statusline files do
+    not add the same cumulative increments on multiple machines.
+    """
+    events = dedup_events([events])
+    grouped = defaultdict(list)
+    for e in events:
+        grouped[(e.get("source", "local"), e.get("agent", "claude"))].append(e)
+    for src in sources:
+        src["daily"], _ = aggregate(grouped[(src["name"], src.get("agent", "claude"))])
+    hook_sources = [src for src in sources if "_hook_rows" in src]
+    if hook_sources:
+        rows, baselines = [], {}
+        for src in hook_sources:
+            rows.extend({**r, "_source": src["name"]} for r in src["_hook_rows"])
+            for sid, base in src.get("_hook_baselines", {}).items():
+                if sid not in baselines or base.get("date", "") < baselines[sid].get("date", ""):
+                    baselines[sid] = base
+        # Other hosts can retain raw copies from before a rolled baseline.
+        rows = [r for r in rows if not baselines.get(r["session_id"], {}).get("date")
+                or r["date_str"] > baselines[r["session_id"]]["date"]]
+        deltas = compute_hook_deltas(rows, baselines)
+        owners = defaultdict(set)
+        for e in events:
+            if e.get("agent", "claude") == "claude":
+                owners[(e.get("session_id", ""), _event_date(e))].add(e.get("source", "local"))
+        for d in deltas:
+            hosts = owners[(d["session_id"], d["date_str"])]
+            if hosts and d.get("source") not in hosts:
+                d["source"] = min(hosts, key=lambda h: (h != "local", h))
+        for src in hook_sources:
+            src["deltas"] = [d for d in deltas if d.get("source") == src["name"]]
+            src["hook_daily"] = aggregate_hook_data(src["deltas"], src.get("_hook_monthly"))
+    return events
+
 
 def format_tokens(n: int) -> str:
     return f"{n:,}"
@@ -2161,7 +2677,8 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
 def _event_cost_breakdown(e: dict, date_str: str) -> dict:
     """Per-token-class dollar cost of one event, at the rates in effect on its
     own date. Keys: input, output, cache_read, cache_write, cache_write_1h."""
-    r = get_rates(e.get("model", ""), date_str, e.get("_request_input"))
+    r = get_rates(e.get("model", ""), date_str, e.get("_request_input"),
+                  e.get("service_tier"))
     return {
         "input": e.get("input", 0) / 1_000_000 * r["input"],
         "output": e.get("output", 0) / 1_000_000 * r["output"],
@@ -2172,11 +2689,8 @@ def _event_cost_breakdown(e: dict, date_str: str) -> dict:
 
 
 def _event_date(e: dict) -> str:
-    ts = e.get("timestamp", "")
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%Y-%m-%d")
-    except (ValueError, AttributeError):
-        return ""
+    dt = _event_dt(e)
+    return dt.strftime("%Y-%m-%d") if dt else ""
 
 
 def _pct(part: float, whole: float) -> str:
@@ -2426,7 +2940,7 @@ def print_explore(events: list[dict], date_str: str,
 
 SCHEMA_VERSION = 1
 # Date the rate card was last verified against both providers' price pages.
-RATE_CARD_VERSION = "2026-10-12"
+RATE_CARD_VERSION = "2026-10-17"
 RATE_CARD_SOURCES = {
     "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
     "openai": "https://developers.openai.com/api/docs/pricing",
@@ -2473,7 +2987,7 @@ def _event_dt(e: dict) -> datetime | None:
         dt = datetime.fromisoformat(e.get("timestamp", "").replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def filter_window(events: list[dict], since: datetime | None,
@@ -2584,12 +3098,19 @@ def build_session_rows(events: list[dict], compactions: dict | None = None,
                             "requests": 0, "models": {}, "first": None, "last": None,
                             "cr_sum": 0, "cr_max": 0, "ctx_sum": 0, "ctx_max": 0,
                             "cwds": {}, "branch": "", "files": set(), "fallback": set(),
-                            "parent": e.get("parent_session_id", "")}
+                            "parent": e.get("parent_session_id", ""),
+                            "locations": set(), "service_tiers": {}}
         for k, v in _event_classes(e).items():
             r["tokens"][k] += v
         for k, v in _event_class_costs(e).items():
             r["cost_by_class"][k] += v
         r["requests"] += 1
+        tier = e.get("service_tier") or ("fast" if e.get("model", "").endswith("-fast") else "unknown")
+        r["service_tiers"][tier] = r["service_tiers"].get(tier, 0) + 1
+        for loc in [*e.get("_locations", []), _event_location(e)]:
+            r["locations"].add(tuple(sorted(loc.items())))
+            if loc["path"]:
+                r["files"].add(loc["path"])
         m = e.get("model", "")
         r["models"][m] = r["models"].get(m, 0) + 1
         if m and not is_known_model(m):
@@ -2656,6 +3177,9 @@ def build_session_rows(events: list[dict], compactions: dict | None = None,
             "context_tokens_per_request_max": r["ctx_max"],
             "compactions": comp if comp is not None else 0,
             "source_files": sorted(redact(f) for f in r["files"]),
+            "service_tiers": dict(sorted(r["service_tiers"].items())),
+            "source_locations": [{k: redact(v) if k in ("path", "cwd") else v
+                                  for k, v in dict(loc).items()} for loc in sorted(r["locations"])],
         })
     rows.sort(key=lambda x: (x["first_ts"] or "", x["row_id"]))
     return rows
@@ -2716,11 +3240,15 @@ def rate_card_rows(models) -> list[dict]:
                     "cache_write_5m": r["cache_write"], "cache_write_1h": r["cache_write_1h"]}
         entry = {"model": m, "provider": base["provider"],
                  "rate_family": base["family"], "priced_by_fallback": row is None,
-                 "usd_per_mtok": per_class(base)}
+                 "usd_per_mtok": per_class(get_rates(m)),
+                 "service_tier_multipliers": {
+                     "standard": 1.0, "fast": FAST_MULTIPLIERS.get(base["family"], 1.0),
+                     "flex": 0.5 if base["family"] in FLEX_MODELS else 1.0}}
         if base.get("long_context"):
             lc = base["long_context"]
             entry["long_context"] = {"applies_when_prompt_tokens_over": lc["over"],
-                                     "usd_per_mtok": per_class(lc)}
+                                     "usd_per_mtok": per_class(get_rates(m, request_input=lc["over"] + 1)),
+                                     "semantics": "whole_request"}
         if base.get("intro"):
             entry["intro"] = dict(base["intro"])
         out.append(entry)
@@ -2803,7 +3331,7 @@ def build_coverage(file_stats: dict, events: list[dict], sources: list[dict],
                    | {(e.get("source", "local"), e.get("agent", "claude")) for e in events})
     for host, agent in hosts:
         days_with = {_event_date(e) for e in events
-                     if e.get("source", "local") == host and e.get("agent", "claude") == agent}
+                     if host in _event_hosts(e) and e.get("agent", "claude") == agent}
         no_records = [d for d in window_days if d not in days_with]
         entry = {"host": host, "agent": agent,
                  "days_without_records": _ranges(no_records),
@@ -2813,7 +3341,7 @@ def build_coverage(file_stats: dict, events: list[dict], sources: list[dict],
             deltas = [d for d in (src or {}).get("deltas", [])
                       if d["date_str"] in set(window_days) and d["cost_usd"] > 0]
             jsonl_sessions = {e.get("session_id") for e in events
-                              if e.get("source", "local") == host and e.get("agent") == "claude"}
+                              if host in _event_hosts(e) and e.get("agent") == "claude"}
             hook_only: dict[str, dict] = {}
             for d in deltas:
                 if d["session_id"] not in jsonl_sessions:
@@ -2832,7 +3360,12 @@ def build_coverage(file_stats: dict, events: list[dict], sources: list[dict],
         gaps.append(entry)
     return {"data_sources": data_sources, "gaps": gaps,
             "window_days": [window_days[0], window_days[-1]] if window_days else None,
-            "compressed_rollouts_skipped": zst_skipped}
+            "compressed_rollouts_skipped": zst_skipped,
+            "unresolved_codex_forks": [
+                {"session_id": sid, "parent_session_id": parent, "status": "UNKNOWN",
+                 "note": "parent history unavailable; possible replay retained in totals"}
+                for sid, parent in sorted({(e.get("session_id", ""), e["_unresolved_fork"])
+                                           for e in events if e.get("_unresolved_fork")})]}
 
 
 def compaction_counts(file_stats: dict, since: datetime | None = None,
@@ -2864,7 +3397,8 @@ def build_document(*, sessions, buckets, bucket, coverage, rates, since, until,
         "cost_basis": {
             "method": "list_price",
             "description": ("cost_usd = tokens x the provider's published API list price "
-                            "per token class, at the rate in effect on the record's date. "
+                            "per token class, including the recorded service tier and whole-request "
+                            "context tier, at the rate in effect on the record's date. "
                             "hook_cost_usd is Claude Code's own statusline cost counter "
                             "(Claude only; booked per UTC day, so null unless the window is "
                             "day-aligned)."),
@@ -2888,6 +3422,7 @@ SESSION_CSV_FIELDS = [
     "priced_by_fallback", "billing_mode", "hook_cost_usd",
     "cache_read_per_request_mean", "cache_read_per_request_max",
     "context_tokens_per_request_mean", "context_tokens_per_request_max", "compactions",
+    "service_tiers", "source_files", "source_locations",
 ]
 BUCKET_CSV_FIELDS = [
     "bucket_start", "bucket", "agent", "host", "sandbox", "requests", "sessions",
@@ -2902,6 +3437,8 @@ def _flat(row: dict) -> dict:
             out.update({f"tokens_{c}": n for c, n in v.items()})
         elif k == "cost_by_class_usd":
             out.update({f"cost_{c}_usd": n for c, n in v.items()})
+        elif k in ("service_tiers", "source_locations"):
+            out[k] = json.dumps(v, separators=(",", ":"), sort_keys=True)
         elif k == "models":
             out[k] = ";".join(f"{m}:{n}" for m, n in v.items())
         elif isinstance(v, list):
@@ -3027,6 +3564,10 @@ def print_coverage(cov: dict) -> None:
             print(f"           session {h['session_id']}: hook ${h['hook_cost_usd']:.2f} on "
                   f"{', '.join(h['dates'])}, transcripts missing (tokens UNKNOWN)")
     print()
+
+    for fork in cov.get("unresolved_codex_forks", []):
+        print(f"  UNKNOWN Codex fork {fork['session_id']}: parent {fork['parent_session_id']} "
+              "history unavailable; possible replay retained in totals")
 
 
 def run_detail_report(args, all_events, sources, file_stats, since, until,
@@ -3231,11 +3772,18 @@ def main():
             pass
 
     local_hook_events: list[dict] = []
+    local_hook_rows: list[dict] = []
+    local_baselines: dict = {}
     local_hook_monthly: dict[str, dict] = {}
     for hdir in (discover_hook_data_dirs() if want_claude else []):
         rollup_old_hook_files(hdir)
         baselines = load_session_baselines(hdir)
-        local_hook_events.extend(compute_hook_deltas(parse_hook_rows(hdir), baselines))
+        rows = parse_hook_rows(hdir)
+        local_hook_rows.extend(rows)
+        for sid, base in baselines.items():
+            if sid not in local_baselines or base.get("date", "") < local_baselines[sid].get("date", ""):
+                local_baselines[sid] = base
+        local_hook_events.extend(compute_hook_deltas(rows, baselines))
         merge_monthly_summaries(local_hook_monthly, load_monthly_hook_summaries(hdir))
 
     local_hook_daily: dict = {}
@@ -3253,7 +3801,8 @@ def main():
     all_events = list(local_events)
     sources = [{"name": "local", "agent": "claude", "daily": local_daily,
                 "hook_daily": local_hook_daily, "install_date": local_install,
-                "deltas": local_hook_events}]
+                "deltas": local_hook_events, "_hook_rows": local_hook_rows,
+                "_hook_baselines": local_baselines, "_hook_monthly": local_hook_monthly}]
 
     # Codex is its own source on each machine: it's priced from the per-response
     # usage Codex logs, and must never be displaced by Claude's hook coverage.
@@ -3296,7 +3845,10 @@ def main():
 
             sources.append({"name": host, "agent": "claude", "daily": remote_daily,
                             "hook_daily": remote_hook_daily, "install_date": remote_install,
-                            "deltas": remote_deltas})
+                            "deltas": remote_deltas, "_hook_rows": remote_hook_events,
+                            "_hook_baselines": remote_baselines, "_hook_monthly": remote_monthly})
+
+    all_events = reconcile_sources(all_events, sources)
 
     if detail_mode:
         run_detail_report(args, all_events, sources, file_stats, since, until, zst_total)

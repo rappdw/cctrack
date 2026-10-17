@@ -872,8 +872,9 @@ def test_end_to_end():
 
         # req_1 cost (opus 4.6): 150k/1M*5 + 60k/1M*25 + 15k/1M*0.5 + 8k/1M*6.25
         opus_cost = 0.15 * 5 + 0.06 * 25 + 0.015 * 0.5 + 0.008 * 6.25
-        # req_2 cost (sonnet): 200k/1M*3 + 100k/1M*15 + 20k/1M*0.3 + 10k/1M*3.75
-        sonnet_cost = 0.2 * 3 + 0.1 * 15 + 0.02 * 0.3 + 0.01 * 3.75
+        # req_2 has 230K prompt tokens including caches: the entire request
+        # uses Sonnet 4's >200K input/context prices.
+        sonnet_cost = 0.2 * 6 + 0.1 * 22.5 + 0.02 * 0.6 + 0.01 * 7.5
 
         expected_cost = opus_cost + sonnet_cost
         assert abs(daily["2026-03-15"]["cost"] - expected_cost) < 0.001

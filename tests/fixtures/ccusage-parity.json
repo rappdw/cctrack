@@ -1,0 +1,717 @@
+{
+  "reference": {
+    "package": "ccusage@20.0.34",
+    "commit": "e4f63baa4e2943d4588f1b644281d6c8325faa74",
+    "arguments": [
+      "daily",
+      "--offline",
+      "--timezone",
+      "UTC",
+      "--json"
+    ],
+    "claude_mode": "calculate"
+  },
+  "intentional_differences": {
+    "claude_long": "Anthropic prices the whole request above 200K ($1.8225); ccusage uses marginal tiering ($1.215). https://claude.com/resources/articles/1m-context",
+    "claude_unknown": "cctrack retains a flagged Sonnet estimate; ccusage calculate reports zero and an unpriced model.",
+    "claude_costusd": "calculate mode agrees; ccusage auto would trust costUSD=0.123. cctrack deliberately reports token-derived list price."
+  },
+  "cases": [
+    {
+      "name": "codex_compaction",
+      "agent": "codex",
+      "files": [
+        [
+          {
+            "timestamp": "2026-10-10T10:00:00Z",
+            "type": "turn_context",
+            "payload": {
+              "model": "gpt-5"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:01Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "token_count",
+              "info": {
+                "last_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100
+                },
+                "total_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100,
+                  "total_tokens": 1100
+                }
+              }
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:02Z",
+            "type": "token_usage_record",
+            "payload": {
+              "response_id": "resp_c",
+              "usage": {
+                "input_tokens": 500,
+                "output_tokens": 50
+              }
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:03Z",
+            "type": "compacted",
+            "payload": {
+              "compaction_response_id": "resp_c"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:10Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "token_count",
+              "info": {
+                "last_token_usage": {
+                  "input_tokens": 2000,
+                  "output_tokens": 200
+                },
+                "total_token_usage": {
+                  "input_tokens": 3100,
+                  "output_tokens": 200,
+                  "total_tokens": 3300
+                }
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 3850,
+      "expected_cost_usd": 0.007875
+    },
+    {
+      "name": "codex_last_only",
+      "agent": "codex",
+      "files": [
+        [
+          {
+            "timestamp": "2026-10-10T10:00:00Z",
+            "type": "turn_context",
+            "payload": {
+              "model": "gpt-5"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:01Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "token_count",
+              "info": {
+                "last_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100
+                }
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 1100,
+      "expected_cost_usd": 0.00225
+    },
+    {
+      "name": "codex_total_only",
+      "agent": "codex",
+      "files": [
+        [
+          {
+            "timestamp": "2026-10-10T10:00:00Z",
+            "type": "turn_context",
+            "payload": {
+              "model": "gpt-5"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:01Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "token_count",
+              "info": {
+                "total_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100,
+                  "total_tokens": 1100
+                }
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 1100,
+      "expected_cost_usd": 0.00225
+    },
+    {
+      "name": "codex_record_model",
+      "agent": "codex",
+      "files": [
+        [
+          {
+            "timestamp": "2026-10-10T10:00:00Z",
+            "type": "turn_context",
+            "payload": {
+              "model": "gpt-5"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:01Z",
+            "type": "token_usage_record",
+            "payload": {
+              "response_id": "resp_c",
+              "model": "gpt-6-astra",
+              "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100
+              }
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:02Z",
+            "type": "compacted",
+            "payload": {
+              "compaction_response_id": "resp_c"
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 1100,
+      "expected_cost_usd": 0.015
+    },
+    {
+      "name": "codex_priority",
+      "agent": "codex",
+      "files": [
+        [
+          {
+            "timestamp": "2026-10-10T10:00:00Z",
+            "type": "turn_context",
+            "payload": {
+              "model": "gpt-5"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:00Z",
+            "type": "turn_context",
+            "payload": {
+              "model": "gpt-6.1-sol"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:01Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "thread_settings_applied",
+              "thread_settings": {
+                "service_tier": "priority"
+              }
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "token_count",
+              "info": {
+                "last_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100
+                },
+                "total_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100,
+                  "total_tokens": 1100
+                }
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 1100,
+      "expected_cost_usd": 0.006
+    },
+    {
+      "name": "codex_flex",
+      "agent": "codex",
+      "files": [
+        [
+          {
+            "timestamp": "2026-10-10T10:00:00Z",
+            "type": "turn_context",
+            "payload": {
+              "model": "gpt-6.1-sol"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:01Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "thread_settings_applied",
+              "thread_settings": {
+                "service_tier": "flex"
+              }
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "token_count",
+              "info": {
+                "last_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100
+                },
+                "total_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100,
+                  "total_tokens": 1100
+                }
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 1100,
+      "expected_cost_usd": 0.0015
+    },
+    {
+      "name": "codex_fork",
+      "agent": "codex",
+      "files": [
+        [
+          {
+            "timestamp": "2026-10-10T10:00:10Z",
+            "type": "session_meta",
+            "payload": {
+              "id": "child",
+              "forked_from_id": "parent"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:00Z",
+            "type": "turn_context",
+            "payload": {
+              "model": "gpt-5"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:10Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "token_count",
+              "info": {
+                "last_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100
+                },
+                "total_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100,
+                  "total_tokens": 1100
+                }
+              }
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:20Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "token_count",
+              "info": {
+                "last_token_usage": {
+                  "input_tokens": 500,
+                  "output_tokens": 50
+                },
+                "total_token_usage": {
+                  "input_tokens": 1600,
+                  "output_tokens": 50,
+                  "total_tokens": 1650
+                }
+              }
+            }
+          }
+        ],
+        [
+          {
+            "timestamp": "2026-10-10T10:00:00Z",
+            "type": "session_meta",
+            "payload": {
+              "id": "parent"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:00Z",
+            "type": "turn_context",
+            "payload": {
+              "model": "gpt-5"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:01Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "token_count",
+              "info": {
+                "last_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100
+                },
+                "total_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100,
+                  "total_tokens": 1100
+                }
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 1650,
+      "expected_cost_usd": 0.003375
+    },
+    {
+      "name": "codex_mini",
+      "agent": "codex",
+      "files": [
+        [
+          {
+            "timestamp": "2026-10-10T10:00:00Z",
+            "type": "turn_context",
+            "payload": {
+              "model": "gpt-5.1-codex-mini"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "token_count",
+              "info": {
+                "last_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100
+                },
+                "total_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100,
+                  "total_tokens": 1100
+                }
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 1100,
+      "expected_cost_usd": 0.00045
+    },
+    {
+      "name": "codex_alias",
+      "agent": "codex",
+      "files": [
+        [
+          {
+            "timestamp": "2026-10-10T10:00:00Z",
+            "type": "turn_context",
+            "payload": {
+              "model": "gpt-5.6"
+            }
+          },
+          {
+            "timestamp": "2026-10-10T10:00:02Z",
+            "type": "event_msg",
+            "payload": {
+              "type": "token_count",
+              "info": {
+                "last_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100
+                },
+                "total_token_usage": {
+                  "input_tokens": 1000,
+                  "output_tokens": 100,
+                  "total_tokens": 1100
+                }
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 1100,
+      "expected_cost_usd": 0.006
+    },
+    {
+      "name": "claude_fast",
+      "agent": "claude",
+      "files": [
+        [
+          {
+            "type": "assistant",
+            "sessionId": "s",
+            "timestamp": "2026-10-10T10:00:00Z",
+            "requestId": "req_1",
+            "message": {
+              "id": "msg_1",
+              "model": "claude-opus-4-6",
+              "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "speed": "fast"
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 1100,
+      "expected_cost_usd": 0.045
+    },
+    {
+      "name": "claude_shared_request",
+      "agent": "claude",
+      "files": [
+        [
+          {
+            "type": "assistant",
+            "sessionId": "s",
+            "timestamp": "2026-10-10T10:00:00Z",
+            "requestId": "req_1",
+            "message": {
+              "id": "msg_1",
+              "model": "claude-sonnet-4",
+              "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100
+              }
+            }
+          },
+          {
+            "type": "assistant",
+            "sessionId": "s",
+            "timestamp": "2026-10-10T10:00:00Z",
+            "requestId": "req_1",
+            "message": {
+              "id": "msg_2",
+              "model": "claude-sonnet-4",
+              "usage": {
+                "input_tokens": 2000,
+                "output_tokens": 200
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 3300,
+      "expected_cost_usd": 0.0135
+    },
+    {
+      "name": "claude_no_request",
+      "agent": "claude",
+      "files": [
+        [
+          {
+            "type": "assistant",
+            "sessionId": "s",
+            "timestamp": "2026-10-10T10:00:00Z",
+            "message": {
+              "id": "msg_1",
+              "model": "claude-sonnet-4",
+              "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100
+              }
+            }
+          },
+          {
+            "type": "assistant",
+            "sessionId": "s",
+            "timestamp": "2026-10-10T10:00:00Z",
+            "message": {
+              "id": "msg_1",
+              "model": "claude-sonnet-4",
+              "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 1100,
+      "expected_cost_usd": 0.0045
+    },
+    {
+      "name": "claude_regression",
+      "agent": "claude",
+      "files": [
+        [
+          {
+            "type": "assistant",
+            "sessionId": "s",
+            "timestamp": "2026-10-10T10:00:00Z",
+            "requestId": "req_1",
+            "message": {
+              "id": "msg_1",
+              "model": "claude-sonnet-4",
+              "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 1000
+              }
+            }
+          },
+          {
+            "type": "assistant",
+            "sessionId": "s",
+            "timestamp": "2026-10-10T10:00:00Z",
+            "requestId": "req_1",
+            "message": {
+              "id": "msg_1",
+              "model": "claude-sonnet-4",
+              "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 1
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 2000,
+      "expected_cost_usd": 0.018
+    },
+    {
+      "name": "claude_haiku_alias",
+      "agent": "claude",
+      "files": [
+        [
+          {
+            "type": "assistant",
+            "sessionId": "s",
+            "timestamp": "2026-10-10T10:00:00Z",
+            "requestId": "req_1",
+            "message": {
+              "id": "msg_1",
+              "model": "claude-3-haiku-20240307",
+              "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 1100,
+      "expected_cost_usd": 0.000375
+    },
+    {
+      "name": "claude_advisor",
+      "agent": "claude",
+      "files": [
+        [
+          {
+            "type": "assistant",
+            "sessionId": "s",
+            "timestamp": "2026-10-10T10:00:00Z",
+            "requestId": "req_1",
+            "message": {
+              "id": "msg_1",
+              "model": "claude-sonnet-4",
+              "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "iterations": [
+                  {
+                    "type": "advisor_message",
+                    "model": "claude-opus-4-6",
+                    "input_tokens": 1000,
+                    "output_tokens": 100
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 2200,
+      "expected_cost_usd": 0.012
+    },
+    {
+      "name": "claude_long",
+      "agent": "claude",
+      "files": [
+        [
+          {
+            "type": "assistant",
+            "sessionId": "s",
+            "timestamp": "2026-10-10T10:00:00Z",
+            "requestId": "req_1",
+            "message": {
+              "id": "msg_1",
+              "model": "claude-sonnet-4",
+              "usage": {
+                "input_tokens": 300000,
+                "output_tokens": 1000
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 301000,
+      "expected_cost_usd": 1.8225
+    },
+    {
+      "name": "claude_costusd",
+      "agent": "claude",
+      "files": [
+        [
+          {
+            "type": "assistant",
+            "sessionId": "s",
+            "timestamp": "2026-10-10T10:00:00Z",
+            "requestId": "req_1",
+            "message": {
+              "id": "msg_1",
+              "model": "claude-sonnet-4",
+              "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100
+              }
+            },
+            "costUSD": 0.123
+          }
+        ]
+      ],
+      "expected_tokens": 1100,
+      "expected_cost_usd": 0.0045
+    },
+    {
+      "name": "claude_unknown",
+      "agent": "claude",
+      "files": [
+        [
+          {
+            "type": "assistant",
+            "sessionId": "s",
+            "timestamp": "2026-10-10T10:00:00Z",
+            "requestId": "req_1",
+            "message": {
+              "id": "msg_1",
+              "model": "unrecognized-test-model-xyz",
+              "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 100
+              }
+            }
+          }
+        ]
+      ],
+      "expected_tokens": 1100,
+      "expected_cost_usd": 0.0045
+    }
+  ]
+}

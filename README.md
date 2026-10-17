@@ -59,7 +59,7 @@ Daily breakdown:
 
 1. Walks `~/.claude/projects/` — and each [Sandy](#sandy-sandboxes) sandbox's `claude/projects/` — for Claude Code transcripts, and each Codex home for Codex rollouts
 2. Parses `assistant` events with token usage
-3. Deduplicates by `requestId` (last event wins, matching Claude Code's semantics)
+3. Deduplicates API message/response identities across files, Sandy sandboxes and remote hosts, keeping the fullest usage snapshot
 4. Calculates cost using Anthropic's published rates per model
 5. Prints daily breakdown with input/output/cache token splits and monthly summaries
 
@@ -69,10 +69,13 @@ cctrack also reads [Codex CLI](https://github.com/openai/codex) usage from `$COD
 
 How it's counted (verified against the Codex source, not inferred):
 
-- **Per-response usage.** Newer Codex versions log a `token_usage_record` for every API response with a unique `response_id`; those are counted and deduplicated across files, so forked and resumed threads (which replay their parent's history) aren't double counted. Older versions only log `token_count` events, which are re-emitted with unchanged totals — only events whose running total moved are counted.
+- **Request records and cumulative snapshots.** `token_usage_record` and `token_count` can coexist, including around compactions. A request record replaces only its matching snapshot; later ordinary usage still counts. Last-usage-only and cumulative-only rollouts are supported, and unchanged cumulative re-emissions are ignored. Explicit models on request records take precedence over the surrounding turn's model.
+- **Forks and copies.** Response IDs deduplicate exact records. Older fork histories with rewritten timestamps are compared against the parent's usage sequence. If the parent is unavailable, possible replay is retained and flagged UNKNOWN by `--coverage`; a fast burst alone is not proof of duplication.
 - **Cached tokens are inside `input_tokens`.** Codex reports cached reads and cache writes as parts of `input_tokens`, and reasoning tokens as part of `output_tokens`. Billable uncached input is `input − cached − cache_write`; reasoning is never added on top.
 - **Its own cost source.** Codex spend is priced directly from its logs and is never replaced by, or scaled with, Claude Code's statusline-hook figures.
 - **Compressed rollouts.** Codex compresses older rollouts to `.jsonl.zst`. Python's standard library only reads zstd from 3.14, so on older Pythons cctrack uses the `zstd` command if it's installed, and otherwise skips those files and says how many it skipped.
+
+Recorded `service_tier` settings (`priority`/`fast`, `flex`, or `default`/`standard`) select the model's corresponding price. Claude's recorded `usage.speed` is also respected. Missing tier metadata uses standard pricing; today's config is not applied retrospectively to old requests.
 
 Costs are at OpenAI's **API list prices**. If you use Codex through a ChatGPT plan, that's an API-equivalent value, not what you're billed — the same is true of Claude Code on a Claude subscription.
 
@@ -82,7 +85,8 @@ cctrack finds every [Sandy](https://github.com/rappdw/sandy) sandbox on the mach
 
 - **Finding sandboxes:** `sandy --print-state` (`sandboxes[].path`) when sandy is installed, which follows `$SANDY_HOME`; otherwise `$SANDY_HOME/sandboxes/*` (default `~/.sandy/sandboxes`).
 - **Per sandbox:** Claude Code transcripts from `claude/projects/`, statusline-hook data from `claude/cctrack/`, Codex rollouts from `codex/sessions/` and `codex/archived_sessions/`. Other files under `claude/` (`history.jsonl`, job timelines, tool-audit logs) aren't transcripts and are ignored.
-- **Never double counted:** the hidden `.rsync-from.<name>.<pid>/` copy that exists while `sandy --rsync-from` is pulling a sandbox in is skipped, as are `.lock` directories. A sandbox's Codex home is never shared with the host's `~/.codex`, and anything copied between hosts with `sandy --rsync` is deduplicated by request/response id.
+- **Copies:** matching API identities are charged once across all collected locations. The fullest usage snapshot wins; equivalent copies have deterministic attribution. Session JSON/CSV includes `source_locations` and `source_files` so every copy remains traceable. Raw statusline histories are merged before calculating cost increments. Old monthly hook summaries contain no session identities, so copied summaries cannot yet be deduplicated reliably.
+- **Temporary copies:** the hidden `.rsync-from.<name>.<pid>/` copy that exists while `sandy --rsync-from` is pulling a sandbox in is skipped, as are `.lock` directories. A sandbox's Codex home is never shared with the host's `~/.codex`, and transcript history copied between hosts with `sandy --rsync` is deduplicated by API message/response identity.
 
 - **Dot-named sandboxes count:** a workspace named like a dotfile directory (e.g. `~/.dotfiles`) gets a sandbox whose name starts with a dot. Sandy's own listing currently omits these, so cctrack scans for them itself — any dot-directory holding `WORKSPACE.json` is a real sandbox.
 
@@ -128,11 +132,28 @@ cctrack --json --redact                                              # hash path
 ```
 
 - `--since` / `--until` take ISO-8601 (zones converted to UTC; naive times are UTC) or `YYYY-MM-DD`. The window is `since <= t < until`, and a bare `--until` date includes that whole day.
-- **Sessions**: one row per session, with Claude subagent (sidechain) turns as their own rows linked by `parent_session_id`. Codex subagent threads are separate sessions that carry their parent's id. Each row has agent, host, Sandy sandbox, project/cwd, git branch, first and last record time, models, request count, tokens and cost in five classes (input, output, cache read, 5-minute and 1-hour cache write), mean and max cache-read and context tokens per request, and compactions.
+- **Sessions**: one row per session, with Claude subagent (sidechain) turns as their own rows linked by `parent_session_id`. Codex subagent threads are separate sessions that carry their parent's id. Each row has agent, host, Sandy sandbox, project/cwd, git branch, recorded service-tier counts and all observed copy locations, first and last record time, models, request count, tokens and cost in five classes (input, output, cache read, 5-minute and 1-hour cache write), mean and max cache-read and context tokens per request, and compactions.
 - **Cost basis**: `cost_usd` is always API list price from the built-in rate card. The rates applied (per model, $/Mtok per class), the card's version and its sources are in the JSON (`rate_card`, `cost_basis`) and in `--csv rates`. For Claude, `hook_cost_usd` is Claude Code's own cost counter. It's booked per UTC day, so it's only filled in for day-aligned windows. Logs don't say whether you're on API or subscription billing, so record that with `--billing-mode subscription` (or `claude=subscription,codex=api`, or `CCTRACK_BILLING_MODE`). It's shown on each row and doesn't change cost.
 - **Coverage**: for each log directory (per host and sandbox), the file count, usage records, earliest and latest timestamp, and any unparseable lines or unreadable files (status `UNKNOWN`). Days in the window with no records are listed as UNKNOWN, since idle days and lost logs look the same. Where the statusline hook saw Claude spend but no transcript exists, the day and session are flagged with tokens UNKNOWN. That's the signature of lost logs.
 - `--redact` hashes cwd, project, sandbox, branch and file paths, but not session ids. Set `CCTRACK_REDACT_SALT` so the hashes of guessable repo names can't be reversed.
 - JSON and CSV carry `schema_version` (currently 1). Field names are stable within a schema version.
+
+## Statusline hook (optional)
+
+```bash
+cctrack --install-hook      # this machine (add --remote HOST to install on another)
+cctrack --uninstall-hook    # keeps the data it collected
+```
+
+The hook is optional. Without it, Claude Code cost is priced from the transcripts at list price. With current rates that tracks Claude Code's own counter closely, typically within a few percent. With it, cctrack also records Claude Code's own running cost counter. That gives you:
+
+- the "authoritative" Claude cost in reports and `hook_cost_usd` in JSON;
+- a measured correction for days priced from transcripts;
+- detection of lost transcripts in `--coverage`.
+
+It's installed as Claude Code's `statusLine` command (`~/.claude/hooks/cctrack-hook.py`), not as an entry under `hooks`. Each status-line redraw appends one record to `~/.claude/cctrack/statusline-<UTC date>.jsonl`.
+
+**An existing status line is kept.** If one is configured, install saves it in `~/.claude/cctrack/config.json`. On every redraw the hook records the cost, then runs your command with the same input, and passes its output and exit code through, so your status line looks the same as before. Uninstall puts your status line back. If you've changed the status line to something else since installing, uninstall leaves it alone. Re-installing keeps the saved command and the original install date.
 
 ## Remote aggregation
 
@@ -159,7 +180,8 @@ Prices per million tokens. Claude prices are from [Anthropic's pricing page](htt
 | Opus 4.1 / 4 | $15.00 | $75.00 | $1.50 | $18.75 | $30.00 |
 | Sonnet 5.5 | $2.00 | $10.00 | $0.10 | $2.50 | $4.00 |
 | Sonnet 5 | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
-| Sonnet 4.6 / 4.5 / 4 / 3.7 | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
+| Sonnet 4.6 / 4.5 / 4 / 3.7 (base) | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
+| Sonnet 4.5 / 4 (historical prompts > 200K) | $6.00 | $22.50 | $0.60 | $7.50 | $12.00 |
 | Haiku 5.5 (prompt ≤ 100K) | $0.10 | $0.50 | $0.01 | $0.125 | $0.20 |
 | Haiku 5.5 (prompt > 100K) | $0.50 | $2.50 | $0.05 | $0.625 | $1.00 |
 | Haiku 4.5 | $1.00 | $5.00 | $0.10 | $1.25 | $2.00 |
@@ -189,9 +211,21 @@ OpenAI prices (for Codex) are from [OpenAI's pricing page](https://developers.op
 | gpt-5-mini | $0.25 | $0.025 | $2.00 | — | |
 | gpt-5-nano | $0.05 | $0.005 | $0.40 | — | |
 
-Codex variants without their own price (e.g. `gpt-5.1-codex`) are priced as their base model, consistent with the one variant OpenAI does list (`gpt-5.3-codex` = `gpt-5.2`). Long-context and Haiku 5.5 prompt-length tiers are applied per request.
+Codex variants without their own price (e.g. `gpt-5.1-codex`) are priced as their base model, consistent with the one variant OpenAI does list (`gpt-5.3-codex` = `gpt-5.2`). Long-context and Haiku 5.5 prompt-length tiers are applied to the whole request, including cache tokens when selecting the tier. The historical Sonnet 4/4.5 premium follows [Anthropic's published whole-request pricing](https://claude.com/resources/articles/1m-context), rather than ccusage 20.0.34's marginal calculation. Explicit aliases include `gpt-5.1-codex-mini` (GPT-5 mini), `gpt-5.1-codex-max` (GPT-5.1), and `gpt-5.6` (GPT-5.6 Sol); dated snapshots of those aliases are supported.
 
-**Every model version has its own row.** A model only matches a row if it is that version or a dated snapshot of it — never a newer minor version. So a newly released model (say `claude-opus-5-7`, or `gpt-5.1-codex-mini`) shows as unknown and is flagged with `?` in the Model column, rather than silently inheriting its predecessor's price. Unknown Claude models are estimated at Sonnet rates, unknown OpenAI models at GPT-5 rates. Pricing is date-aware, so any time-limited introductory price applies only to usage on the days it was in effect.
+**Every model version has its own row.** A model only matches a row if it is that version or a dated snapshot of it — never a newer minor version. So a newly released model (say `claude-opus-5-7`, or `gpt-5.9-codex-mini`) shows as unknown and is flagged with `?` in the Model column, rather than silently inheriting its predecessor's price. Unknown Claude models are estimated at Sonnet rates, unknown OpenAI models at GPT-5 rates. Pricing is date-aware, so any time-limited introductory price applies only to usage on the days it was in effect.
+
+## Accounting regression checks
+
+Run the offline test suite with `PYTHONPATH=src python3 -m pytest`. Synthetic fixtures in `tests/fixtures/ccusage-parity.json` are pinned to ccusage 20.0.34, commit `e4f63baa4e2943d4588f1b644281d6c8325faa74`. They cover compactions, legacy snapshots, forks, speed tiers, message deduplication, advisor calls and model aliases. Additional tests cover sandbox/host copies, cumulative hook histories, context boundaries and attribution.
+
+To repeat the comparison against an independently installed executable:
+
+```bash
+PYTHONPATH=src python3 scripts/compare_ccusage.py --ccusage /path/to/ccusage
+```
+
+The command requires exactly ccusage 20.0.34 and uses isolated temporary homes with offline pricing. Runtime cctrack and its normal tests do not depend on Node or ccusage. Provider documentation resolves pricing disagreements. Intentional differences are recorded in the fixture: Sonnet 4 uses whole-request context pricing, unknown models retain a flagged estimate, and cctrack's token-derived costs correspond to ccusage's `calculate` mode rather than its stored-`costUSD` `auto` mode.
 
 ## Energy estimate
 

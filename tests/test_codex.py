@@ -260,8 +260,10 @@ def test_codex_variants_inherit_base_price():
 def test_family_boundary_and_tier_words():
     assert not cctrack._family_matches("gpt-5.5", "gpt-5")
     assert not cctrack._family_matches("gpt-5-mini", "gpt-5")
-    # an unverified size variant must not silently borrow its base model's price
-    assert not cctrack.is_known_model("gpt-5.1-codex-mini")
+    # Explicitly priced variants are known; a future size is never inherited.
+    assert cctrack.is_known_model("gpt-5.1-codex-mini")
+    assert cctrack.get_rates("gpt-5.1-codex-mini")["input"] == 0.25
+    assert not cctrack.is_known_model("gpt-5.1-codex-nano")
     assert cctrack.get_rates("gpt-5.4-mini")["input"] == 0.75
 
 
