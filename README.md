@@ -83,7 +83,7 @@ Costs are at OpenAI's **API list prices**. If you use Codex through a ChatGPT pl
 
 cctrack finds every [Sandy](https://github.com/rappdw/sandy) sandbox on the machine (and on `--remote` hosts) and includes its Claude Code and Codex usage. It follows sandy's published host-side path contract:
 
-- **Finding sandboxes:** `sandy --print-state` (`sandboxes[].path`) when sandy is installed, which follows `$SANDY_HOME`; otherwise `$SANDY_HOME/sandboxes/*` (default `~/.sandy/sandboxes`).
+- **Finding sandboxes:** a direct scan of `$SANDY_HOME/sandboxes/*` (default `~/.sandy/sandboxes`), the same on `--remote` hosts. `sandy --print-state` can take many seconds, so cctrack only asks it when that directory doesn't exist, waiting at most 15 seconds (`CCTRACK_SANDY_TIMEOUT`).
 - **Per sandbox:** Claude Code transcripts from `claude/projects/`, statusline-hook data from `claude/cctrack/`, Codex rollouts from `codex/sessions/` and `codex/archived_sessions/`. Other files under `claude/` (`history.jsonl`, job timelines, tool-audit logs) aren't transcripts and are ignored.
 - **Copies:** matching API identities are charged once across all collected locations. The fullest usage snapshot wins; equivalent copies have deterministic attribution. Session JSON/CSV includes `source_locations` and `source_files` so every copy remains traceable. Raw statusline histories are merged before calculating cost increments. Old monthly hook summaries contain no session identities, so copied summaries cannot yet be deduplicated reliably.
 - **Temporary copies:** the hidden `.rsync-from.<name>.<pid>/` copy that exists while `sandy --rsync-from` is pulling a sandbox in is skipped, as are `.lock` directories. A sandbox's Codex home is never shared with the host's `~/.codex`, and transcript history copied between hosts with `sandy --rsync` is deduplicated by API message/response identity.
@@ -157,7 +157,11 @@ It's installed as Claude Code's `statusLine` command (`~/.claude/hooks/cctrack-h
 
 ## Remote aggregation
 
-With `--remote`, cctrack SSHs to each host and streams back both the JSONL logs and the host's statusline hook data (`~/.claude/cctrack/`) for local parsing, so authoritative hook costs from every machine are summed per day. Requires SSH key auth.
+With `--remote`, cctrack reads each host's Claude Code transcripts, Codex rollouts and statusline hook data (`~/.claude/cctrack/`), including the host's Sandy sandboxes. Usage from every machine is then reconciled and summed per day. Requires SSH key auth.
+
+**Logs are parsed on the host.** Over one SSH connection, cctrack sends its own code to the host and runs it with `python3 -`. Only the usage records come back: ids, timestamps, models and token counts, compressed. Raw logs are mostly conversation content, so this cuts the transfer from gigabytes to megabytes. The host doesn't need cctrack installed, nothing on it is changed, and the results are the same as reading the raw logs. If the host has no Python 3.10+, cctrack says so and streams the raw logs instead, gzip-compressed. Set `CCTRACK_REMOTE_PARSE=0` to always stream.
+
+Each fetch may take up to 600 seconds (set `CCTRACK_SSH_TIMEOUT` to change it). If one times out, cctrack warns that the host's data is missing from the report. While it works, a status line on stderr shows each step: files found and parsed, bytes received, elapsed time. It's shown only when stderr is a terminal; `CCTRACK_NO_PROGRESS=1` turns it off.
 
 ```bash
 # Aggregate this machine + DGX server + laptop

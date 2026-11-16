@@ -117,13 +117,33 @@ def test_roots_fallback_dot_entry_rules(fake_host):
     assert [p.name for p in cctrack.sandbox_roots()] == ROOT_NAMES
 
 
-def test_dot_named_sandbox_found_even_with_print_state(fake_host, monkeypatch):
-    """sandy --print-state currently omits dot-named sandboxes (a sandy bug);
-    cctrack adds them by scanning sandboxes/ itself."""
-    sb = fake_host / ".sandy" / "sandboxes"
-    monkeypatch.setattr(cctrack, "_sandy_print_state",
-                        lambda: [str(sb / "web"), str(sb / "my box")])
+def test_sandboxes_dir_scanned_without_asking_sandy(fake_host, monkeypatch):
+    """`sandy --print-state` is slow (many seconds) and omits dot-named
+    sandboxes, so when sandboxes/ exists cctrack scans it and never asks."""
+    def slow_sandy():
+        raise AssertionError("sandy --print-state should not be called")
+    monkeypatch.setattr(cctrack, "_sandy_print_state", slow_sandy)
     assert [p.name for p in cctrack.sandbox_roots()] == ROOT_NAMES
+    cctrack.default_dirs()
+    cctrack.codex_homes()
+    cctrack.discover_hook_data_dirs()
+
+
+@pytest.mark.real_sandy_probe
+def test_print_state_asked_once_with_no_terminal_and_timeout_falls_back(monkeypatch, capsys):
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(kw)
+        raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+    monkeypatch.setenv("CCTRACK_SANDY_TIMEOUT", "3")
+    with patch("shutil.which", return_value="/usr/bin/sandy"), \
+         patch("subprocess.run", side_effect=run):
+        assert cctrack._sandy_print_state() is None
+        assert cctrack._sandy_print_state() is None       # cached: not asked again
+    assert len(calls) == 1
+    assert calls[0]["stdin"] is subprocess.DEVNULL and calls[0]["timeout"] == 3.0
+    assert "didn't answer within 3s" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("name,ws,expected", [

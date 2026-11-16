@@ -352,19 +352,51 @@ def sandy_home() -> Path:
     return Path(os.environ.get("SANDY_HOME") or (Path.home() / ".sandy"))
 
 
+_SANDY_STATE_UNSET = object()
+_sandy_state_cache = _SANDY_STATE_UNSET
+
+
 def _sandy_print_state() -> list[str] | None:
-    """sandboxes[].path from `sandy --print-state`, or None if unavailable."""
+    """sandboxes[].path from `sandy --print-state`, or None if unavailable.
+    Asked once per run (cached): it's needed by several discovery steps.
+    stdin is /dev/null so sandy can never wait on, or draw to, the terminal;
+    on a timeout cctrack says so and falls back to scanning sandboxes/."""
+    global _sandy_state_cache
+    if _sandy_state_cache is not _SANDY_STATE_UNSET:
+        return _sandy_state_cache
+    _sandy_state_cache = _query_sandy_state()
+    return _sandy_state_cache
+
+
+def sandy_state_timeout() -> float:
+    try:
+        return max(1.0, float(os.environ.get("CCTRACK_SANDY_TIMEOUT", "15")))
+    except ValueError:
+        return 15.0
+
+
+def _query_sandy_state() -> list[str] | None:
     import shutil
     if not shutil.which("sandy"):
         return None
+    progress = Progress("Asking sandy for its sandboxes")
+    progress.update(force=True)
     try:
-        r = subprocess.run(["sandy", "--print-state"], capture_output=True,
-                           text=True, timeout=30)
+        r = subprocess.run(["sandy", "--print-state"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=sandy_state_timeout())
         if r.returncode != 0:
             return None
         state = json.loads(r.stdout)
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError):
+    except subprocess.TimeoutExpired:
+        progress.done()
+        print(f"  Note: `sandy --print-state` didn't answer within "
+              f"{sandy_state_timeout():.0f}s; scanning {sandy_home() / 'sandboxes'} "
+              f"directly instead (CCTRACK_SANDY_TIMEOUT changes the wait).", file=sys.stderr)
         return None
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    finally:
+        progress.done()
     boxes = state.get("sandboxes") if isinstance(state, dict) else None
     if not isinstance(boxes, list):
         return None
@@ -391,15 +423,17 @@ def _is_sandbox_name(name: str, has_workspace_json: bool | None) -> bool:
 def sandbox_roots() -> list[Path]:
     """Root directory of every Sandy sandbox on this machine.
 
-    Uses `sandy --print-state` when available, else every entry of
-    $SANDY_HOME/sandboxes/. Dot-named sandboxes are always added by scanning
-    sandboxes/ directly: sandy's own enumeration (and so --print-state) skips
-    them today, which would silently drop their usage."""
+    Scans $SANDY_HOME/sandboxes/ (default ~/.sandy) directly: every sandbox
+    lives there, and the scan also finds dot-named sandboxes, which sandy's own
+    enumeration (and so --print-state) skips today. `sandy --print-state` can
+    take many seconds, so it's asked only when that directory doesn't exist."""
     base = sandy_home() / "sandboxes"
     entries = sorted(p for p in base.iterdir() if p.is_dir()) if base.is_dir() else []
-    paths = _sandy_print_state()
-    candidates = [Path(p) for p in paths] if paths is not None else list(entries)
-    candidates += [p for p in entries if p.name.startswith(".")]
+    if base.is_dir():
+        candidates = list(entries)
+    else:
+        paths = _sandy_print_state()
+        candidates = [Path(p) for p in paths] if paths is not None else []
     roots = {p for p in candidates
              if _is_sandbox_name(p.name, (p / "WORKSPACE.json").is_file()
                                  if p.name.startswith(".") else None)}
@@ -421,16 +455,236 @@ def default_dirs() -> list[str]:
 def discover_files(dirs: list[str]) -> list[str]:
     """Walk directories, return all .jsonl file paths."""
     files = []
+    progress = Progress("Finding Claude transcripts")
     for d in dirs:
         p = Path(d)
         if not p.exists():
             continue
         for f in p.rglob("*.jsonl"):
             files.append(str(f))
+            progress.update(f"{len(files):,} found")
+        progress.update(f"{len(files):,} found")
+    progress.done()
     return files
 
 
 # ── Remote host support ────────────────────────────────────────────────
+
+# -T: never allocate a remote pty. Together with stdin=/dev/null (see _run_ssh)
+# this stops ssh from putting the local terminal into raw mode — an ssh killed
+# by our timeout can't restore it, which left the report "staircased".
+_SSH = ("ssh", "-T", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes")
+
+
+class Progress:
+    """One live status line on stderr: a bouncing (cylon) bar plus detail
+    text, e.g. bytes received. Silent unless stderr is a terminal, so piped
+    output, --json and tests are unaffected; CCTRACK_NO_PROGRESS=1 disables."""
+    WIDTH = 16
+
+    def __init__(self, label: str, enabled: bool | None = None):
+        import time
+        self.label = label
+        self.start = time.monotonic()
+        self._last = 0.0
+        self.enabled = progress_enabled() if enabled is None else enabled
+
+    def update(self, detail: str = "", force: bool = False) -> None:
+        import time
+        if _remote_progress_lines:
+            # Running on a --remote host: report to the local cctrack, which
+            # shows it in its own status line.
+            now = time.monotonic()
+            if force or now - self._last >= 0.5:
+                self._last = now
+                sys.stderr.write(f"{REMOTE_PROGRESS}{self.label}: {detail}\n")
+                sys.stderr.flush()
+            return
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and now - self._last < 0.1:
+            return
+        self._last = now
+        elapsed = now - self.start
+        # Bounce a 3-cell block across the bar, about one sweep per second.
+        span = self.WIDTH - 3
+        step = int(elapsed * 2 * span) % (2 * span)
+        pos = step if step <= span else 2 * span - step
+        bar = " " * pos + "\u2588\u2588\u2588" + " " * (span - pos)
+        sys.stderr.write(f"\r\033[K  {self.label} [{bar}] {detail}  {elapsed:.0f}s")
+        sys.stderr.flush()
+
+    def done(self) -> None:
+        if self.enabled:
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+
+
+def progress_enabled() -> bool:
+    if os.environ.get("CCTRACK_NO_PROGRESS"):
+        return False
+    try:
+        return sys.stderr.isatty() is True
+    except (AttributeError, ValueError):
+        return False
+
+
+def format_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _run_streaming(cmd, progress: Progress, timeout: float | None, input: bytes | str | None = None,
+                   text: bool = True) -> subprocess.CompletedProcess:
+    """Like subprocess.run(capture_output=True, timeout=…) but reads output as
+    it arrives, so the progress line can show bytes received and any
+    `CCTRACK_PROGRESS` lines a remote collector writes to stderr."""
+    import threading
+    import time
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out_chunks: list[bytes] = []
+    err_lines: list[bytes] = []
+    received = [0]
+    remote_status = [""]
+    marker = REMOTE_PROGRESS.encode()
+
+    def pump_out():
+        for chunk in iter(lambda: p.stdout.read1(65536), b""):
+            out_chunks.append(chunk)
+            received[0] += len(chunk)
+
+    def pump_err():
+        for line in iter(p.stderr.readline, b""):
+            if line.startswith(marker):
+                remote_status[0] = line[len(marker):].decode(errors="replace").strip()
+            else:
+                err_lines.append(line)
+
+    def feed():
+        try:
+            data = input.encode() if isinstance(input, str) else input
+            p.stdin.write(data)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                p.stdin.close()
+            except OSError:
+                pass
+
+    threads = [threading.Thread(target=pump_out, daemon=True),
+               threading.Thread(target=pump_err, daemon=True)]
+    if input is not None:
+        threads.append(threading.Thread(target=feed, daemon=True))
+    for t in threads:
+        t.start()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    try:
+        while p.poll() is None:
+            if deadline is not None and time.monotonic() > deadline:
+                p.kill()
+                p.wait()
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            got = f"{format_bytes(received[0])} received"
+            progress.update(f"{remote_status[0]} · {got}" if remote_status[0] else got)
+            time.sleep(0.05)
+        for t in threads:
+            t.join()
+    finally:
+        progress.done()
+    out = b"".join(out_chunks)
+    err = b"".join(err_lines)
+    if text:
+        return subprocess.CompletedProcess(cmd, p.returncode,
+                                           stdout=out.decode("utf-8", errors="replace"),
+                                           stderr=err.decode("utf-8", errors="replace"))
+    return subprocess.CompletedProcess(cmd, p.returncode, stdout=out, stderr=err)
+
+
+def _run_ssh(cmd, progress: str | None = None, **kw):
+    """subprocess.run for ssh: stdin from /dev/null unless input is given, and
+    the local terminal's settings restored afterwards whatever ssh did. With
+    `progress` (a label) and a terminal on stderr, shows a live status line."""
+    if "input" not in kw:
+        kw.setdefault("stdin", subprocess.DEVNULL)
+    saved = []
+    try:
+        import termios
+        for fd in (0, 1, 2):
+            try:
+                if os.isatty(fd):
+                    saved.append((fd, termios.tcgetattr(fd)))
+            except (OSError, termios.error):
+                pass
+    except ImportError:
+        termios = None
+    try:
+        if progress and progress_enabled():
+            return _run_streaming(cmd, Progress(progress), kw.get("timeout"),
+                                  input=kw.get("input"), text=bool(kw.get("text")))
+        return subprocess.run(cmd, **kw)
+    finally:
+        for fd, attrs in saved:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+            except (OSError, termios.error):
+                pass
+
+
+def _gzip_wrapped(remote_cmd: str) -> str:
+    """Compress a raw remote stream when the host has gzip (log JSON shrinks
+    several-fold); _decode_stream undoes it, and accepts uncompressed output."""
+    return (f"if command -v gzip >/dev/null 2>&1; then {{ {remote_cmd} ; }} | gzip -c; "
+            f"else {remote_cmd} ; fi")
+
+
+def _decode_stream(data) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    if data[:2] == b"\x1f\x8b":
+        import gzip
+        import zlib
+        try:
+            data = gzip.decompress(data)
+        except (OSError, EOFError, zlib.error):
+            # A stream cut short (e.g. ssh killed): keep what decompressed.
+            d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            try:
+                data = d.decompress(data)
+            except zlib.error:
+                data = b""
+    return data.decode("utf-8", errors="replace")
+
+
+def _ssh_fetch(host: str, remote_cmd: str, label: str) -> subprocess.CompletedProcess:
+    """Run a raw-stream fetch (gzip-compressed in transit); text out."""
+    r = _run_ssh([*_SSH, host, _gzip_wrapped(remote_cmd)], capture_output=True,
+                 timeout=remote_fetch_timeout(), progress=f"{host}: {label}")
+    return subprocess.CompletedProcess(r.args, r.returncode, stdout=_decode_stream(r.stdout),
+                                       stderr=_decode_stream(r.stderr))
+
+
+def remote_fetch_timeout() -> float:
+    """Seconds allowed for one remote log fetch (CCTRACK_SSH_TIMEOUT, default
+    600). A host with months of transcripts streams a lot of data."""
+    try:
+        return max(1.0, float(os.environ.get("CCTRACK_SSH_TIMEOUT", "600")))
+    except ValueError:
+        return 600.0
+
+
+def _warn_timeout(host: str, what: str) -> None:
+    print(f"  Warning: SSH to {host} timed out after {remote_fetch_timeout():.0f}s fetching "
+          f"{what}; that data is MISSING from this report. Raise CCTRACK_SSH_TIMEOUT "
+          f"(seconds) to allow longer.", file=sys.stderr)
+
 
 _STATE_END = "___CCTRACK_SANDY_STATE_END___"
 _remote_roots_cache: dict[str, list[str]] = {}
@@ -443,17 +697,20 @@ def remote_sandbox_roots(host: str) -> list[str]:
     WORKSPACE.json), filtered by _is_sandbox_name. One SSH call, cached."""
     if host in _remote_roots_cache:
         return _remote_roots_cache[host]
+    # As locally: scan sandboxes/ and only ask the (slow) sandy when it's missing.
     remote_cmd = (
-        "command -v sandy >/dev/null 2>&1 && sandy --print-state 2>/dev/null; "
-        f"echo '{_STATE_END}'; "
         'B="${SANDY_HOME:-$HOME/.sandy}/sandboxes"; '
+        '[ -d "$B" ] || { command -v sandy >/dev/null 2>&1 && '
+        'sandy --print-state </dev/null 2>/dev/null; }; '
+        f"echo '{_STATE_END}'; "
         'ls -1d "$B"/*/ 2>/dev/null; '
         f"echo '{_STATE_END}'; "
         'for d in "$B"/.*/; do [ -f "$d/WORKSPACE.json" ] && echo "$d"; done 2>/dev/null; true'
     )
-    cmd = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, remote_cmd]
+    cmd = [*_SSH, host, remote_cmd]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout or ""
+        out = _run_ssh(cmd, capture_output=True, text=True, timeout=60,
+                       progress=f"{host}: finding sandboxes").stdout or ""
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         out = ""
     if not isinstance(out, str):
@@ -498,18 +755,16 @@ def fetch_remote_jsonl(host: str) -> str:
     sandbox's claude/projects. Returns raw output."""
     dirs = " ".join(['"$HOME/.claude/projects"']
                     + [_q(f"{r}/claude/projects") for r in remote_sandbox_roots(host)])
-    cmd = [
-        "ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host,
-        f"find {dirs} -name '*.jsonl' -exec echo '___CCTRACK_FILE_SEP___' {{}} \\; -exec cat {{}} \\; 2>/dev/null"
-    ]
+    remote_cmd = (f"find {dirs} -name '*.jsonl' -exec echo '___CCTRACK_FILE_SEP___' {{}} "
+                  f"\\; -exec cat {{}} \\; 2>/dev/null")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = _ssh_fetch(host, remote_cmd, "Claude transcripts")
         if result.returncode != 0 and not result.stdout:
             print(f"  Warning: SSH to {host} failed: {result.stderr.strip()}", file=sys.stderr)
             return ""
         return result.stdout
     except subprocess.TimeoutExpired:
-        print(f"  Warning: SSH to {host} timed out", file=sys.stderr)
+        _warn_timeout(host, "Claude Code transcripts")
         return ""
     except FileNotFoundError:
         print(f"  Warning: ssh command not found", file=sys.stderr)
@@ -537,8 +792,15 @@ def _remote_chunks(raw: str, sep: str):
 def _remote_parse(host: str, raw: str, sep: str, parser, file_stats: dict | None) -> list[dict]:
     """Parse a remote stream file by file, dedup across the host's files, and
     tag each event with `host:path` as its source file."""
+    return _parse_remote_files(host, _remote_chunks(raw, sep), parser, file_stats)
+
+
+def _parse_remote_files(host: str, items, parser, file_stats: dict | None) -> list[dict]:
+    """(path, lines) per file → events, exactly as for a streamed remote host.
+    Shared by the raw stream and by _remote_collect running on the host, so
+    both paths produce the same events."""
     lists = []
-    for path, lines in _remote_chunks(raw, sep):
+    for path, lines in items:
         label = f"{host}:{path}" if path else f"(remote {host})"
         st = new_parse_stats() if file_stats is not None else None
         events = parser(lines, source=host, stats=st)
@@ -554,6 +816,13 @@ def parse_remote_events(host: str, file_stats: dict | None = None) -> list[dict]
     """Fetch and parse JSONL from a remote host via SSH.
     Dedup by API message identity across the host's files (resumed sessions).
     Events are tagged with `host` as their source."""
+    bundle = _remote_bundle_cache.get(host)
+    if bundle is not None and bundle.get("ok"):
+        if file_stats is not None:
+            file_stats.update(bundle.get("claude_stats", {}))
+        return bundle.get("claude", [])
+    if bundle is not None and bundle.get("failed"):
+        return []
     print(f"  Fetching from {host}...", file=sys.stderr)
     raw = fetch_remote_jsonl(host)
     if not raw:
@@ -584,15 +853,14 @@ def fetch_remote_hook_data(host: str) -> str:
         f"-exec echo '{BASELINE_FILE_SEP}' \\; -exec cat {{}} \\; 2>/dev/null; "
         f"true"
     )
-    cmd = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, remote_cmd]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = _ssh_fetch(host, remote_cmd, "statusline hook data")
         if result.returncode != 0 and not result.stdout:
             print(f"  Warning: SSH to {host} failed: {result.stderr.strip()}", file=sys.stderr)
             return ""
         return result.stdout
     except subprocess.TimeoutExpired:
-        print(f"  Warning: SSH to {host} timed out", file=sys.stderr)
+        _warn_timeout(host, "statusline hook data")
         return ""
     except FileNotFoundError:
         print(f"  Warning: ssh command not found", file=sys.stderr)
@@ -604,10 +872,21 @@ def parse_remote_hook_data(host: str) -> tuple[list[dict], dict, dict]:
     Returns (hook_rows, monthly_summaries, session_baselines) in the same
     shapes as parse_hook_rows, load_monthly_hook_summaries, and
     load_session_baselines."""
+    bundle = _remote_bundle_cache.get(host)
+    if bundle is not None and bundle.get("ok"):
+        return bundle.get("hook", ([], {}, {}))
+    if bundle is not None and bundle.get("failed"):
+        return [], {}, {}
     raw = fetch_remote_hook_data(host)
     if not raw:
         return [], {}, {}
+    return parse_hook_blob(raw)
 
+
+def parse_hook_blob(raw: str) -> tuple[list[dict], dict, dict]:
+    """Parse the hook-data stream (statusline lines, then monthly summaries,
+    then baselines, with file separators) — fetched raw, or built on the
+    remote host by _remote_collect."""
     # Chunk order matches the find order above: statusline, monthly, baselines.
     main_part, *baseline_chunks = raw.split(BASELINE_FILE_SEP)
     head, _, monthly_raw = main_part.partition(MONTHLY_FILE_SEP)
@@ -966,9 +1245,9 @@ _REMOTE_PATHS = ('home / ".claude" / "settings.json"',
 
 
 def _run_remote_python(host: str, program: str) -> subprocess.CompletedProcess | None:
-    cmd = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, "python3", "-"]
+    cmd = [*_SSH, host, "python3", "-"]
     try:
-        return subprocess.run(cmd, input=program, capture_output=True, text=True, timeout=30)
+        return _run_ssh(cmd, input=program, capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         print(f"SSH to {host} timed out", file=sys.stderr)
     except FileNotFoundError:
@@ -1383,7 +1662,9 @@ def parse_events(files: list[str], file_stats: dict | None = None) -> list[dict]
     `file_stats`, if given, receives {path: parse stats} (unreadable files get
     {"unreadable": True})."""
     event_lists = []
-    for path in files:
+    progress = Progress("Reading Claude transcripts")
+    for i, path in enumerate(files, 1):
+        progress.update(f"{i:,}/{len(files):,} files")
         st = new_parse_stats() if file_stats is not None else None
         try:
             with open(path, "r", errors="replace") as f:
@@ -1402,7 +1683,11 @@ def parse_events(files: list[str], file_stats: dict | None = None) -> list[dict]
                 if name.startswith("agent-") and name.endswith(".jsonl"):
                     e["agent_id"] = name[len("agent-"):-len(".jsonl")]
         event_lists.append(events)
-    return dedup_events(event_lists)
+    progress.update("removing duplicates", force=True)
+    try:
+        return dedup_events(event_lists)
+    finally:
+        progress.done()
 
 
 # ── Codex CLI logs ──────────────────────────────────────────────────────
@@ -1457,16 +1742,20 @@ def discover_codex_files(home: Path | list[Path] | None = None) -> list[str]:
     else:
         homes = [home]
     found: dict[str, str] = {}
+    progress = Progress("Finding Codex rollouts")
     for sub, h in ((sub, h) for h in homes for sub in ("sessions", "archived_sessions")):
         root = h / sub
         if not root.exists():
             continue
+        progress.update(f"{len(found):,} found")
         for f in root.rglob("rollout-*.jsonl*"):
+            progress.update(f"{len(found):,} found")
             name = f.name
             if name.endswith(".jsonl"):
                 found[str(f)] = str(f)
             elif name.endswith(".jsonl.zst"):
                 found.setdefault(str(f)[: -len(".zst")], str(f))
+    progress.done()
     return sorted(found.values())
 
 
@@ -1783,7 +2072,9 @@ def parse_codex_events(files: list[str], source: str = "local",
     where `skipped` counts .zst files that couldn't be decompressed."""
     event_lists = []
     skipped = 0
-    for path in files:
+    progress = Progress("Reading Codex rollouts")
+    for i, path in enumerate(files, 1):
+        progress.update(f"{i:,}/{len(files):,} files")
         st = new_parse_stats() if file_stats is not None else None
         if path.endswith(".zst"):
             text = _read_zstd(path)
@@ -1807,6 +2098,7 @@ def parse_codex_events(files: list[str], source: str = "local",
         for e in events:
             _tag_event_file(e, path)
         event_lists.append(events)
+    progress.done()
     return dedup_events(event_lists), skipped
 
 
@@ -1825,19 +2117,233 @@ def fetch_remote_codex(host: str) -> str:
         f'find {dirs} -name "rollout-*.jsonl.zst" '
         f"-exec echo '{REMOTE_CODEX_SEP}' {{}} \\; -exec zstd -dc {{}} \\; 2>/dev/null; fi; true"
     )
-    cmd = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, remote_cmd]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = _ssh_fetch(host, remote_cmd, "Codex rollouts")
         return result.stdout or ""
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except subprocess.TimeoutExpired:
+        _warn_timeout(host, "Codex rollouts")
+        return ""
+    except FileNotFoundError:
         return ""
 
 
 def parse_remote_codex_events(host: str, file_stats: dict | None = None) -> list[dict]:
+    bundle = _remote_bundle_cache.get(host)
+    if bundle is not None and bundle.get("ok"):
+        if file_stats is not None:
+            file_stats.update(bundle.get("codex_stats", {}))
+        return bundle.get("codex", [])
+    if bundle is not None and bundle.get("failed"):
+        return []
     raw = fetch_remote_codex(host)
     if not raw:
         return []
     return _remote_parse(host, raw, REMOTE_CODEX_SEP, parse_codex_lines, file_stats)
+
+
+# ── Remote parsing ──────────────────────────────────────────────────────
+#
+# Streaming a host's raw logs moves gigabytes of conversation content that is
+# thrown away on arrival. Instead cctrack sends its own source to the host
+# (`ssh host python3 -`), parses there with exactly the per-file code a raw
+# stream would get (_parse_remote_files, parse_hook_blob), and ships back the
+# usage events, parse stats and hook rows: zlib-compressed, tagged JSON (see
+# _tag_json) so tuples, datetimes and non-string keys round-trip exactly. The
+# collector is read-only on the host (no hook rollup). Hosts without Python
+# 3.10+ fall back to the raw (gzip-compressed) stream. CCTRACK_REMOTE_PARSE=0
+# forces the raw stream.
+
+REMOTE_PROTOCOL = b"CCTRACK_REMOTE_V1\n"
+REMOTE_UNSUPPORTED = "CCTRACK_REMOTE_UNSUPPORTED"
+REMOTE_PROGRESS = "CCTRACK_PROGRESS "
+_remote_bundle_cache: dict[str, dict] = {}
+_remote_progress_lines = False  # set on the remote host: Progress → stderr lines
+
+
+def _tag_json(o):
+    """JSON-safe form of parser output that _untag_json restores exactly."""
+    if isinstance(o, dict):
+        if all(isinstance(k, str) for k in o):
+            if "__cct" in o:
+                return {"__cct": "d", "v": [[_tag_json(k), _tag_json(v)] for k, v in o.items()]}
+            return {k: _tag_json(v) for k, v in o.items()}
+        return {"__cct": "d", "v": [[_tag_json(k), _tag_json(v)] for k, v in o.items()]}
+    if isinstance(o, tuple):
+        return {"__cct": "t", "v": [_tag_json(v) for v in o]}
+    if isinstance(o, (set, frozenset)):
+        return {"__cct": "s", "v": [_tag_json(v) for v in o]}
+    if isinstance(o, list):
+        return [_tag_json(v) for v in o]
+    if isinstance(o, datetime):
+        return {"__cct": "dt", "v": o.isoformat()}
+    return o
+
+
+def _untag_json(o):
+    if isinstance(o, list):
+        return [_untag_json(v) for v in o]
+    if isinstance(o, dict):
+        kind = o.get("__cct")
+        if kind == "t":
+            return tuple(_untag_json(v) for v in o["v"])
+        if kind == "s":
+            return {_untag_json(v) for v in o["v"]}
+        if kind == "dt":
+            return datetime.fromisoformat(o["v"])
+        if kind == "d":
+            return {_untag_json(k): _untag_json(v) for k, v in o["v"]}
+        return {k: _untag_json(v) for k, v in o.items()}
+    return o
+
+
+def _read_text_lines(path: str):
+    try:
+        with open(path, "r", errors="replace") as f:
+            return f.readlines()
+    except OSError:
+        return None
+
+
+def _remote_collect(host: str, want_claude: bool, want_codex: bool) -> dict:
+    """Runs ON the remote host. Same discovery and per-file parsing as the raw
+    stream path; returns everything the local report needs. Read-only."""
+    out: dict = {"python": sys.version.split()[0]}
+    if want_claude:
+        files = discover_files(default_dirs())
+        stats: dict = {}
+        progress = Progress("parsing Claude transcripts")
+
+        def claude_items():
+            for i, path in enumerate(files, 1):
+                progress.update(f"{i:,}/{len(files):,} files")
+                lines = _read_text_lines(path)
+                if lines is not None:
+                    yield path, lines
+        out["claude"] = _parse_remote_files(host, claude_items(), parse_lines, stats)
+        out["claude_stats"] = stats
+
+        # Hook data: the same stream fetch_remote_hook_data would cat, built
+        # from the same files in the same order, then parsed the same way.
+        hook_dirs = discover_hook_data_dirs()
+        parts: list[str] = []
+        for pattern, sep in (("statusline*.jsonl", HOOK_FILE_SEP),
+                             ("monthly-*.json", MONTHLY_FILE_SEP),
+                             ("session-baselines.json", BASELINE_FILE_SEP)):
+            for d in hook_dirs:
+                for f in sorted(d.rglob(pattern)):
+                    lines = _read_text_lines(str(f))
+                    if lines is not None:
+                        parts.append(sep + "\n" + "".join(lines))
+        out["hook"] = parse_hook_blob("\n".join(parts)) if parts else ([], {}, {})
+    if want_codex:
+        files = discover_codex_files()
+        stats = {}
+        skipped = [0]
+        progress = Progress("parsing Codex rollouts")
+
+        def codex_items():
+            for i, path in enumerate(files, 1):
+                progress.update(f"{i:,}/{len(files):,} files")
+                if path.endswith(".zst"):
+                    text = _read_zstd(path)
+                    if text is None:
+                        skipped[0] += 1
+                        continue
+                    yield path, text.splitlines()
+                else:
+                    lines = _read_text_lines(path)
+                    if lines is not None:
+                        yield path, lines
+        out["codex"] = _parse_remote_files(host, codex_items(), parse_codex_lines, stats)
+        out["codex_stats"] = stats
+        out["zst_skipped"] = skipped[0]
+    return out
+
+
+def _remote_main(host: str, want_claude: bool, want_codex: bool) -> None:
+    """Entry point of the program fetch_remote_bundle sends to the host."""
+    global _remote_progress_lines
+    _remote_progress_lines = True
+    import zlib
+    data = _remote_collect(host, want_claude, want_codex)
+    payload = zlib.compress(json.dumps(_tag_json(data), separators=(",", ":")).encode(), 6)
+    sys.stdout.buffer.write(REMOTE_PROTOCOL + payload)
+    sys.stdout.flush()
+
+
+def _remote_program(host: str, want_claude: bool, want_codex: bool) -> bytes:
+    import zlib
+    src = Path(__file__).read_bytes()
+    blob = base64.b64encode(zlib.compress(src, 9)).decode()
+    return (
+        "import sys\n"
+        "if sys.version_info < (3, 10):\n"
+        f"    sys.stdout.write('{REMOTE_UNSUPPORTED} %d.%d\\n' % sys.version_info[:2])\n"
+        "    sys.exit(0)\n"
+        "import base64, types, zlib\n"
+        "mod = types.ModuleType('cctrack_remote')\n"
+        "mod.__file__ = '<cctrack>'\n"
+        f"exec(compile(zlib.decompress(base64.b64decode('{blob}')), 'cctrack', 'exec'),"
+        " mod.__dict__)\n"
+        f"mod._remote_main({host!r}, {bool(want_claude)!r}, {bool(want_codex)!r})\n"
+    ).encode()
+
+
+def fetch_remote_bundle(host: str, want_claude: bool = True, want_codex: bool = True) -> dict:
+    """Parse a host's logs on the host itself and fetch the results (cached).
+    Returns {"ok": True, ...} on success, {"failed": True} when the host is
+    unreachable or timed out (nothing more to try), or {"fallback": True}
+    when it lacks a usable Python — callers then stream raw logs."""
+    if host in _remote_bundle_cache:
+        return _remote_bundle_cache[host]
+    if os.environ.get("CCTRACK_REMOTE_PARSE", "1").strip() in ("0", "no", "false", "off"):
+        res = {"fallback": True}
+        _remote_bundle_cache[host] = res
+        return res
+    import zlib
+    print(f"  Fetching from {host} (parsing on {host})...", file=sys.stderr)
+    cmd = [*_SSH, host, "python3", "-"]
+    res: dict
+    try:
+        r = _run_ssh(cmd, input=_remote_program(host, want_claude, want_codex),
+                     capture_output=True, timeout=remote_fetch_timeout(),
+                     progress=f"{host}: parsing logs on {host}")
+    except subprocess.TimeoutExpired:
+        _warn_timeout(host, "remotely parsed logs")
+        res = {"failed": True}
+    except FileNotFoundError:
+        print("  Warning: ssh command not found", file=sys.stderr)
+        res = {"failed": True}
+    else:
+        out = r.stdout if isinstance(r.stdout, bytes) else (r.stdout or "").encode()
+        err = r.stderr.decode(errors="replace") if isinstance(r.stderr, bytes) else (r.stderr or "")
+        if out.startswith(REMOTE_PROTOCOL):
+            try:
+                data = _untag_json(json.loads(zlib.decompress(out[len(REMOTE_PROTOCOL):])))
+                res = {"ok": True, **data}
+            except (zlib.error, ValueError, TypeError, KeyError) as exc:
+                print(f"  Note: couldn't read {host}'s parsed results ({exc}); "
+                      f"streaming raw logs instead.", file=sys.stderr)
+                res = {"fallback": True}
+        elif r.returncode == 255:
+            print(f"  Warning: SSH to {host} failed: {err.strip()}", file=sys.stderr)
+            res = {"failed": True}
+        else:
+            why = out.decode(errors="replace").strip()
+            if why.startswith(REMOTE_UNSUPPORTED):
+                why = f"its python3 is {why.split()[-1]}; cctrack needs 3.10+"
+            else:
+                tail = err.strip().splitlines()[-1:] or ["python3 not available"]
+                why = tail[0]
+            print(f"  Note: couldn't parse on {host} ({why}); streaming raw logs "
+                  f"instead (slower).", file=sys.stderr)
+            res = {"fallback": True}
+    if res.get("ok") and res.get("zst_skipped"):
+        print(f"  Note: {host}: skipped {res['zst_skipped']} compressed Codex rollout(s) "
+              f"(.jsonl.zst) — install `zstd` there (or Python 3.14+) to include them.",
+              file=sys.stderr)
+    _remote_bundle_cache[host] = res
+    return res
 
 
 # ── Hook data parsing ──────────────────────────────────────────────────
@@ -3775,7 +4281,10 @@ def main():
     local_hook_rows: list[dict] = []
     local_baselines: dict = {}
     local_hook_monthly: dict[str, dict] = {}
-    for hdir in (discover_hook_data_dirs() if want_claude else []):
+    hook_dirs = discover_hook_data_dirs() if want_claude else []
+    hook_progress = Progress("Reading statusline hook data")
+    for i, hdir in enumerate(hook_dirs, 1):
+        hook_progress.update(f"{i}/{len(hook_dirs)} folders", force=True)
         rollup_old_hook_files(hdir)
         baselines = load_session_baselines(hdir)
         rows = parse_hook_rows(hdir)
@@ -3785,6 +4294,7 @@ def main():
                 local_baselines[sid] = base
         local_hook_events.extend(compute_hook_deltas(rows, baselines))
         merge_monthly_summaries(local_hook_monthly, load_monthly_hook_summaries(hdir))
+    hook_progress.done()
 
     local_hook_daily: dict = {}
     if local_hook_events or local_hook_monthly:
@@ -3828,6 +4338,9 @@ def main():
     # session's cumulative history never mixes across hosts. ──
     if args.remote:
         for host in args.remote:
+            # One ssh call parses everything on the host; the per-kind fetches
+            # below then read from it, or stream raw logs if it fell back.
+            fetch_remote_bundle(host, want_claude, want_codex)
             if want_codex:
                 _add_codex_source(host, parse_remote_codex_events(host, file_stats))
             if not want_claude:
