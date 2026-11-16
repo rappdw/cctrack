@@ -177,6 +177,7 @@ Prices per million tokens. Claude prices are from [Anthropic's pricing page](htt
 
 | Claude model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
 |---|---|---|---|---|---|
+| Fable 5.2 / Mythos 5.2 | $8.00 | $40.00 | $0.20 | $10.00 | $16.00 |
 | Fable 5.1 / Mythos 5.1 | $10.00 | $50.00 | $0.25 | $12.50 | $20.00 |
 | Fable 5 / Mythos 5 | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
 | Opus 5.5 | $4.00 | $20.00 | $0.20 | $5.00 | $8.00 |
@@ -192,12 +193,13 @@ Prices per million tokens. Claude prices are from [Anthropic's pricing page](htt
 | Haiku 3.5 | $0.80 | $4.00 | $0.08 | $1.00 | $1.60 |
 | Haiku 3 | $0.25 | $1.25 | $0.03 | $0.30 | $0.50 |
 
-OpenAI prices (for Codex) are from [OpenAI's pricing page](https://developers.openai.com/api/docs/pricing), Standard tier. OpenAI has a single cache-write price, listed only for some models; elsewhere cache writes bill as ordinary input.
+OpenAI prices (for Codex) are from [OpenAI's pricing page](https://developers.openai.com/api/docs/pricing), Standard tier, last checked 2026-11-16. Cache writes are priced at OpenAI's 30-minute rate, shown below. OpenAI also sells 12-hour writes at 2×, but Codex logs don't record which one was used. Where no cache-write price is listed, cache writes bill as ordinary input. Some ids Codex logs aren't on OpenAI's price list at all, such as `codex-auto-review` and `gpt-daybreak-blue-latest`. Those stay flagged `?` and are estimated at GPT-5 rates.
 
 | OpenAI model | Input | Cached input | Output | Cache write | Over 272K input |
 |---|---|---|---|---|---|
 | gpt-6-astra | $10.00 | $1.00 | $50.00 | $12.50 | $20 / $2 / $75 / $25 |
 | gpt-6.1-sol | $2.00 | $0.10 | $10.00 | $2.50 | $4 / $0.20 / $15 / $5 |
+| gpt-6.1-terra | $1.00 | $0.05 | $5.00 | $1.25 | $2 / $0.10 / $7.50 / $2.50 |
 | gpt-6-sol | $2.00 | $0.20 | $10.00 | $2.50 | $4 / $0.40 / $15 / $5 |
 | gpt-6-luna | $0.10 | $0.01 | $0.50 | $0.125 | $0.20 / $0.02 / $0.75 / $0.25 |
 | gpt-5.6-sol | $4.00 | $0.40 | $20.00 | $5.00 | $8 / $0.80 / $30 / $10 |

@@ -196,6 +196,29 @@ def test_new_minor_versions_never_inherit_a_price():
     assert cctrack.get_rates("claude-opus-4-20250514")["family"] == "claude-opus-4"
 
 
+def test_fable_5_2_and_gpt_6_1_terra_rows():
+    """Official prices, 2026-11-16 (Anthropic and OpenAI pricing pages)."""
+    for m in ("claude-fable-5-2", "claude-mythos-5-2"):
+        r = cctrack.get_rates(m)
+        assert r["family"] == m and cctrack.is_known_model(m)
+        assert (r["input"], r["cache_write"], r["cache_write_1h"], r["cache_read"], r["output"]) \
+            == (8.0, 10.0, 16.0, 0.20, 40.0)
+        assert "long_context" not in r
+        fast = cctrack.get_rates(m, service_tier="fast")
+        assert (fast["input"], fast["output"]) == (16.0, 80.0)
+    # Fable 5.2 must not fall back to Sonnet, nor 5.1's or 5's prices.
+    assert cctrack.get_rates("claude-fable-5-1")["input"] == 10.0
+    t = cctrack.get_rates("gpt-6.1-terra")
+    assert (t["input"], t["cache_read"], t["output"], t["cache_write"]) == (1.0, 0.05, 5.0, 1.25)
+    lc = cctrack.get_rates("gpt-6.1-terra", request_input=300_000)
+    assert (lc["input"], lc["cache_read"], lc["output"], lc["cache_write"]) == (2.0, 0.10, 7.5, 2.5)
+    assert cctrack.get_rates("gpt-6.1-terra", service_tier="fast")["output"] == 10.0
+    assert cctrack.get_rates("gpt-6.1-terra", service_tier="flex")["output"] == 2.5
+    # Not on OpenAI's price list: stay flagged rather than guessed.
+    assert not cctrack.is_known_model("codex-auto-review")
+    assert not cctrack.is_known_model("gpt-daybreak-blue-latest")
+
+
 def test_haiku_5_5_prompt_length_tier():
     """Haiku 5.5 requests whose prompt (input + cache reads + writes) exceeds
     100K tokens bill at the higher tier."""

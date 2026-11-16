@@ -52,7 +52,7 @@ def _oa(family, tier, inp, cached, out, cache_write=None, lc=None):
 # "intro" is a time-limited launch price applying to usage on/before "until".
 # "long_context" rates apply to a whole request whose prompt (input + cache
 # reads + cache writes) exceeds "over".
-# Source: https://platform.claude.com/docs/en/about-claude/pricing (2026-10-12).
+# Source: https://platform.claude.com/docs/en/about-claude/pricing (2026-11-16).
 def _an(family, tier, inp, cw5, cw1h, read, out, lc=None):
     """Build an Anthropic rate-card row."""
     row = {"family": family, "tier": tier, "provider": "anthropic", "input": inp,
@@ -66,6 +66,8 @@ def _an(family, tier, inp, cw5, cw1h, read, out, lc=None):
 
 
 RATES = [
+    _an("claude-fable-5-2",      "frontier",  8.00, 10.00, 16.00, 0.20,  40.00),
+    _an("claude-mythos-5-2",     "frontier",  8.00, 10.00, 16.00, 0.20,  40.00),
     _an("claude-fable-5-1",      "frontier", 10.00, 12.50, 20.00, 0.25,  50.00),
     _an("claude-mythos-5-1",     "frontier", 10.00, 12.50, 20.00, 0.25,  50.00),
     _an("claude-fable-5",        "frontier", 10.00, 12.50, 20.00, 1.00,  50.00),
@@ -98,8 +100,11 @@ RATES = [
     _an("claude-haiku-3",        "haiku",     0.25,  0.30,  0.50, 0.03,   1.25),
 ] + [
     # ── OpenAI (Codex CLI). Source: https://developers.openai.com/api/docs/pricing
-    # (Standard tier, fetched 2026-10-12). OpenAI has one cache-write tier, so
-    # cache_write == cache_write_1h. Where the price list shows no cache-write
+    # (Standard tier, fetched 2026-10-12; re-checked 2026-11-16). OpenAI lists
+    # 30-minute and 12-hour cache writes, but Codex logs a single
+    # cache_write_input_tokens count with no TTL, so writes are priced at the
+    # 30-minute rate and cache_write == cache_write_1h (12h writes, at 2x, would
+    # be under-priced). Where the price list shows no cache-write
     # price, cache writes are ordinary input and bill at the input rate; where it
     # shows no cached-input price (the -pro models), cached tokens bill at input.
     # "long_context" rates apply to a whole request whose input exceeds "over".
@@ -108,6 +113,7 @@ RATES = [
     # "tier" is a price-class proxy for the energy model only.
     _oa("gpt-6-astra",   "frontier", 10.00, 1.00,  50.00, 12.50, lc=(20.00, 2.00, 75.00, 25.00)),
     _oa("gpt-6.1-sol",   "sonnet",    2.00, 0.10,  10.00,  2.50, lc=(4.00, 0.20, 15.00, 5.00)),
+    _oa("gpt-6.1-terra", "sonnet",    1.00, 0.05,   5.00,  1.25, lc=(2.00, 0.10,  7.50, 2.50)),
     _oa("gpt-6-sol",     "sonnet",    2.00, 0.20,  10.00,  2.50, lc=(4.00, 0.40, 15.00, 5.00)),
     _oa("gpt-6-luna",    "haiku",     0.10, 0.01,   0.50,  0.125, lc=(0.20, 0.02, 0.75, 0.25)),
     _oa("gpt-5.6-sol",   "opus",      4.00, 0.40,  20.00,  5.00, lc=(8.00, 0.80, 30.00, 10.00)),
@@ -141,13 +147,14 @@ MODEL_ALIASES = {
 FAST_MULTIPLIERS = {
     "claude-opus-4-6": 6.0, "claude-opus-4-7": 6.0,
     "claude-opus-4-8": 2.0, "claude-opus-5": 2.0, "claude-opus-5-5": 2.0,
+    "claude-fable-5-2": 2.0, "claude-mythos-5-2": 2.0,
     "gpt-5.5": 2.5,
     **dict.fromkeys(("gpt-5.3-codex", "gpt-5.4", "gpt-5.6-sol", "gpt-5.6-terra",
-                     "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol",
+                     "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra",
                      "gpt-6-luna"), 2.0),
 }
 FLEX_MODELS = {
-    "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna",
+    "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna",
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.5-pro",
     "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro",
     "gpt-5.2", "gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-5-nano",
@@ -3446,7 +3453,7 @@ def print_explore(events: list[dict], date_str: str,
 
 SCHEMA_VERSION = 1
 # Date the rate card was last verified against both providers' price pages.
-RATE_CARD_VERSION = "2026-10-17"
+RATE_CARD_VERSION = "2026-11-16"
 RATE_CARD_SOURCES = {
     "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
     "openai": "https://developers.openai.com/api/docs/pricing",
