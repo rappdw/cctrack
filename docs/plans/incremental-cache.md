@@ -13,7 +13,7 @@ The `/step` loop reads this table for dependencies and progress, and sets a row 
 | 2 | One per-file parse seam (refactor only) | 0 | done |
 | 3 | Cache store, standalone | 2 | done |
 | 4 | Local transcripts and rollouts through the cache | 1, 3 | done |
-| 5 | Local hook data | 4 | todo |
+| 5 | Local hook data | 4 | skipped (F10: hook read 3.3% of a run, under the 5% gate; local hook caching moved into Step 6 by Dan, 2026-11-20) |
 | 6 | Remote protocol v2 | 5 | todo |
 | 7 | Documentation and release readiness | 6 | todo |
 | 8 | Resume inside a growing Claude transcript (optional, gated) | 7 | todo |
@@ -252,6 +252,10 @@ Skip this step if Step 0 timings show hook reading is under 5% of a run.
 ### Step 6. Remote protocol v2
 
 Section 4.6. `REMOTE_PROTOCOL` becomes v2. Covers Claude transcripts, Codex rollouts and hook files on the remote host.
+
+**Also local hook files (moved here from Step 5, Dan's decision, 2026-11-20).** Step 5 was skipped, but its local half is included here because this step builds per-file hook entries anyway: cache each local `statusline-*.jsonl` file's rows (kind `hook`, host `local`) as Step 5's brief described, with `rollup_old_hook_files` still run first and monthly and baseline files always read. `docs/plans/steps/05-local-hook-data.md` holds the measurements and the proof that per-file sorted rows, joined in file order and stable-sorted again, equal today's single sort. It also lists how the remote hook read differs from the local one: no rollup, recursive glob, legacy file in sorted position, a single sort across folders, `splitlines()`. Remote hook entries must reproduce the remote's behaviour and local entries the local behaviour, exactly.
+
+Accept (local hooks): hook totals, `hook_cost_usd` fields and `--coverage` hook findings identical cached and uncached; a file removed by rollup leaves no effect; only today's hook file is opened on a warm local run.
 
 Accept:
 - `tests/test_remote_parse.py` extended: remote-parse results still equal the raw stream; with a warm cache the results are still equal.
