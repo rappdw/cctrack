@@ -9,7 +9,7 @@ The `/step` loop reads this table for dependencies and progress, and sets a row 
 | Step | Title | Depends on | Status |
 |---|---|---|---|
 | 0 | Measurement and the equivalence harness | — | done |
-| 1 | Make pricing cheap | 0 | todo |
+| 1 | Make pricing cheap | 0 | done |
 | 2 | One per-file parse seam (refactor only) | 0 | todo |
 | 3 | Cache store, standalone | 2 | todo |
 | 4 | Local transcripts and rollouts through the cache | 1, 3 | todo |

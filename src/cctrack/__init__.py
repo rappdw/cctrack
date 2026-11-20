@@ -217,12 +217,33 @@ def _is_openai_model(model: str) -> bool:
     return model.startswith(("gpt-", "codex", "o1", "o3", "o4"))
 
 
-def _find_rate_row(model: str) -> dict | None:
+def _find_rate_row_uncached(model: str) -> dict | None:
     model = _canonical_model(model)
     for r in sorted(RATES, key=lambda r: len(r["family"]), reverse=True):
         if _family_matches(model, r["family"]):
             return r
     return None
+
+
+# Memo of _find_rate_row per model string. It rebuilds itself when RATES or
+# MODEL_ALIASES is replaced by another object or changes length (tests patch
+# them). The key holds strong refs so a freed object's id can't be reused.
+_rate_row_memo: dict = {}
+_rate_row_memo_key: tuple | None = None
+
+
+def _find_rate_row(model: str) -> dict | None:
+    global _rate_row_memo, _rate_row_memo_key
+    key = _rate_row_memo_key
+    if (key is None or key[0] is not RATES or key[1] != len(RATES)
+            or key[2] is not MODEL_ALIASES or key[3] != len(MODEL_ALIASES)):
+        _rate_row_memo = {}
+        _rate_row_memo_key = (RATES, len(RATES), MODEL_ALIASES, len(MODEL_ALIASES))
+    try:
+        return _rate_row_memo[model]
+    except KeyError:
+        row = _rate_row_memo[model] = _find_rate_row_uncached(model)
+        return row
 
 
 def get_rates(model: str, date_str: str | None = None,
@@ -325,11 +346,12 @@ def get_energy_rates(model: str) -> dict:
 
 
 def estimate_energy_wh(model: str, input_t: int, output_t: int, cache_read: int,
-                       cache_write: int, cache_write_1h: int = 0) -> float:
+                       cache_write: int, cache_write_1h: int = 0,
+                       scale: float | None = None) -> float:
     """Estimated inference energy in watt-hours. See ENERGY_WH_PER_MTOK —
     this is an order-of-magnitude estimate, not a measurement."""
     e = get_energy_rates(model)
-    return energy_scale() * (
+    return (energy_scale() if scale is None else scale) * (
         input_t / 1_000_000 * e["input"]
         + output_t / 1_000_000 * e["output"]
         + cache_read / 1_000_000 * e["cache_read"]
@@ -2842,6 +2864,7 @@ def aggregate(events: list[dict]) -> tuple[dict, dict]:
     """
     daily = defaultdict(new_bucket)
     monthly = defaultdict(new_bucket)
+    scale = energy_scale()
 
     for e in events:
         ts = e["timestamp"]
@@ -2854,8 +2877,12 @@ def aggregate(events: list[dict]) -> tuple[dict, dict]:
             continue
 
         dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-        date_str = dt.strftime("%Y-%m-%d")
-        month_str = dt.strftime("%Y-%m")
+        if dt.year >= 1000:
+            date_str = f"{dt.year}-{dt.month:02d}-{dt.day:02d}"
+            month_str = date_str[:7]
+        else:  # glibc's %Y doesn't zero-pad; keep strftime's keys exactly
+            date_str = dt.strftime("%Y-%m-%d")
+            month_str = dt.strftime("%Y-%m")
 
         cache_1h = e.get("cache_write_1h", 0)
         cost = calculate_cost(e["model"], e["input"], e["output"],
@@ -2864,7 +2891,8 @@ def aggregate(events: list[dict]) -> tuple[dict, dict]:
                               request_input=e.get("_request_input"),
                               service_tier=e.get("service_tier"))
         energy = estimate_energy_wh(e["model"], e["input"], e["output"],
-                                    e["cache_read"], e["cache_write"], cache_1h)
+                                    e["cache_read"], e["cache_write"], cache_1h,
+                                    scale=scale)
         model = e.get("model", "")
 
         for bucket in (daily[date_str], monthly[month_str]):
@@ -2883,7 +2911,7 @@ def aggregate(events: list[dict]) -> tuple[dict, dict]:
 
 # ── Output ──────────────────────────────────────────────────────────────
 
-def reconcile_sources(events: list[dict], sources: list[dict]) -> list[dict]:
+def reconcile_sources(events: list[dict], sources: list[dict], timing=None) -> list[dict]:
     """Deduplicate collected usage and rebuild every report's source totals.
 
     Matching identities are billed once, with all locations retained. Hook
@@ -2894,8 +2922,12 @@ def reconcile_sources(events: list[dict], sources: list[dict]) -> list[dict]:
     grouped = defaultdict(list)
     for e in events:
         grouped[(e.get("source", "local"), e.get("agent", "claude"))].append(e)
+    if timing is not None:
+        timing.phase("aggregate")
     for src in sources:
         src["daily"], _ = aggregate(grouped[(src["name"], src.get("agent", "claude"))])
+    if timing is not None:
+        timing.phase("reconcile")
     hook_sources = [src for src in sources if "_hook_rows" in src]
     if hook_sources:
         rows, baselines = [], {}
@@ -4444,8 +4476,6 @@ def main():
         files = discover_files(dirs) if want_claude else []
         timing.phase("claude parse")
         local_events = parse_events(files, file_stats=file_stats)
-        timing.phase("aggregate")
-        local_daily, _ = aggregate(local_events)
 
         timing.phase("discovery")
         local_install = None
@@ -4490,7 +4520,7 @@ def main():
                 local_install = earliest
 
         all_events = list(local_events)
-        sources = [{"name": "local", "agent": "claude", "daily": local_daily,
+        sources = [{"name": "local", "agent": "claude", "daily": {},
                     "hook_daily": local_hook_daily, "install_date": local_install,
                     "deltas": local_hook_events, "_hook_rows": local_hook_rows,
                     "_hook_baselines": local_baselines, "_hook_monthly": local_hook_monthly}]
@@ -4501,10 +4531,8 @@ def main():
             if not events:
                 return
             all_events.extend(events)
-            timing.phase("aggregate")
-            codex_daily, _ = aggregate(events)
             sources.append({"name": name, "agent": "codex", "exact": True,
-                            "daily": codex_daily, "hook_daily": {},
+                            "daily": {}, "hook_daily": {},
                             "install_date": None, "deltas": []})
 
         if want_codex:
@@ -4536,9 +4564,6 @@ def main():
                     continue
                 remote_events = parse_remote_events(host, file_stats)
                 all_events.extend(remote_events)
-                timing.phase("aggregate")
-                remote_daily, _ = aggregate(remote_events)
-                timing.phase(rphase)
 
                 remote_hook_events, remote_monthly, remote_baselines = parse_remote_hook_data(host)
                 remote_deltas = compute_hook_deltas(remote_hook_events, remote_baselines)
@@ -4547,14 +4572,14 @@ def main():
                     remote_hook_daily = aggregate_hook_data(remote_deltas, remote_monthly)
                 remote_install = min(remote_hook_daily.keys()) if remote_hook_daily else None
 
-                sources.append({"name": host, "agent": "claude", "daily": remote_daily,
+                sources.append({"name": host, "agent": "claude", "daily": {},
                                 "hook_daily": remote_hook_daily, "install_date": remote_install,
                                 "deltas": remote_deltas, "_hook_rows": remote_hook_events,
                                 "_hook_baselines": remote_baselines, "_hook_monthly": remote_monthly})
                 _note_remote_timing(timing, host)
 
         timing.phase("reconcile")
-        all_events = reconcile_sources(all_events, sources)
+        all_events = reconcile_sources(all_events, sources, timing=timing)
 
         timing.phase("report")
         if detail_mode:
