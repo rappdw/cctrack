@@ -16,7 +16,7 @@ The `/step` loop reads this table for dependencies and progress, and sets a row 
 | 5 | Local hook data | 4 | skipped (F10: hook read 3.3% of a run, under the 5% gate; local hook caching moved into Step 6 by Dan, 2026-11-20) |
 | 6 | Remote protocol v2 | 5 | done |
 | 7 | Documentation and release readiness | 6 | done |
-| 8 | Resume inside a growing Claude transcript (optional, gated) | 7 | todo |
+| 8 | Resume inside a growing Claude transcript (optional, gated) | 7 | skipped (Dan, 2026-11-20, D3: warm run 43.8 s vs 220.7 s before, F11; grown transcripts are 59% of it, but not worth the risk now) |
 
 ## 1. How to use this plan
 
@@ -316,6 +316,7 @@ Idea: for Claude transcripts only, keep the per-line entries from before the in-
 - **D2. Invalidation on upgrade.** Recommended: any code change invalidates the cache, so the first run after each upgrade reads everything. Alternative: a hand-maintained parser version, faster after rate-card-only releases, with the risk of stale numbers if a bump is forgotten.
   **Decided by Dan, 2026-11-20:** any change to cctrack's code, the Python version or the text encoding invalidates the cache (the Step 3 code key). The first run after each of these reads everything.
 - **D3. Step 8.** Recommended: decide from the timings after Step 6.
+  **Decided by Dan, 2026-11-20:** skip Step 8 (see F11).
 
 ## 8. Risks
 
