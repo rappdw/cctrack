@@ -161,7 +161,7 @@ With `--remote`, cctrack reads each host's Claude Code transcripts, Codex rollou
 
 **Logs are parsed on the host.** Over one SSH connection, cctrack sends its own code to the host and runs it with `python3 -`. Only the usage records come back: ids, timestamps, models and token counts, compressed. Raw logs are mostly conversation content, so this cuts the transfer from gigabytes to megabytes. The host doesn't need cctrack installed, nothing on it is changed, and the results are the same as reading the raw logs. If the host has no Python 3.10+, cctrack says so and streams the raw logs instead, gzip-compressed. Set `CCTRACK_REMOTE_PARSE=0` to always stream.
 
-Each fetch may take up to 600 seconds (set `CCTRACK_SSH_TIMEOUT` to change it). If one times out, cctrack warns that the host's data is missing from the report. While it works, a status line on stderr shows each step: files found and parsed, bytes received, elapsed time. It's shown only when stderr is a terminal; `CCTRACK_NO_PROGRESS=1` turns it off.
+Each fetch may take up to 600 seconds (set `CCTRACK_SSH_TIMEOUT` to change it). If one times out, cctrack warns that the host's data is missing from the report. While it works, a status line on stderr shows each step: files found and parsed, bytes received, elapsed time. It's shown only when stderr is a terminal; `CCTRACK_NO_PROGRESS=1` turns it off. `CCTRACK_TIMING=1` prints how long each step took (and, for each `--remote` host, how long it spent reading its logs) to stderr when the run ends.
 
 ```bash
 # Aggregate this machine + DGX server + laptop

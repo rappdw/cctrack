@@ -20,6 +20,12 @@ cctrack
 # Run all tests
 python -m pytest tests/
 
+# Time a run: per-phase wall time on stderr (also per --remote host); stdout unchanged
+CCTRACK_TIMING=1 python -m cctrack
+
+# Benchmark on a synthetic corpus (add --remote for a fake host)
+python3 scripts/bench_cache.py --runs 2
+
 # Run a single test
 python -m pytest tests/test_cctrack.py::test_name
 
@@ -43,6 +49,8 @@ This is a single-module CLI tool. All logic lives in `src/cctrack/__init__.py`:
 6. **Output** (`print_report`) - Prints current month-to-date summary with projections, daily breakdown, and previous month summaries. Cost is composed **per source** (one source per machine): hook cost where a source has statusline coverage, accuracy-factor-adjusted JSONL cost otherwise, summed per date. The accuracy factor is measured per source over dates strictly after that source's hook install day; when unmeasurable, `DEFAULT_ACCURACY_FACTOR` is **1.0** — the old 1.25 "logs undercount ~20-25%" was entirely rate-card error and inflated unmeasured days 25%.
 6a. **Explore** (`print_explore`, `--explore DATE`) - Drills into one day: dollar decomposition by token class, then by model / project / session / machine. Each JSONL event carries its `project` (from `cwd`), `session_id`, `source` (host) and `git_branch` for attribution. Per-session JSONL estimate is shown against the hook's authoritative per-session cost; a >15% day-total divergence is flagged so an inflated estimate (incomplete logs, unknown model) is distinguishable from real spend.
 6b. **Detailed reports** (`run_detail_report`, `build_session_rows`, `build_bucket_rows`, `build_coverage`, `build_document`, `write_csv`; flags `--sessions --bucket --coverage --json --csv --since --until --redact --billing-mode`) - Everything UTC; `--since/--until` are a half-open window and are rejected without one of these views. Session key = (agent, host, sandbox, session id, subagent id): Claude sidechain turns (`isSidechain`, `agentId`, else the `agent-<id>.jsonl` filename) are separate rows linked to the parent sessionId; Codex threads use the record's `thread_id` (a fork's replayed records stay with the parent) and get a parent from `session_meta` (`source…parent_thread_id`, `forked_from_id`, or `session_id` ≠ `id`). Parsers fill per-file stats (`new_parse_stats`: lines, unparseable lines, records, timestamp range, compactions keyed by marker so resume replays don't double count) only when asked. Remote streams carry each file's path after the separator. Hook cost is day-granular, so it's attached only for day-aligned windows. Output is ids/paths/counts/money only; `SCHEMA_VERSION` must be bumped on any breaking field change.
+
+7. **Timing** (`timing_enabled`, `_Timing`, `_file_census`, `_note_remote_timing`) - `CCTRACK_TIMING=1` prints `[timing]` lines to **stderr only** when the run ends (also when interrupted): wall time per phase (startup, discovery, claude/codex parse, aggregate, hook read, `remote <host>`, reconcile, report), file/byte census per log kind (done after the clock stops), and for each `--remote` host its own phase breakdown (`_remote_collect(..., timing=True)` adds a `timing` key to the v1 reply; with timing off the program sent to the host is byte-identical). `tests/test_cache_equivalence.py` is the equivalence harness every cache step extends: a fixture corpus plus helpers that run `cctrack` as a subprocess in every mode x variant and compare stdout. `scripts/bench_cache.py` builds a synthetic home and times runs.
 
 Entry point: `cctrack:main` (registered in `pyproject.toml` as a console script).
 

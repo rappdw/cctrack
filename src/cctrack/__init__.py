@@ -19,6 +19,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -535,6 +536,109 @@ def progress_enabled() -> bool:
         return sys.stderr.isatty() is True
     except (AttributeError, ValueError):
         return False
+
+
+def timing_enabled() -> bool:
+    """CCTRACK_TIMING=1 prints a per-phase timing block to stderr at exit."""
+    return os.environ.get("CCTRACK_TIMING", "").strip().lower() not in ("", "0", "no", "false", "off")
+
+
+def _file_census(paths) -> list[int]:
+    """[files, bytes, files_changed_24h, bytes_changed_24h]; unreadable files skipped."""
+    n = b = rn = rb = 0
+    cutoff = time.time() - 86400
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        n += 1
+        b += st.st_size
+        if st.st_mtime >= cutoff:
+            rn += 1
+            rb += st.st_size
+    return [n, b, rn, rb]
+
+
+def _census_text(c) -> str:
+    n, b, rn, rb = c
+    return f"{n:,} files, {format_bytes(b)}; {rn:,} changed in last 24 h ({format_bytes(rb)})"
+
+
+class _Timing:
+    """Wall time per phase, printed to stderr (never stdout) when the run ends,
+    including when it is interrupted. Does nothing unless enabled."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        if not enabled:
+            return
+        self.t0 = time.perf_counter()
+        self._cur = "startup"
+        self._cur_start = self.t0
+        self.totals: dict[str, float] = {"startup": 0.0}
+        self.details: dict[str, str] = {}
+        self.subs: dict[str, list[tuple[str, float, str]]] = {}
+        self.others: dict[str, tuple[str, str]] = {}
+
+    def phase(self, name: str) -> None:
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        self.totals[self._cur] += now - self._cur_start
+        self._cur, self._cur_start = name, now
+        self.totals.setdefault(name, 0.0)
+
+    def detail(self, name: str, text: str) -> None:
+        if self.enabled:
+            self.details[name] = text
+
+    def sub(self, parent: str, name: str, secs: float, text: str = "") -> None:
+        if self.enabled:
+            self.subs.setdefault(parent, []).append((name, secs, text))
+
+    def other(self, parent: str, name: str, text: str = "") -> None:
+        """A sub-line whose time is the parent's total minus its other sub-lines."""
+        if self.enabled:
+            self.others[parent] = (name, text)
+
+    def finish(self, interrupted: bool = False, census: dict | None = None, file=None) -> None:
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        self.totals[self._cur] += now - self._cur_start
+        total = now - self.t0
+        # The census (stat calls) happens after the clock stops.
+        for phase, paths in (census or {}).items():
+            if phase in self.totals:
+                try:
+                    self.details[phase] = _census_text(_file_census(paths))
+                except Exception:
+                    pass
+        if interrupted:
+            d = self.details.get(self._cur, "")
+            self.details[self._cur] = (d + " " if d else "") + "(interrupted)"
+
+        def line(indent, name, secs, detail):
+            return (f"[timing] {indent}{name:<{30 - len(indent)}} {secs:9.3f} s"
+                    + (f"  {detail}" if detail else ""))
+
+        out = [f"[timing] # cctrack {cctrack_version()}, Python {sys.version.split()[0]}, {sys.platform}"]
+        for name, secs in self.totals.items():
+            out.append(line("", name, secs, self.details.get(name, "")))
+            subs = list(self.subs.get(name, []))
+            if name in self.others:
+                oname, otext = self.others[name]
+                subs.append((oname, max(0.0, secs - sum(x[1] for x in subs)), otext))
+            for sname, ssecs, stext in subs:
+                out.append(line("  ", sname, ssecs, stext))
+        out.append(line("", "total", total, ""))
+        f = file if file is not None else sys.stderr
+        try:
+            f.write("\n".join(out) + "\n")
+            f.flush()
+        except (OSError, ValueError):
+            pass
 
 
 def format_bytes(n: int) -> str:
@@ -2211,12 +2315,20 @@ def _read_text_lines(path: str):
         return None
 
 
-def _remote_collect(host: str, want_claude: bool, want_codex: bool) -> dict:
+def _remote_collect(host: str, want_claude: bool, want_codex: bool, timing: bool = False) -> dict:
     """Runs ON the remote host. Same discovery and per-file parsing as the raw
     stream path; returns everything the local report needs. Read-only."""
     out: dict = {"python": sys.version.split()[0]}
+    phases: dict[str, float] = {"discovery": 0.0}
+    census_paths: dict[str, list] = {}
+    t = time.perf_counter()
     if want_claude:
         files = discover_files(default_dirs())
+        if timing:
+            now = time.perf_counter()
+            phases["discovery"] += now - t
+            t = now
+            census_paths["claude parse"] = files
         stats: dict = {}
         progress = Progress("parsing Claude transcripts")
 
@@ -2228,10 +2340,19 @@ def _remote_collect(host: str, want_claude: bool, want_codex: bool) -> dict:
                     yield path, lines
         out["claude"] = _parse_remote_files(host, claude_items(), parse_lines, stats)
         out["claude_stats"] = stats
+        if timing:
+            now = time.perf_counter()
+            phases["claude parse"] = now - t
+            t = now
 
         # Hook data: the same stream fetch_remote_hook_data would cat, built
         # from the same files in the same order, then parsed the same way.
         hook_dirs = discover_hook_data_dirs()
+        if timing:
+            now = time.perf_counter()
+            phases["discovery"] += now - t
+            t = now
+            census_paths["hook read"] = [f for d in hook_dirs for f in d.rglob("statusline*.jsonl")]
         parts: list[str] = []
         for pattern, sep in (("statusline*.jsonl", HOOK_FILE_SEP),
                              ("monthly-*.json", MONTHLY_FILE_SEP),
@@ -2242,8 +2363,17 @@ def _remote_collect(host: str, want_claude: bool, want_codex: bool) -> dict:
                     if lines is not None:
                         parts.append(sep + "\n" + "".join(lines))
         out["hook"] = parse_hook_blob("\n".join(parts)) if parts else ([], {}, {})
+        if timing:
+            now = time.perf_counter()
+            phases["hook read"] = now - t
+            t = now
     if want_codex:
         files = discover_codex_files()
+        if timing:
+            now = time.perf_counter()
+            phases["discovery"] += now - t
+            t = now
+            census_paths["codex parse"] = files
         stats = {}
         skipped = [0]
         progress = Progress("parsing Codex rollouts")
@@ -2264,21 +2394,26 @@ def _remote_collect(host: str, want_claude: bool, want_codex: bool) -> dict:
         out["codex"] = _parse_remote_files(host, codex_items(), parse_codex_lines, stats)
         out["codex_stats"] = stats
         out["zst_skipped"] = skipped[0]
+        if timing:
+            phases["codex parse"] = time.perf_counter() - t
+    if timing:
+        out["timing"] = {"phases": phases,
+                         "census": {k: _file_census(v) for k, v in census_paths.items()}}
     return out
 
 
-def _remote_main(host: str, want_claude: bool, want_codex: bool) -> None:
+def _remote_main(host: str, want_claude: bool, want_codex: bool, timing: bool = False) -> None:
     """Entry point of the program fetch_remote_bundle sends to the host."""
     global _remote_progress_lines
     _remote_progress_lines = True
     import zlib
-    data = _remote_collect(host, want_claude, want_codex)
+    data = _remote_collect(host, want_claude, want_codex, timing)
     payload = zlib.compress(json.dumps(_tag_json(data), separators=(",", ":")).encode(), 6)
     sys.stdout.buffer.write(REMOTE_PROTOCOL + payload)
     sys.stdout.flush()
 
 
-def _remote_program(host: str, want_claude: bool, want_codex: bool) -> bytes:
+def _remote_program(host: str, want_claude: bool, want_codex: bool, timing: bool = False) -> bytes:
     import zlib
     src = Path(__file__).read_bytes()
     blob = base64.b64encode(zlib.compress(src, 9)).decode()
@@ -2292,7 +2427,8 @@ def _remote_program(host: str, want_claude: bool, want_codex: bool) -> bytes:
         "mod.__file__ = '<cctrack>'\n"
         f"exec(compile(zlib.decompress(base64.b64decode('{blob}')), 'cctrack', 'exec'),"
         " mod.__dict__)\n"
-        f"mod._remote_main({host!r}, {bool(want_claude)!r}, {bool(want_codex)!r})\n"
+        f"mod._remote_main({host!r}, {bool(want_claude)!r}, {bool(want_codex)!r}"
+        f"{', timing=True' if timing else ''})\n"
     ).encode()
 
 
@@ -2312,7 +2448,8 @@ def fetch_remote_bundle(host: str, want_claude: bool = True, want_codex: bool = 
     cmd = [*_SSH, host, "python3", "-"]
     res: dict
     try:
-        r = _run_ssh(cmd, input=_remote_program(host, want_claude, want_codex),
+        r = _run_ssh(cmd, input=_remote_program(host, want_claude, want_codex,
+                                              timing=timing_enabled()),
                      capture_output=True, timeout=remote_fetch_timeout(),
                      progress=f"{host}: parsing logs on {host}")
     except subprocess.TimeoutExpired:
@@ -2327,7 +2464,7 @@ def fetch_remote_bundle(host: str, want_claude: bool = True, want_codex: bool = 
         if out.startswith(REMOTE_PROTOCOL):
             try:
                 data = _untag_json(json.loads(zlib.decompress(out[len(REMOTE_PROTOCOL):])))
-                res = {"ok": True, **data}
+                res = {"ok": True, **data, "_wire_bytes": len(out)}
             except (zlib.error, ValueError, TypeError, KeyError) as exc:
                 print(f"  Note: couldn't read {host}'s parsed results ({exc}); "
                       f"streaming raw logs instead.", file=sys.stderr)
@@ -4166,7 +4303,28 @@ def resolve_date(token: str) -> str:
     return token.strip()
 
 
+def _note_remote_timing(timing: "_Timing", host: str) -> None:
+    """Fill the `remote <host>` timing line from the fetched bundle."""
+    if not timing.enabled:
+        return
+    phase = f"remote {host}"
+    b = _remote_bundle_cache.get(host) or {}
+    if b.get("ok"):
+        timing.detail(phase, f"{format_bytes(b.get('_wire_bytes', 0))} received")
+        if phase not in timing.subs and b.get("timing"):
+            census = b["timing"].get("census", {})
+            for name, secs in b["timing"]["phases"].items():
+                timing.sub(phase, f"on {host}: {name}", secs,
+                           _census_text(census[name]) if name in census else "")
+            timing.other(phase, f"on {host}: other", "ssh, encode, transfer, local decode")
+    elif b.get("fallback"):
+        timing.detail(phase, "raw stream")
+    elif b.get("failed"):
+        timing.detail(phase, "failed")
+
+
 def main():
+    timing = _Timing(timing_enabled())
     parser = argparse.ArgumentParser(
         description="Claude Code cost reporter — scans JSONL logs and reports token usage + cost"
     )
@@ -4269,143 +4427,180 @@ def main():
             uninstall_hook()
         return
 
-    # ── Local source: JSONL events + hook data ──
-    dirs = args.dirs if args.dirs else default_dirs()
-    files = discover_files(dirs) if want_claude else []
-    local_events = parse_events(files, file_stats=file_stats)
-    local_daily, _ = aggregate(local_events)
-
-    local_install = None
-    config = read_hook_config()
-    if config and "installed_at" in config:
+    files: list = []
+    codex_files: list = []
+    hook_dirs: list = []
+    unwinding = False
+    def _census():
         try:
-            dt = datetime.fromisoformat(config["installed_at"].replace("Z", "+00:00"))
-            local_install = dt.strftime("%Y-%m-%d")
-        except (ValueError, AttributeError):
-            pass
+            hook_files = [f for d in hook_dirs for f in d.rglob("statusline*.jsonl")]
+        except OSError:
+            hook_files = []
+        return {"claude parse": files, "codex parse": codex_files, "hook read": hook_files}
+    try:
+        # ── Local source: JSONL events + hook data ──
+        timing.phase("discovery")
+        dirs = args.dirs if args.dirs else default_dirs()
+        files = discover_files(dirs) if want_claude else []
+        timing.phase("claude parse")
+        local_events = parse_events(files, file_stats=file_stats)
+        timing.phase("aggregate")
+        local_daily, _ = aggregate(local_events)
 
-    local_hook_events: list[dict] = []
-    local_hook_rows: list[dict] = []
-    local_baselines: dict = {}
-    local_hook_monthly: dict[str, dict] = {}
-    hook_dirs = discover_hook_data_dirs() if want_claude else []
-    hook_progress = Progress("Reading statusline hook data")
-    for i, hdir in enumerate(hook_dirs, 1):
-        hook_progress.update(f"{i}/{len(hook_dirs)} folders", force=True)
-        rollup_old_hook_files(hdir)
-        baselines = load_session_baselines(hdir)
-        rows = parse_hook_rows(hdir)
-        local_hook_rows.extend(rows)
-        for sid, base in baselines.items():
-            if sid not in local_baselines or base.get("date", "") < local_baselines[sid].get("date", ""):
-                local_baselines[sid] = base
-        local_hook_events.extend(compute_hook_deltas(rows, baselines))
-        merge_monthly_summaries(local_hook_monthly, load_monthly_hook_summaries(hdir))
-    hook_progress.done()
+        timing.phase("discovery")
+        local_install = None
+        config = read_hook_config()
+        if config and "installed_at" in config:
+            try:
+                dt = datetime.fromisoformat(config["installed_at"].replace("Z", "+00:00"))
+                local_install = dt.strftime("%Y-%m-%d")
+            except (ValueError, AttributeError):
+                pass
 
-    local_hook_daily: dict = {}
-    if local_hook_events or local_hook_monthly:
-        local_hook_daily = aggregate_hook_data(local_hook_events, local_hook_monthly)
+        local_hook_events: list[dict] = []
+        local_hook_rows: list[dict] = []
+        local_baselines: dict = {}
+        local_hook_monthly: dict[str, dict] = {}
+        hook_dirs = discover_hook_data_dirs() if want_claude else []
+        timing.phase("hook read")
+        hook_progress = Progress("Reading statusline hook data")
+        for i, hdir in enumerate(hook_dirs, 1):
+            hook_progress.update(f"{i}/{len(hook_dirs)} folders", force=True)
+            rollup_old_hook_files(hdir)
+            baselines = load_session_baselines(hdir)
+            rows = parse_hook_rows(hdir)
+            local_hook_rows.extend(rows)
+            for sid, base in baselines.items():
+                if sid not in local_baselines or base.get("date", "") < local_baselines[sid].get("date", ""):
+                    local_baselines[sid] = base
+            local_hook_events.extend(compute_hook_deltas(rows, baselines))
+            merge_monthly_summaries(local_hook_monthly, load_monthly_hook_summaries(hdir))
+        hook_progress.done()
 
-    # Hook coverage may start earlier than the configured install date
-    # (e.g. data restored from another machine); the earliest observed hook
-    # date is the effective install date for this source.
-    if local_hook_daily:
-        earliest = min(local_hook_daily.keys())
-        if local_install is None or earliest < local_install:
-            local_install = earliest
+        local_hook_daily: dict = {}
+        if local_hook_events or local_hook_monthly:
+            local_hook_daily = aggregate_hook_data(local_hook_events, local_hook_monthly)
 
-    all_events = list(local_events)
-    sources = [{"name": "local", "agent": "claude", "daily": local_daily,
-                "hook_daily": local_hook_daily, "install_date": local_install,
-                "deltas": local_hook_events, "_hook_rows": local_hook_rows,
-                "_hook_baselines": local_baselines, "_hook_monthly": local_hook_monthly}]
+        # Hook coverage may start earlier than the configured install date
+        # (e.g. data restored from another machine); the earliest observed hook
+        # date is the effective install date for this source.
+        if local_hook_daily:
+            earliest = min(local_hook_daily.keys())
+            if local_install is None or earliest < local_install:
+                local_install = earliest
 
-    # Codex is its own source on each machine: it's priced from the per-response
-    # usage Codex logs, and must never be displaced by Claude's hook coverage.
-    def _add_codex_source(name: str, events: list[dict]) -> None:
-        if not events:
+        all_events = list(local_events)
+        sources = [{"name": "local", "agent": "claude", "daily": local_daily,
+                    "hook_daily": local_hook_daily, "install_date": local_install,
+                    "deltas": local_hook_events, "_hook_rows": local_hook_rows,
+                    "_hook_baselines": local_baselines, "_hook_monthly": local_hook_monthly}]
+
+        # Codex is its own source on each machine: it's priced from the per-response
+        # usage Codex logs, and must never be displaced by Claude's hook coverage.
+        def _add_codex_source(name: str, events: list[dict]) -> None:
+            if not events:
+                return
+            all_events.extend(events)
+            timing.phase("aggregate")
+            codex_daily, _ = aggregate(events)
+            sources.append({"name": name, "agent": "codex", "exact": True,
+                            "daily": codex_daily, "hook_daily": {},
+                            "install_date": None, "deltas": []})
+
+        if want_codex:
+            timing.phase("discovery")
+            codex_files = discover_codex_files()
+            timing.phase("codex parse")
+            codex_events, zst_skipped = parse_codex_events(codex_files, file_stats=file_stats)
+            zst_total += zst_skipped
+            _add_codex_source("local", codex_events)
+            if zst_skipped:
+                print(f"  Note: skipped {zst_skipped} compressed Codex rollout(s) (.jsonl.zst) — "
+                      f"install `zstd` (or use Python 3.14+) to include them.", file=sys.stderr)
+
+        # ── One source per remote host. Deltas are computed per host so a
+        # session's cumulative history never mixes across hosts. ──
+        if args.remote:
+            for host in args.remote:
+                # One ssh call parses everything on the host; the per-kind fetches
+                # below then read from it, or stream raw logs if it fell back.
+                rphase = f"remote {host}"
+                timing.phase(rphase)
+                fetch_remote_bundle(host, want_claude, want_codex)
+                if want_codex:
+                    remote_codex = parse_remote_codex_events(host, file_stats)
+                    _add_codex_source(host, remote_codex)
+                    timing.phase(rphase)
+                if not want_claude:
+                    _note_remote_timing(timing, host)
+                    continue
+                remote_events = parse_remote_events(host, file_stats)
+                all_events.extend(remote_events)
+                timing.phase("aggregate")
+                remote_daily, _ = aggregate(remote_events)
+                timing.phase(rphase)
+
+                remote_hook_events, remote_monthly, remote_baselines = parse_remote_hook_data(host)
+                remote_deltas = compute_hook_deltas(remote_hook_events, remote_baselines)
+                remote_hook_daily: dict = {}
+                if remote_deltas or remote_monthly:
+                    remote_hook_daily = aggregate_hook_data(remote_deltas, remote_monthly)
+                remote_install = min(remote_hook_daily.keys()) if remote_hook_daily else None
+
+                sources.append({"name": host, "agent": "claude", "daily": remote_daily,
+                                "hook_daily": remote_hook_daily, "install_date": remote_install,
+                                "deltas": remote_deltas, "_hook_rows": remote_hook_events,
+                                "_hook_baselines": remote_baselines, "_hook_monthly": remote_monthly})
+                _note_remote_timing(timing, host)
+
+        timing.phase("reconcile")
+        all_events = reconcile_sources(all_events, sources)
+
+        timing.phase("report")
+        if detail_mode:
+            run_detail_report(args, all_events, sources, file_stats, since, until, zst_total)
             return
-        all_events.extend(events)
-        codex_daily, _ = aggregate(events)
-        sources.append({"name": name, "agent": "codex", "exact": True,
-                        "daily": codex_daily, "hook_daily": {},
-                        "install_date": None, "deltas": []})
 
-    if want_codex:
-        codex_events, zst_skipped = parse_codex_events(discover_codex_files(),
-                                                       file_stats=file_stats)
-        zst_total += zst_skipped
-        _add_codex_source("local", codex_events)
-        if zst_skipped:
-            print(f"  Note: skipped {zst_skipped} compressed Codex rollout(s) (.jsonl.zst) — "
-                  f"install `zstd` (or use Python 3.14+) to include them.", file=sys.stderr)
+        # Suggest hook if not installed (it only matters for Claude Code)
+        if want_claude and not is_hook_installed():
+            prompt_hook_install()
 
-    # ── One source per remote host. Deltas are computed per host so a
-    # session's cumulative history never mixes across hosts. ──
-    if args.remote:
-        for host in args.remote:
-            # One ssh call parses everything on the host; the per-kind fetches
-            # below then read from it, or stream raw logs if it fell back.
-            fetch_remote_bundle(host, want_claude, want_codex)
-            if want_codex:
-                _add_codex_source(host, parse_remote_codex_events(host, file_stats))
-            if not want_claude:
-                continue
-            remote_events = parse_remote_events(host, file_stats)
-            all_events.extend(remote_events)
-            remote_daily, _ = aggregate(remote_events)
-
-            remote_hook_events, remote_monthly, remote_baselines = parse_remote_hook_data(host)
-            remote_deltas = compute_hook_deltas(remote_hook_events, remote_baselines)
-            remote_hook_daily: dict = {}
-            if remote_deltas or remote_monthly:
-                remote_hook_daily = aggregate_hook_data(remote_deltas, remote_monthly)
-            remote_install = min(remote_hook_daily.keys()) if remote_hook_daily else None
-
-            sources.append({"name": host, "agent": "claude", "daily": remote_daily,
-                            "hook_daily": remote_hook_daily, "install_date": remote_install,
-                            "deltas": remote_deltas, "_hook_rows": remote_hook_events,
-                            "_hook_baselines": remote_baselines, "_hook_monthly": remote_monthly})
-
-    all_events = reconcile_sources(all_events, sources)
-
-    if detail_mode:
-        run_detail_report(args, all_events, sources, file_stats, since, until, zst_total)
-        return
-
-    # Suggest hook if not installed (it only matters for Claude Code)
-    if want_claude and not is_hook_installed():
-        prompt_hook_install()
-
-    # ── Explore a single day (run and exit) ──
-    if args.explore:
-        try:
-            target = resolve_date(args.explore)
-        except ValueError:
-            print(f"Invalid --explore date: {args.explore!r} "
-                  f"(use YYYY-MM-DD, 'today', or 'yesterday')", file=sys.stderr)
+        # ── Explore a single day (run and exit) ──
+        if args.explore:
+            try:
+                target = resolve_date(args.explore)
+            except ValueError:
+                print(f"Invalid --explore date: {args.explore!r} "
+                      f"(use YYYY-MM-DD, 'today', or 'yesterday')", file=sys.stderr)
+                return
+            hook_by_source: dict[str, float] = defaultdict(float)
+            hook_by_session: dict[tuple, float] = defaultdict(float)
+            for src in sources:
+                for d in src.get("deltas", []):
+                    if d["date_str"] == target:
+                        hook_by_source[src["name"]] += d["cost_usd"]
+                        hook_by_session[(src["name"], d["session_id"])] += d["cost_usd"]
+            print_explore(all_events, target,
+                          hook_by_source=dict(hook_by_source),
+                          hook_by_session=dict(hook_by_session),
+                          show_energy=args.energy,
+                          project_filter=args.project)
             return
-        hook_by_source: dict[str, float] = defaultdict(float)
-        hook_by_session: dict[tuple, float] = defaultdict(float)
-        for src in sources:
-            for d in src.get("deltas", []):
-                if d["date_str"] == target:
-                    hook_by_source[src["name"]] += d["cost_usd"]
-                    hook_by_session[(src["name"], d["session_id"])] += d["cost_usd"]
-        print_explore(all_events, target,
-                      hook_by_source=dict(hook_by_source),
-                      hook_by_session=dict(hook_by_session),
-                      show_energy=args.energy,
-                      project_filter=args.project)
-        return
 
-    # Global aggregates feed the token columns; cost is composed per source.
-    daily, monthly = aggregate(all_events)
+        # Global aggregates feed the token columns; cost is composed per source.
+        timing.phase("aggregate")
+        daily, monthly = aggregate(all_events)
 
-    print_report(daily, monthly, days=args.days, sources=sources,
-                 show_energy=args.energy)
+        timing.phase("report")
+        print_report(daily, monthly, days=args.days, sources=sources,
+                     show_energy=args.energy)
 
+    except BaseException:
+        unwinding = True
+        raise
+    finally:
+        # (a `return` inside the try skips try/else, hence the flag + finally)
+        timing.finish(interrupted=unwinding, census=_census())
 
 if __name__ == "__main__":
     main()
