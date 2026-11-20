@@ -3,6 +3,9 @@
 transcripts, Codex rollouts, statusline hook files and optionally a fake
 `--remote` host reached through a fake ssh), runs cctrack N times with
 CCTRACK_TIMING=1 and reports wall time, the phase timings and a hash of stdout.
+Run 1 is cold (the parse cache is cleared first) and later runs are warm; the built
+files are backdated (--age) so the cache will store them. `--filler-lines 6` gives
+about real logs' 48 events/MB.
 
 Stdlib only; does not import cctrack. Usage: see --help."""
 
@@ -175,13 +178,19 @@ def main() -> int:
     ap.add_argument("--dir", help="build in DIR and keep it")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--age", type=int, default=3600, metavar="SECONDS",
+                    help="backdate the built files by this many seconds so the parse cache "
+                         "stores them (default 3600; 0 = leave mtimes alone)")
+    ap.add_argument("--keep-cache", action="store_true",
+                    help="don't clear the cache before run 1 (default: run 1 is cold, "
+                         "later runs warm)")
     ap.add_argument("--json", action="store_true")
     o, extra = ap.parse_known_args()
     if extra and extra[0] == "--":
         extra = extra[1:]
 
     today = datetime.now(timezone.utc).date()
-    opts = {k: v for k, v in vars(o).items() if k not in ("dir", "runs", "json")}
+    opts = {k: v for k, v in vars(o).items() if k not in ("dir", "runs", "json", "keep_cache")}
     opts["anchor"] = today.isoformat()
     cleanup = None
     if o.dir:
@@ -212,7 +221,15 @@ def main() -> int:
             if o.remote:
                 corpus["remote"] = build_home(root / "remote-home", o, o.seed + 1, "r", today)
                 write_fake_ssh(root / "bin", root / "remote-home", o.python)
+            if o.age:
+                t = time.time_ns() - o.age * 10**9
+                for sub in ("home", "remote-home"):
+                    for f in (root / sub).rglob("*"):
+                        if f.is_file() and not f.is_symlink():
+                            os.utime(f, ns=(t, t))
             marker.write_text(json.dumps({"opts": opts, "stats": corpus}))
+        if not o.keep_cache:
+            shutil.rmtree(root / "xdg-cache", ignore_errors=True)
         env = {"HOME": str(root / "home"), "SANDY_HOME": str(root / "home" / ".sandy"),
                "PATH": f"{root / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
                "PYTHONPATH": str(REPO / "src"), "CCTRACK_TIMING": "1", "CCTRACK_NO_PROGRESS": "1",

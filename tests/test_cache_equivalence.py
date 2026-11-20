@@ -9,6 +9,8 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -167,7 +169,9 @@ def run_env(corpus: Corpus, extra: dict | None = None) -> dict:
     env = {"HOME": str(corpus.home), "SANDY_HOME": str(corpus.home / ".sandy"),
            "PATH": f"{corpus.bin_dir}{os.pathsep}{os.environ['PATH']}",
            "PYTHONPATH": str(SRC), "CCTRACK_NO_PROGRESS": "1",
-           "PYTHONIOENCODING": "utf-8", "XDG_CACHE_HOME": str(corpus.root / "xdg-cache")}
+           "PYTHONIOENCODING": "utf-8", "XDG_CACHE_HOME": str(corpus.root / "xdg-cache"),
+           # reference runs are uncached; cache tests pass CCTRACK_CACHE=1
+           "CCTRACK_CACHE": "0"}
     env.update(extra or {})
     return env
 
@@ -178,6 +182,115 @@ def run_cctrack(corpus: Corpus, argv: list, env: dict | None = None) -> subproce
                        capture_output=True, text=True, encoding="utf-8", timeout=120)
     assert r.returncode == 0, f"cctrack {argv} exited {r.returncode}:\n{r.stderr}"
     return r
+
+
+def backdate(corpus: Corpus, secs: int = 3600) -> int:
+    """Set every file under the corpus homes to one old mtime (fresh files are racy and
+    never stored). Returns that time in ns."""
+    t = time.time_ns() - secs * 10**9
+    for home in (corpus.home, corpus.remote_home):
+        for f in home.rglob("*"):
+            if f.is_file() and not f.is_symlink():
+                os.utime(f, ns=(t, t))
+    return t
+
+
+def local_log_files(corpus: Corpus, agent: str = "all") -> list:
+    """Sorted paths (relative to corpus.root) of the local transcripts and rollouts."""
+    out = []
+    for f in corpus.home.rglob("*"):
+        if not f.is_file() or not (f.name.endswith(".jsonl") or f.name.endswith(".jsonl.zst")):
+            continue
+        rel = f.relative_to(corpus.root)
+        if "cctrack" in rel.parts:
+            continue
+        if agent == "claude" and "projects" not in rel.parts:
+            continue
+        if agent == "codex" and ".codex" not in rel.parts:
+            continue
+        out.append(str(rel))
+    return sorted(out)
+
+
+LAUNCHER = r'''
+import os, sys
+log = os.environ.get("CCTRACK_TEST_OPEN_LOG")
+if log:
+    _fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    def _hook(event, args):
+        if event == "open":
+            p = args[0]
+            if isinstance(p, (str, bytes)):
+                t = os.fsdecode(p)
+                if t.endswith(".jsonl") or t.endswith(".jsonl.zst"):
+                    os.write(_fd, (t + "\n").encode("utf-8", "surrogateescape"))
+    sys.addaudithook(_hook)
+import cctrack
+mode = os.environ.get("CCTRACK_TEST_ZSTD")
+if mode == "raw":
+    def _raw(path):
+        with open(path, "rb") as fh:
+            data = fh.read()[9:]
+        out, i = [], 0
+        while i < len(data):
+            h = int.from_bytes(data[i:i + 3], "little")
+            size, last = h >> 3, h & 1
+            out.append(data[i + 3:i + 3 + size])
+            i += 3 + size
+            if last:
+                break
+        return b"".join(out).decode("utf-8")
+    cctrack._read_zstd = _raw
+    cctrack._zstd_available = lambda: True
+elif mode == "none":
+    cctrack._read_zstd = lambda p: None
+    cctrack._zstd_available = lambda: False
+sys.argv = ["cctrack", *sys.argv[1:]]
+cctrack.main()
+'''
+
+
+@dataclass
+class Launched:
+    stdout: str
+    stderr: str
+    opens: list
+
+
+def cache_db(cache_home) -> Path:
+    return Path(cache_home) / "cctrack" / "cache.sqlite3"
+
+
+def run_launched(corpus: Corpus, argv: list, env: dict | None = None, *, zstd: str = "raw",
+                 src=None, cache_home=None) -> Launched:
+    """Run cctrack through a launcher that logs every .jsonl/.jsonl.zst open."""
+    ldir = corpus.root / "launch"
+    ldir.mkdir(exist_ok=True)
+    launcher = ldir / "cctrack_launch.py"
+    if not launcher.exists() or launcher.read_text() != LAUNCHER:
+        launcher.write_text(LAUNCHER)
+    fd, log = tempfile.mkstemp(dir=ldir, suffix=".log")
+    os.close(fd)
+    full = run_env(corpus, {
+        "CCTRACK_CACHE": "1", "PYTHONPATH": str(src or SRC), "CCTRACK_TEST_ZSTD": zstd,
+        "CCTRACK_TEST_OPEN_LOG": log,
+        **({"XDG_CACHE_HOME": str(cache_home)} if cache_home else {}), **(env or {})})
+    try:
+        r = subprocess.run([corpus.python, str(launcher), *argv], cwd=corpus.root, env=full,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           encoding="utf-8", timeout=120)
+        assert r.returncode == 0, f"cctrack {argv} exited {r.returncode}:\n{r.stderr}"
+        logged = Path(log).read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+    finally:
+        os.unlink(log)
+    root = str(corpus.root) + os.sep
+    opens = []
+    for t in logged:
+        if t.startswith(root):
+            rel = t[len(root):]
+            if "cctrack" not in Path(rel).parts:
+                opens.append(rel)
+    return Launched(normalise(r.stdout), r.stderr, sorted(opens))
 
 
 def normalise(stdout: str) -> str:

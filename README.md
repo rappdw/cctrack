@@ -171,6 +171,17 @@ cctrack --remote dgx macbook-air
 cctrack --install-hook --remote dgx macbook-air
 ```
 
+## Parse cache
+
+cctrack remembers what it read from each log file, so a repeat run re-reads only the files that changed. The cache is one file, `~/.cache/cctrack/cache.sqlite3` (or under `$XDG_CACHE_HOME/cctrack`, or `$CCTRACK_CACHE_DIR`), readable only by you. It holds ids, file paths, working directories, timestamps, models and token counts, never prompt or response text, and never prices: costs are worked out fresh on every run, so a rate-card fix applies to all history. After any change to cctrack, the Python version or the text encoding, the next run reads everything again.
+
+```bash
+cctrack --rebuild-cache   # read everything and replace the cache
+cctrack --no-cache        # read everything; leave the cache alone (or CCTRACK_CACHE=0)
+```
+
+Statusline hook files and `--remote` hosts are still read in full on every run.
+
 ## Rate card
 
 Prices per million tokens. Claude prices are from [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing); cache writes are priced per TTL (5-minute and 1-hour).

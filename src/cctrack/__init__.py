@@ -602,6 +602,7 @@ class _Timing:
         self.details: dict[str, str] = {}
         self.subs: dict[str, list[tuple[str, float, str]]] = {}
         self.others: dict[str, tuple[str, str]] = {}
+        self.notes: dict[str, str] = {}
 
     def phase(self, name: str) -> None:
         if not self.enabled:
@@ -614,6 +615,11 @@ class _Timing:
     def detail(self, name: str, text: str) -> None:
         if self.enabled:
             self.details[name] = text
+
+    def note(self, name: str, text: str) -> None:
+        """Text appended to a phase's detail at finish (after the census text)."""
+        if self.enabled:
+            self.notes[name] = text
 
     def sub(self, parent: str, name: str, secs: float, text: str = "") -> None:
         if self.enabled:
@@ -637,6 +643,9 @@ class _Timing:
                     self.details[phase] = _census_text(_file_census(paths))
                 except Exception:
                     pass
+        for name, text in self.notes.items():
+            d = self.details.get(name, "")
+            self.details[name] = f"{d}; {text}" if d else text
         if interrupted:
             d = self.details.get(self._cur, "")
             self.details[self._cur] = (d + " " if d else "") + "(interrupted)"
@@ -1848,7 +1857,7 @@ def _log_kind(parser) -> str:
 # ── Parse cache ──────────────────────────────────────────────────────────
 # One SQLite file holds one entry per log file: the per-file parse result
 # ({events, stats}), valid while the file's (size, mtime_ns) and the code key match.
-# Not called by any report path yet. `sqlite3`, `marshal`, `zlib`, `hashlib`, `io`
+# main() opens it once per run for local transcripts and rollouts. `sqlite3`, `marshal`, `zlib`, `hashlib`, `io`
 # and `codecs` are imported inside the functions that need them (cache-only imports).
 
 CACHE_SCHEMA = 1                     # PRAGMA user_version
@@ -2213,18 +2222,56 @@ def _parse_log_file_cached(store: "CacheStore | None", kind: str, path: str, *,
     return r if want_stats else {"events": r["events"], "stats": None}
 
 
-def parse_events(files: list[str], file_stats: dict | None = None) -> list[dict]:
+_CACHE_OFF_VALUES = ("0", "no", "false", "off")
+
+
+def cache_mode(no_cache: bool = False, rebuild: bool = False) -> str:
+    """'off', 'rebuild' or 'on' for this run. --no-cache wins; then --rebuild-cache (a flag
+    beats the environment); then CCTRACK_CACHE, which is off when its stripped, lower-cased
+    value is one of _CACHE_OFF_VALUES; otherwise on (unset and empty included)."""
+    if no_cache:
+        return "off"
+    if rebuild:
+        return "rebuild"
+    if os.environ.get("CCTRACK_CACHE", "").strip().lower() in _CACHE_OFF_VALUES:
+        return "off"
+    return "on"
+
+
+def _cache_hits(store) -> int:
+    """store.counts["hits"], or 0 for None."""
+    return 0 if store is None else store.counts["hits"]
+
+
+def _note_cache_use(timing: "_Timing", phase: str, store, hits_before: int, n_files: int) -> None:
+    """Add 'cache: N reused, M read' to a timing phase's detail (nothing without a store)."""
+    if store is None:
+        return
+    reused = _cache_hits(store) - hits_before
+    timing.note(phase, f"cache: {reused:,} reused, {n_files - reused:,} read")
+
+
+def _files_progress(i: int, n: int, cache, hits0: int) -> str:
+    if cache is None:
+        return f"{i:,}/{n:,} files"
+    return f"{i:,}/{n:,} files, {(i - 1) - (_cache_hits(cache) - hits0):,} changed"
+
+
+def parse_events(files: list[str], file_stats: dict | None = None,
+                 cache: "CacheStore | None" = None) -> list[dict]:
     """Parse all local JSONL files. Dedup API message identities across files
     so resumed sessions aren't double counted. Each event
     is tagged with the file it came from (`_source_file`) for traceability.
     `file_stats`, if given, receives {path: parse stats} (unreadable files get
-    {"unreadable": True})."""
+    {"unreadable": True}). `cache`, if given, serves unchanged files from the parse cache."""
     event_lists = []
     progress = Progress("Reading Claude transcripts")
+    n = len(files)
+    hits0 = _cache_hits(cache)
     for i, path in enumerate(files, 1):
-        progress.update(f"{i:,}/{len(files):,} files")
-        r = _parse_log_file("claude", path, want_stats=file_stats is not None,
-                            agent_id_from_name=True)
+        progress.update(_files_progress(i, n, cache, hits0))
+        r = _parse_log_file_cached(cache, "claude", path, want_stats=file_stats is not None,
+                                   agent_id_from_name=True)
         if r is None:
             if file_stats is not None:
                 file_stats[path] = {**new_parse_stats(), "unreadable": True}
@@ -2232,6 +2279,8 @@ def parse_events(files: list[str], file_stats: dict | None = None) -> list[dict]
         if file_stats is not None:
             file_stats[path] = r["stats"]
         event_lists.append(r["events"])
+    if cache is not None:
+        progress.update(f"{n - (_cache_hits(cache) - hits0):,} changed of {n:,} files", force=True)
     progress.update("removing duplicates", force=True)
     try:
         return dedup_events(event_lists)
@@ -2615,16 +2664,20 @@ def parse_codex_lines(lines, source: str = "local", stats: dict | None = None) -
 
 
 def parse_codex_events(files: list[str], source: str = "local",
-                       file_stats: dict | None = None) -> tuple[list[dict], int]:
+                       file_stats: dict | None = None,
+                       cache: "CacheStore | None" = None) -> tuple[list[dict], int]:
     """Parse Codex rollouts. Dedups by response id across files (forked and
     resumed threads replay their parent's history). Returns (events, skipped)
     where `skipped` counts .zst files that couldn't be decompressed."""
     event_lists = []
     skipped = 0
     progress = Progress("Reading Codex rollouts")
+    n = len(files)
+    hits0 = _cache_hits(cache)
     for i, path in enumerate(files, 1):
-        progress.update(f"{i:,}/{len(files):,} files")
-        r = _parse_log_file("codex", path, source=source, want_stats=file_stats is not None)
+        progress.update(_files_progress(i, n, cache, hits0))
+        r = _parse_log_file_cached(cache, "codex", path, source=source,
+                                   want_stats=file_stats is not None)
         if r is None:
             if path.endswith(".zst"):
                 skipped += 1
@@ -2634,6 +2687,8 @@ def parse_codex_events(files: list[str], source: str = "local",
         if file_stats is not None:
             file_stats[path] = r["stats"]
         event_lists.append(r["events"])
+    if cache is not None:
+        progress.update(f"{n - (_cache_hits(cache) - hits0):,} changed of {n:,} files", force=True)
     progress.done()
     return dedup_events(event_lists), skipped
 
@@ -4800,6 +4855,13 @@ def main():
         help="Which coding agents to include (default: all found). Codex logs "
              "are read from $CODEX_HOME or ~/.codex."
     )
+    cache_opts = parser.add_mutually_exclusive_group()
+    cache_opts.add_argument(
+        "--no-cache", action="store_true",
+        help="Read every log file; don't read or write the parse cache (or set CCTRACK_CACHE=0).")
+    cache_opts.add_argument(
+        "--rebuild-cache", action="store_true",
+        help="Read every log file and replace the parse cache.")
     detail = parser.add_argument_group(
         "detailed / machine-readable reports (all UTC; ids, paths, counts and money only)")
     detail.add_argument("--since", metavar="UTC",
@@ -4862,6 +4924,7 @@ def main():
     codex_files: list = []
     hook_dirs: list = []
     unwinding = False
+    store = None
     def _census():
         try:
             hook_files = [f for d in hook_dirs for f in d.rglob("statusline*.jsonl")]
@@ -4870,11 +4933,17 @@ def main():
         return {"claude parse": files, "codex parse": codex_files, "hook read": hook_files}
     try:
         # ── Local source: JSONL events + hook data ──
+        mode = cache_mode(args.no_cache, args.rebuild_cache)
+        if mode != "off":
+            timing.phase("cache")
+            store = open_cache(rebuild=mode == "rebuild")
         timing.phase("discovery")
         dirs = args.dirs if args.dirs else default_dirs()
         files = discover_files(dirs) if want_claude else []
         timing.phase("claude parse")
-        local_events = parse_events(files, file_stats=file_stats)
+        h0 = _cache_hits(store)
+        local_events = parse_events(files, file_stats=file_stats, cache=store)
+        _note_cache_use(timing, "claude parse", store, h0, len(files))
 
         timing.phase("discovery")
         local_install = None
@@ -4938,7 +5007,10 @@ def main():
             timing.phase("discovery")
             codex_files = discover_codex_files()
             timing.phase("codex parse")
-            codex_events, zst_skipped = parse_codex_events(codex_files, file_stats=file_stats)
+            h0 = _cache_hits(store)
+            codex_events, zst_skipped = parse_codex_events(codex_files, file_stats=file_stats,
+                                                           cache=store)
+            _note_cache_use(timing, "codex parse", store, h0, len(codex_files))
             zst_total += zst_skipped
             _add_codex_source("local", codex_events)
             if zst_skipped:
@@ -5024,6 +5096,10 @@ def main():
         raise
     finally:
         # (a `return` inside the try skips try/else, hence the flag + finally)
+        if store is not None:
+            if not unwinding:
+                timing.phase("cache")     # never while unwinding: the marker stays on the phase
+            store.close()                 # never raises; flushes pending rows
         timing.finish(interrupted=unwinding, census=_census())
 
 if __name__ == "__main__":

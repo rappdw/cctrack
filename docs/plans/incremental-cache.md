@@ -12,7 +12,7 @@ The `/step` loop reads this table for dependencies and progress, and sets a row 
 | 1 | Make pricing cheap | 0 | done |
 | 2 | One per-file parse seam (refactor only) | 0 | done |
 | 3 | Cache store, standalone | 2 | done |
-| 4 | Local transcripts and rollouts through the cache | 1, 3 | todo |
+| 4 | Local transcripts and rollouts through the cache | 1, 3 | done |
 | 5 | Local hook data | 4 | todo |
 | 6 | Remote protocol v2 | 5 | todo |
 | 7 | Documentation and release readiness | 6 | todo |
@@ -154,6 +154,8 @@ Every entry records a hash of the running module's source (`Path(__file__).read_
 
 Progress text says how much was reused, for example `Reading Claude transcripts [...] 12 changed of 3,480 files`.
 
+*Step 4 addition.* `--no-cache` and `--rebuild-cache` are mutually exclusive (argparse error). A flag beats the environment: `--rebuild-cache` rebuilds even with `CCTRACK_CACHE=0`. `CCTRACK_CACHE` is off for `0`, `no`, `false` or `off` (case-insensitive, surrounding spaces ignored) and on for anything else, including unset or empty. With the cache off, cctrack never opens or creates the cache file, so the file stays byte-identical (opening it always writes: the probe and prune at open change its bytes). With `CCTRACK_TIMING=1`, a `cache` phase times opening and closing the store, and each parse phase's detail ends with `; cache: N reused, M read`.
+
 ### 4.6 Remote
 
 Protocol v2, still one SSH call, remote still read-only:
@@ -178,6 +180,8 @@ The corpus must include, at minimum: a resumed Claude session (same request in t
 Mutations between runs, each followed by a warm run compared against `--no-cache`:
 
 1. append lines to one transcript; 2. add a file; 3. delete a file; 4. replace a file's content keeping its size but changing mtime; 5. add a fork child whose parent is already cached; 6. add an rsynced copy of a cached session on the other machine; 7. change the code hash; 8. corrupt the store; 9. make the cache directory read-only; 10. truncate a file.
+
+*Step 4 finding.* Cross-file dedup mutates its inputs only in `_remove_codex_fork_replays` (a parent's `_locations` gains the suppressed child replay's location; children get `_fork_history` and `_unresolved_fork`), and those mutations are idempotent when files are **added**. So a cache that wrongly stored post-dedup events passes mutation 5 and fails only when a cached fork child is **deleted** (a mutation 3 case: the parent's stale `_locations` still names the deleted file in `--json` and `--csv sessions`). Every step that tests "serialize before dedup" must include that deletion, and should also compare each stored entry directly with a fresh per-file parse.
 
 ## 6. Steps
 
