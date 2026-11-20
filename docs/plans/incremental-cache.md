@@ -85,6 +85,29 @@ These constrain the design. Function names are stable; line numbers are not.
 
 About 80% of `aggregate` is `_find_rate_row`, called twice per event (cost and energy), each call re-scanning the rate card with regex work. `main` runs `aggregate` once per source before `reconcile_sources`, which then rebuilds every source's totals and discards the first results, and once more for the final report. So after a cache lands, pricing would dominate a warm run unless Step 1 is done.
 
+**F10. Real timings (Step 0, Dan's Mac with `--remote dgx`, 2026-11-20, cctrack 0.11.2 + Step 0, Python 3.11, total 220.7 s):**
+
+| Phase | Time | Data |
+|---|---|---|
+| discovery | 0.8 s | |
+| claude parse (Mac) | 30.6 s | 2,460 files, 5.8 GB; 71 changed in last 24 h (743.9 MB) |
+| aggregate | 21.1 s | |
+| hook read (Mac) | 1.9 s | 646 files, 96.7 MB; 15 changed in 24 h (415.6 KB) |
+| codex parse (Mac) | 22.5 s | 115 files, 2.6 GB; 0 changed in 24 h |
+| remote dgx, total | 127.3 s | 28.7 MB received |
+| — on dgx: claude parse | 59.8 s | 1,472 files, 5.3 GB; 32 changed in 24 h (**3.5 GB**) |
+| — on dgx: hook read | 5.3 s | 581 files, 101.0 MB; 19 changed in 24 h (1.6 MB) |
+| — on dgx: codex parse | 32.3 s | 94 files, 2.9 GB; 1 changed in 24 h (**2.6 GB**) |
+| — on dgx: other | 29.9 s | ssh, encode, transfer, local decode |
+| reconcile | 16.5 s | |
+| report | 0.0 s | |
+
+Readings for later steps:
+- Hook reading is 7.2 s of 220.7 s (3.3%) across both machines, under Step 5's 5% threshold.
+- Pricing and merging (aggregate 21.1 s + reconcile 16.5 s, which itself re-aggregates) are 17% of the run and are not removed by any cache: Step 1 matters.
+- Files changed within 24 h are a large share of the bytes on dgx: 3.5 GB of 5.3 GB of Claude transcripts, and one 2.6 GB Codex rollout. A per-file cache re-reads those in full, so on dgx a warm run would still parse roughly 6 GB. This is the evidence Step 8 asks for (for Claude); Codex is excluded from Step 8 as briefed, so the 2.6 GB rollout would stay a full re-read.
+- "on dgx: other" (30 s) covers encoding, transfer and local decode of 28.7 MB; Step 6's planner should check how much of it is local `_untag_json` decode.
+
 ## 4. Design
 
 ### 4.1 Unit and watermark
