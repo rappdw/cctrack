@@ -109,6 +109,27 @@ Readings for later steps:
 - "on dgx: other" (30 s) covers encoding, transfer and local decode of 28.7 MB; Step 6's planner should check how much of it is local `_untag_json` decode.
   *Step 6 finding:* a synthetic 27.7 MB reply decodes locally in 1.9–2.4 s on the planner's sandbox (zlib 0.2–0.3 s, `json.loads` 0.5–0.6 s, `_untag_json` 1.2–1.5 s) and takes 2.9 s to encode on the remote side. Real ids compress better, so estimate 2–4 s decode and 3–5 s encode for the real reply. That leaves roughly 20 s of ssh and transfer, which only the real machines can measure. Step 6 adds `on <host>: encode`, `local: decode` and `local: merge` timing sub-lines to split it.
 
+**F11. Real timings after Step 7 (Dan's Mac with `--remote dgx`, 2026-11-20, cctrack 0.12.0 at `103abfd`, Python 3.11.15):**
+
+| Phase | `--no-cache` | cold (`--rebuild-cache`) | warm (straight after) |
+|---|---|---|---|
+| claude parse (Mac) | 24.3 s | 25.2 s | 1.3 s (2,509 reused, 2 read) |
+| hook read (Mac) | 1.5 s | 1.8 s | 0.3 s (648 reused) |
+| codex parse (Mac) | 19.6 s | 19.9 s | 0.3 s (115 reused) |
+| remote dgx, total | 120.0 s, 29.2 MB | 109.5 s, 29.2 MB | 34.6 s, 9.5 MB (2,168 reused, 6 read) |
+| — on dgx: claude parse | 59.9 s | 51.7 s | **24.6 s** |
+| — on dgx: hook read | 5.3 s | 4.0 s | 0.05 s |
+| — on dgx: codex parse | 29.8 s | 28.0 s | 0.001 s |
+| — on dgx: encode | 16.8 s | 15.9 s | 5.2 s |
+| — local: decode / merge | 4.3 / 0.5 s | 4.6 / 1.6 s | 1.2 / 1.8 s |
+| — on dgx: other (ssh, transfer) | 3.3 s | 3.4 s | 1.7 s |
+| reconcile + aggregate | 6.3 s | 6.6 s | 6.6 s |
+| total | 172.4 s | 163.5 s | **43.8 s** |
+
+Against F10 (220.7 s): pricing and merging fell from 37.6 s to about 6.3 s (Step 1), and F10's 30 s "other" was mostly encoding on dgx (16.8 s), not transfer (3.3 s). For D3: in the warm run, re-reading grown Claude transcripts is (1.3 + 24.6) / 43.8 = **59%** of the run, nearly all of it on dgx (6 files that grew between runs, out of 3.7 GB changed in 24 h). The dgx Codex rollout (2.7 GB) did not change between these runs; when it does, it is re-read in full (about 28 s), which Step 8 does not address.
+
+Report check: `nocache.out` vs `warm.out` differed only in today's live figures and by a few cents in some closed months (2026-05 to 2026-09) with identical tokens. Codex totals were identical. This is the existing accuracy factor, measured over every hook-covered day including today, rescaling estimated days as today's usage changes between runs, not the cache (tokens for those months are unchanged).
+
 ## 4. Design
 
 ### 4.1 Unit and watermark
