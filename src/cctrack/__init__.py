@@ -1845,6 +1845,374 @@ def _log_kind(parser) -> str:
     raise ValueError(f"unknown log parser {parser!r}")
 
 
+# ── Parse cache ──────────────────────────────────────────────────────────
+# One SQLite file holds one entry per log file: the per-file parse result
+# ({events, stats}), valid while the file's (size, mtime_ns) and the code key match.
+# Not called by any report path yet. `sqlite3`, `marshal`, `zlib`, `hashlib`, `io`
+# and `codecs` are imported inside the functions that need them (cache-only imports).
+
+CACHE_SCHEMA = 1                     # PRAGMA user_version
+CACHE_FILENAME = "cache.sqlite3"
+CACHE_BUSY_TIMEOUT = 1.0             # seconds; tests patch it smaller
+CACHE_RACY_NS = 2_000_000_000        # 2 s: a file this fresh may still be written to
+CACHE_PRUNE_SECONDS = 30 * 86400
+CACHE_FLUSH_BYTES = 8 << 20          # flush pending rows at 8 MiB of blobs ...
+CACHE_FLUSH_SECONDS = 2.0            # ... or 2 s after the last flush
+CACHE_ZLIB_LEVEL = 1
+
+
+def cache_dir() -> Path:
+    """$CCTRACK_CACHE_DIR if set; else $XDG_CACHE_HOME/cctrack when XDG_CACHE_HOME is an
+    absolute path (the XDG spec says to ignore relative ones); else ~/.cache/cctrack."""
+    env = os.environ.get("CCTRACK_CACHE_DIR")
+    if env:
+        return Path(env).expanduser()
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg and os.path.isabs(xdg):
+        return Path(xdg) / "cctrack"
+    return Path.home() / ".cache" / "cctrack"
+
+
+def cache_code_key() -> str:
+    """Everything besides a file's bytes that decides its parse and its payload format:
+    this module's source hash, the interpreter, marshal's format version and the default
+    text encoding `open()` uses. Raises OSError if the source can't be read."""
+    import codecs
+    import hashlib
+    import io
+    import marshal
+    digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    enc = codecs.lookup(io.TextIOWrapper(io.BytesIO()).encoding).name
+    return (f"{digest} {sys.implementation.name}-{'.'.join(map(str, sys.version_info[:3]))} "
+            f"marshal{marshal.version} {enc}")
+
+
+def _cache_params(source: str, label: str, path: str, agent_id_from_name: bool) -> str:
+    """The parse parameters that change a file's events, as part of the entry's key."""
+    return json.dumps([source, None if label == path else label, bool(agent_id_from_name)])
+
+
+def _encode_cache_payload(payload: dict) -> bytes | None:
+    """{"events", "stats"} -> zlib(marshal(...)); None if marshal rejects an object.
+    The stats datetimes become ISO strings (on a shallow copy)."""
+    import marshal
+    import zlib
+    try:
+        st = payload["stats"]
+        if st is not None:
+            st = dict(st)
+            for k in ("first_ts", "last_ts"):
+                if isinstance(st.get(k), datetime):
+                    st[k] = st[k].isoformat()
+        return zlib.compress(marshal.dumps({"events": payload["events"], "stats": st}),
+                             CACHE_ZLIB_LEVEL)
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def _decode_cache_payload(blob: bytes) -> dict | None:
+    """Inverse of _encode_cache_payload. None on any error or wrong shape: zlib's
+    checksum is what turns a corrupt blob into a miss."""
+    import marshal
+    import zlib
+    try:
+        p = marshal.loads(zlib.decompress(blob))
+        if (not isinstance(p, dict) or set(p) != {"events", "stats"}
+                or not isinstance(p["events"], list)
+                or not all(isinstance(e, dict) for e in p["events"])
+                or not (p["stats"] is None or isinstance(p["stats"], dict))):
+            return None
+        st = p["stats"]
+        if st is not None:
+            for k in ("first_ts", "last_ts"):
+                if isinstance(st.get(k), str):
+                    st[k] = datetime.fromisoformat(st[k])
+        return p
+    except Exception:
+        return None
+
+
+def _file_sig(path: str) -> tuple[int, int] | None:
+    """(size, mtime_ns) of a file, None if it can't be stat'ed."""
+    try:
+        s = os.stat(path)
+    except OSError:
+        return None
+    return (s.st_size, s.st_mtime_ns)
+
+
+def _is_racy(sig: tuple[int, int], now_ns: int) -> bool:
+    """True if the mtime is within CACHE_RACY_NS of now, or in the future."""
+    return sig[1] > now_ns - CACHE_RACY_NS
+
+
+def _zstd_available() -> bool:
+    """Mirror of _read_zstd's decoder choice: stdlib zstd, else the `zstd` CLI."""
+    try:
+        from compression import zstd  # type: ignore  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    import shutil
+    return shutil.which("zstd") is not None
+
+
+def _key_text_ok(*texts: str) -> bool:
+    """True if every text encodes as strict UTF-8 (SQLite can't bind lone surrogates)."""
+    try:
+        for t in texts:
+            t.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _cache_note(msg: str) -> None:
+    print(f"cctrack: cache {msg}", file=sys.stderr)
+
+
+class _CacheCorrupt(Exception):
+    """The cache file opened but its contents are not a usable store."""
+
+
+def _cache_unlink_files(db: Path) -> None:
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        Path(str(db) + suffix).unlink(missing_ok=True)
+
+
+class CacheStore:
+    """Per-file parse cache. Rows are encoded at put() and written in short
+    BEGIN IMMEDIATE batches, so no write lock is held while files are parsed. The first
+    SQLite error disables the store for the rest of the run, with one stderr note."""
+
+    def __init__(self, con, db: Path, code_key: str, noted: bool = False):
+        self.path = db
+        self.code_key = code_key
+        self.enabled = True
+        self.counts = {"hits": 0, "misses": 0, "stored": 0, "bad": 0, "unstorable": 0}
+        self._con = con
+        self._pending: list[tuple] = []
+        self._pending_bytes = 0
+        self._touched: list[tuple] = []
+        self._last_flush = time.monotonic()
+        self._noted = noted
+        self._reset_on_close = False
+        self._closed = False
+
+    def __enter__(self) -> "CacheStore":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def _note_once(self, msg: str) -> None:
+        if not self._noted:
+            self._noted = True
+            _cache_note(msg)
+
+    def _fail(self, e: BaseException) -> None:
+        import sqlite3
+        self.enabled = False
+        if type(e) is sqlite3.DatabaseError:    # exactly: OperationalError is a subclass
+            self._reset_on_close = True
+        self._note_once(f"error ({e}); reading the remaining log files without it")
+        self._pending = []
+        self._pending_bytes = 0
+        self._touched = []
+
+    def get(self, host: str, kind: str, path: str, sig: tuple[int, int],
+            params: str = "") -> dict | None:
+        if not self.enabled:
+            return None
+        try:
+            row = self._con.execute(
+                "SELECT size, mtime_ns, code, payload FROM entries "
+                "WHERE host=? AND kind=? AND path=?", (host, kind, path)).fetchone()
+            if row is None:
+                return None
+            size, mtime_ns, code, blob = row
+            if size != sig[0] or mtime_ns != sig[1] or code != f"{self.code_key} {params}":
+                return None
+            p = _decode_cache_payload(blob)
+            if p is None:
+                self.counts["bad"] += 1
+                return None
+            self.counts["hits"] += 1
+            self._touched.append((host, kind, path))
+            return p
+        except Exception as e:
+            self._fail(e)
+            return None
+
+    def put(self, host: str, kind: str, path: str, sig: tuple[int, int], payload: dict,
+            params: str = "") -> None:
+        if not self.enabled:
+            return
+        try:
+            blob = _encode_cache_payload(payload)      # now: cross-file dedup mutates events
+            if blob is None:
+                self.counts["unstorable"] += 1
+                return
+            now = int(time.time())
+            self._pending.append((host, kind, path, sig[0], sig[1],
+                                  f"{self.code_key} {params}", blob, now, now))
+            self._pending_bytes += len(blob)
+            if (self._pending_bytes >= CACHE_FLUSH_BYTES
+                    or time.monotonic() - self._last_flush >= CACHE_FLUSH_SECONDS):
+                self.flush()
+        except Exception as e:
+            self._fail(e)
+
+    def flush(self) -> None:
+        if not self.enabled or not (self._pending or self._touched):
+            return
+        try:
+            self._con.execute("BEGIN IMMEDIATE")
+            self._con.executemany(
+                "INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?)", self._pending)
+            now = int(time.time())
+            self._con.executemany(
+                "UPDATE entries SET last_used=? WHERE host=? AND kind=? AND path=?",
+                [(now, *k) for k in self._touched])
+            self._con.execute("COMMIT")
+            self.counts["stored"] += len(self._pending)
+            self._pending = []
+            self._pending_bytes = 0
+            self._touched = []
+            self._last_flush = time.monotonic()
+        except Exception as e:
+            try:
+                self._con.execute("ROLLBACK")
+            except Exception:
+                pass
+            self._fail(e)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.flush()
+        except Exception:
+            pass
+        try:
+            self._con.close()
+        except Exception:
+            pass
+        if self._reset_on_close:
+            try:
+                _cache_unlink_files(self.path)
+            except OSError:
+                pass
+
+
+def _cache_connect(sqlite3, db: Path):
+    """Open and validate the database; raises on any problem (the caller decides)."""
+    os.close(os.open(db, os.O_RDWR | os.O_CREAT, 0o600))
+    con = sqlite3.connect(str(db), timeout=CACHE_BUSY_TIMEOUT, isolation_level=None)
+    try:
+        con.execute("PRAGMA synchronous=NORMAL")
+        try:
+            rows = con.execute("PRAGMA quick_check").fetchall()
+        except sqlite3.DatabaseError as e:
+            if type(e) is not sqlite3.DatabaseError:
+                raise
+            raise _CacheCorrupt(str(e))
+        if rows != [("ok",)]:
+            raise _CacheCorrupt("quick_check failed")
+        con.execute("BEGIN IMMEDIATE")
+        version = con.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (0, CACHE_SCHEMA):
+            raise _CacheCorrupt(f"schema version {version}")
+        if version == 0:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS entries ("
+                "host TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, "
+                "size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, code TEXT NOT NULL, "
+                "payload BLOB NOT NULL, stored_at INTEGER NOT NULL, last_used INTEGER NOT NULL, "
+                "PRIMARY KEY (host, kind, path))")
+        con.execute(f"PRAGMA user_version = {CACHE_SCHEMA}")     # the write probe
+        con.execute("DELETE FROM entries WHERE last_used < ?",
+                    (int(time.time()) - CACHE_PRUNE_SECONDS,))
+        con.execute("COMMIT")
+        return con
+    except BaseException:
+        try:
+            con.close()
+        except Exception:
+            pass
+        raise
+
+
+def open_cache(*, rebuild: bool = False) -> CacheStore | None:
+    """Open or create the cache. Any problem: one stderr note and None (read uncached)."""
+    try:
+        import sqlite3
+    except ImportError:
+        _cache_note("unavailable (sqlite3 module missing); reading all log files")
+        return None
+    try:
+        code_key = cache_code_key()
+    except OSError as e:
+        _cache_note(f"unavailable ({e}); reading all log files")
+        return None
+    d = cache_dir()
+    try:
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        db = d / CACHE_FILENAME
+        if rebuild:
+            _cache_unlink_files(db)
+    except OSError as e:
+        _cache_note(f"unavailable ({e}); reading all log files")
+        return None
+
+    def corrupt(e: BaseException) -> bool:
+        return isinstance(e, _CacheCorrupt) or type(e) is sqlite3.DatabaseError
+
+    try:
+        return CacheStore(_cache_connect(sqlite3, db), db, code_key)
+    except Exception as e:
+        first = e
+    if not corrupt(first):
+        _cache_note(f"unavailable ({db}: {first}); reading all log files")
+        return None
+    try:
+        _cache_unlink_files(db)
+        con = _cache_connect(sqlite3, db)
+    except Exception as e:
+        _cache_note(f"unavailable ({e}); reading all log files")
+        return None
+    _cache_note(f"was unreadable and has been reset ({db})")
+    return CacheStore(con, db, code_key, noted=True)
+
+
+def _parse_log_file_cached(store: "CacheStore | None", kind: str, path: str, *,
+                           host: str = "local", source: str = "local",
+                           label: str | None = None, want_stats: bool = False,
+                           agent_id_from_name: bool = False) -> dict | None:
+    """_parse_log_file with the cache in front; same return contract. A file is stored
+    only if it parsed, was not racy and did not change while it was read."""
+    lbl = path if label is None else label
+    if store is None or not store.enabled or not _key_text_ok(host, path, lbl, source):
+        return _parse_log_file(kind, path, source=source, label=label,
+                               want_stats=want_stats, agent_id_from_name=agent_id_from_name)
+    params = _cache_params(source, lbl, path, agent_id_from_name)
+    sig = _file_sig(path)
+    zst_ok = not (kind == "codex" and path.endswith(".zst")) or _zstd_available()
+    if sig is not None and zst_ok:
+        p = store.get(host, kind, path, sig, params)
+        if p is not None:
+            return {"events": p["events"], "stats": p["stats"] if want_stats else None}
+    store.counts["misses"] += 1
+    r = _parse_log_file(kind, path, source=source, label=label, want_stats=True,
+                        agent_id_from_name=agent_id_from_name)
+    if r is None:
+        return None                                   # failures are never stored
+    if sig is not None and _file_sig(path) == sig and not _is_racy(sig, time.time_ns()):
+        store.put(host, kind, path, sig, r, params)   # encodes now: dedup mutates events later
+    return r if want_stats else {"events": r["events"], "stats": None}
+
+
 def parse_events(files: list[str], file_stats: dict | None = None) -> list[dict]:
     """Parse all local JSONL files. Dedup API message identities across files
     so resumed sessions aren't double counted. Each event

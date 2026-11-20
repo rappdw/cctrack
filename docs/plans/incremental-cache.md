@@ -11,7 +11,7 @@ The `/step` loop reads this table for dependencies and progress, and sets a row 
 | 0 | Measurement and the equivalence harness | — | done |
 | 1 | Make pricing cheap | 0 | done |
 | 2 | One per-file parse seam (refactor only) | 0 | done |
-| 3 | Cache store, standalone | 2 | todo |
+| 3 | Cache store, standalone | 2 | done |
 | 4 | Local transcripts and rollouts through the cache | 1, 3 | todo |
 | 5 | Local hook data | 4 | todo |
 | 6 | Remote protocol v2 | 5 | todo |
@@ -117,7 +117,7 @@ One cache entry per log file. The watermark for a file is the `(size, mtime_ns)`
 - **Hit:** the file's current `(size, mtime_ns)` equals the stored pair, and the entry was written by the same parser code (4.3).
 - **Miss:** anything else. The file is re-parsed from the start and the entry replaced.
 - **Racy files:** if a file's mtime is within 2 s of the clock when it is parsed, or its `stat` differs before and after reading, parse it but do not store it. This is git's "racy timestamp" rule; it stops a file written during the read from being cached short. Use the clock of the machine the file is on.
-- **Failures are never cached:** unreadable files, undecodable `.zst`.
+- **Failures are never cached:** unreadable files, undecodable `.zst`. A cached `.zst` entry is used only while a zstd decoder is available, so a cached run skips exactly the files an uncached run skips. (Step 3.)
 - Inode is not part of the key (unstable on some mounts; rsync replaces inodes without changing content). A same-size, same-mtime rewrite of an append-only log is not a realistic case, and `--rebuild-cache` is the escape hatch.
 
 A byte-offset watermark inside a growing file is Step 8, optional and gated.
@@ -130,6 +130,8 @@ A byte-offset watermark inside a growing file is Step 8, optional and gated.
 
 Every entry records a hash of the running module's source (`Path(__file__).read_bytes()`). A different hash is a miss. Consequence: the first run after any cctrack upgrade is a full read. This is deliberate: a hand-bumped version number that someone forgets would silently serve stale numbers. (Decision D2.)
 
+*Step 3 addition.* The key also names what else decides a parse: the interpreter (`sys.implementation.name` and `sys.version_info[:3]`), `marshal.version` (the payload format, 4 on 3.12 and 5 on 3.14) and the default text encoding `open()` uses (`codecs.lookup(io.TextIOWrapper(io.BytesIO()).encoding).name`). The encoding matters: with `LC_ALL=C PYTHONCOERCECLOCALE=0 PYTHONUTF8=0` the same file parses `cwd` `/w/café` as `/w/caf\ufffd\ufffd`. Each entry's `code` column also carries the parse parameters (`source`, `label` when it differs from `path`, `agent_id_from_name`), so one path parsed two ways never shares an entry.
+
 ### 4.4 Store
 
 - One SQLite file, `entries(host, kind, path, size, mtime_ns, code, payload BLOB, stored_at, last_used)` with primary key `(host, kind, path)`; `host` is `local` or the `--remote` name; `kind` is `claude`, `codex` or `hook`.
@@ -138,7 +140,8 @@ Every entry records a hash of the running module's source (`Path(__file__).read_
 - Two cctrack runs at once must both produce correct reports; one may run uncached. Use a short busy timeout.
 - A corrupt or unreadable store is deleted and recreated once; if that fails, run uncached.
 - Entries not used for 30 days are pruned. Entries are only ever looked up by a path discovered in the current run, so stale entries cannot affect a report.
-- **Planner decides (Step 3):** payload encoding. Candidates: tagged JSON + zlib (existing, proven); `marshal` keyed additionally on Python version (5× faster to decode in F9, preserves tuples, but not safe against corrupt input: must be wrapped so a bad blob is a miss, never a crash). Not pickle. Choose by measuring decode time at 1M events against the Step 3 budget.
+- **Payload encoding (decided in Step 3):** `zlib.compress(marshal.dumps(payload), 1)`, with the two stats datetimes stored as ISO strings. At 1M realistic events, decode took 2.0 s against 5.3 s for tagged JSON + zlib (budget 3 s). zlib's checksum turns a corrupt blob into a miss: 20,000 random bit flips all failed to decode, while about a quarter of mutated raw marshal blobs loaded as silently different values. Any decode error or wrong shape is a miss. Not pickle.
+- Rollback journal (SQLite's default `DELETE` mode), not WAL: WAL needs a shared-memory `-shm` file, which fails on network filesystems and in read-only directories, and its advantage (readers never wait for a writer) is not needed when every write is short. Three concurrent simulated cold runs got no lock errors even with a 0.1 s busy timeout. Rows waiting to be written are held as encoded bytes and written in one short `BEGIN IMMEDIATE` transaction per batch, so no write lock is held while files are parsed. Opening runs `PRAGMA quick_check` and a write probe (`PRAGMA user_version`). The store is all or nothing for a run: the first SQLite error disables it for the rest of that run.
 
 ### 4.5 Command line
 
@@ -273,6 +276,7 @@ Idea: for Claude transcripts only, keep the per-line entries from before the in-
 
 - **D1. Unreachable remote host.** Recommended: unchanged, its data is missing and the warning says so. Alternative: use that host's last cached data and print how old it is.
 - **D2. Invalidation on upgrade.** Recommended: any code change invalidates the cache, so the first run after each upgrade reads everything. Alternative: a hand-maintained parser version, faster after rate-card-only releases, with the risk of stale numbers if a bump is forgotten.
+  **Decided by Dan, 2026-11-20:** any change to cctrack's code, the Python version or the text encoding invalidates the cache (the Step 3 code key). The first run after each of these reads everything.
 - **D3. Step 8.** Recommended: decide from the timings after Step 6.
 
 ## 8. Risks

@@ -4,6 +4,8 @@ cctrack discovers Sandy sandboxes by running `sandy --print-state` and by
 reading $SANDY_HOME. Tests must never touch a developer's real sandboxes, so by
 default the sandy probe returns "unavailable" and SANDY_HOME points at an empty
 temp dir. Tests that exercise the probe itself use the `real_sandy_probe` marker.
+Likewise CCTRACK_CACHE_DIR points at a per-test temp dir, so no test can touch a
+real parse cache.
 """
 import pytest
 
@@ -20,6 +22,7 @@ def pytest_configure(config):
 @pytest.fixture(autouse=True)
 def _isolate_sandy(request, monkeypatch, tmp_path):
     monkeypatch.setenv("SANDY_HOME", str(tmp_path / "no-sandy"))
+    monkeypatch.setenv("CCTRACK_CACHE_DIR", str(tmp_path / "cctrack-cache"))
     # main() tries remote parsing before the raw fetches; tests that mock the
     # raw fetches must never reach a real `ssh host python3 -`.
     if not request.node.get_closest_marker("real_remote_bundle"):
