@@ -1857,8 +1857,10 @@ def _log_kind(parser) -> str:
 # ── Parse cache ──────────────────────────────────────────────────────────
 # One SQLite file holds one entry per log file: the per-file parse result
 # ({events, stats}), valid while the file's (size, mtime_ns) and the code key match.
-# main() opens it once per run for local transcripts and rollouts. `sqlite3`, `marshal`, `zlib`, `hashlib`, `io`
-# and `codecs` are imported inside the functions that need them (cache-only imports).
+# main() opens it once per run. Local transcripts, rollouts and statusline files go
+# through it, and so do --remote hosts' per-file replies (protocol v2); the raw stream
+# never does. `sqlite3`, `marshal`, `zlib`, `hashlib`, `io` and `codecs` are imported
+# inside the functions that need them (cache-only imports).
 
 CACHE_SCHEMA = 1                     # PRAGMA user_version
 CACHE_FILENAME = "cache.sqlite3"
@@ -5154,6 +5156,7 @@ def _note_remote_timing(timing: "_Timing", host: str) -> None:
 def main():
     timing = _Timing(timing_enabled())
     parser = argparse.ArgumentParser(
+        prog="cctrack",
         description="Claude Code cost reporter — scans JSONL logs and reports token usage + cost"
     )
     parser.add_argument(
@@ -5197,13 +5200,19 @@ def main():
         help="Which coding agents to include (default: all found). Codex logs "
              "are read from $CODEX_HOME or ~/.codex."
     )
-    cache_opts = parser.add_mutually_exclusive_group()
+    cache_group = parser.add_argument_group(
+        "parse cache",
+        "Repeat runs re-read only the log files that changed and take the rest from the "
+        "cache: cache.sqlite3 in $CCTRACK_CACHE_DIR, else $XDG_CACHE_HOME/cctrack, else "
+        "~/.cache/cctrack. It holds parsed usage records, never prices. The first run after "
+        "any change to cctrack or Python reads everything.")
+    cache_opts = cache_group.add_mutually_exclusive_group()
     cache_opts.add_argument(
         "--no-cache", action="store_true",
         help="Read every log file; don't read or write the parse cache (or set CCTRACK_CACHE=0).")
     cache_opts.add_argument(
         "--rebuild-cache", action="store_true",
-        help="Read every log file and replace the parse cache.")
+        help="Read every log file, including on --remote hosts, and replace the parse cache.")
     detail = parser.add_argument_group(
         "detailed / machine-readable reports (all UTC; ids, paths, counts and money only)")
     detail.add_argument("--since", metavar="UTC",

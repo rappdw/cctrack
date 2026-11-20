@@ -15,7 +15,7 @@ The `/step` loop reads this table for dependencies and progress, and sets a row 
 | 4 | Local transcripts and rollouts through the cache | 1, 3 | done |
 | 5 | Local hook data | 4 | skipped (F10: hook read 3.3% of a run, under the 5% gate; local hook caching moved into Step 6 by Dan, 2026-11-20) |
 | 6 | Remote protocol v2 | 5 | done |
-| 7 | Documentation and release readiness | 6 | todo |
+| 7 | Documentation and release readiness | 6 | done |
 | 8 | Resume inside a growing Claude transcript (optional, gated) | 7 | todo |
 
 ## 1. How to use this plan

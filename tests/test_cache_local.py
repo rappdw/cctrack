@@ -110,8 +110,6 @@ def test_mutation_then_warm_matches_uncached(tmp_path, name):
     day1 = c.explore_date
     home = c.root / "xdg-cache"
     src = SRC
-    if name == "7-code-hash":
-        src = tmp_path / "src2"
     expect, notes, content = [], [], True
     all_opens = local_log_files(c)
 
@@ -161,9 +159,11 @@ def test_mutation_then_warm_matches_uncached(tmp_path, name):
             os.utime(p, ns=(t, t))
             expect = [str(p.relative_to(c.root))]
         elif name == "7-code-hash":
-            shutil.copytree(SRC, src)
-            with open(src / "cctrack" / "__init__.py", "a", encoding="utf-8") as fh:
+            src2 = tmp_path / "src2"
+            shutil.copytree(SRC, src2)
+            with open(src2 / "cctrack" / "__init__.py", "a", encoding="utf-8") as fh:
                 fh.write("\n# step 4 code-hash mutation\n")
+            src = src2
             expect, content = all_opens, False
         elif name == "8-corrupt":
             cache_db(home).write_bytes(b"garbage" * 1000)
@@ -442,6 +442,22 @@ def test_help_lists_cache_options(monkeypatch, capsys):
     assert e.value.code == 0
     out = capsys.readouterr().out
     assert "--no-cache" in out and "--rebuild-cache" in out and "CCTRACK_CACHE=0" in out
+
+
+def test_help_describes_cache(monkeypatch, capsys):
+    monkeypatch.setenv("COLUMNS", "100")
+    monkeypatch.setattr(sys, "argv", ["__main__.py", "--help"])
+    with pytest.raises(SystemExit) as e:
+        cctrack.main()
+    assert e.value.code == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert out.startswith("usage: cctrack ")
+    for need in ("parse cache:", "$CCTRACK_CACHE_DIR", "$XDG_CACHE_HOME/cctrack",
+                 "~/.cache/cctrack", "cache.sqlite3", "never prices", "CCTRACK_CACHE=0"):
+        assert need in out, need
+    section = out.split("parse cache:", 1)[1].split("detailed / machine-readable", 1)[0]
+    assert "--no-cache" in section and "--rebuild-cache" in section
+    assert not cctrack.cache_dir().exists()
 
 
 def test_hook_commands_do_not_open_the_cache(monkeypatch):

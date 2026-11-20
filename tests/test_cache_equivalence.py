@@ -310,6 +310,8 @@ def run_launched(corpus: Corpus, argv: list, env: dict | None = None, *, zstd: s
                  src=None, cache_home=None, remote_zstd: str | None = None) -> Launched:
     """Run cctrack through a launcher that logs every .jsonl/.jsonl.zst open (and, via the
     fake remote's sitecustomize, every one the remote program opens)."""
+    pp = Path(src or SRC)
+    assert (pp / "cctrack" / "__init__.py").is_file(), f"no cctrack under {pp}"
     ldir = corpus.root / "launch"
     ldir.mkdir(exist_ok=True)
     launcher = ldir / "cctrack_launch.py"

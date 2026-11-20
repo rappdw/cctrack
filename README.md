@@ -30,6 +30,10 @@ cctrack --dirs ~/.claude/projects ~/old-machine/projects
 # Only one coding agent (default: all found)
 cctrack --agent claude
 cctrack --agent codex
+
+# Repeat runs re-read only changed log files (see Parse cache)
+cctrack --rebuild-cache   # read everything and replace the cache
+cctrack --no-cache        # read everything; leave the cache alone
 ```
 
 ## Example output
@@ -58,10 +62,11 @@ Daily breakdown:
 ## What it does
 
 1. Walks `~/.claude/projects/` — and each [Sandy](#sandy-sandboxes) sandbox's `claude/projects/` — for Claude Code transcripts, and each Codex home for Codex rollouts
-2. Parses `assistant` events with token usage
-3. Deduplicates API message/response identities across files, Sandy sandboxes and remote hosts, keeping the fullest usage snapshot
-4. Calculates cost using Anthropic's published rates per model
-5. Prints daily breakdown with input/output/cache token splits and monthly summaries
+2. Re-reads only the log files that changed since the last run, taking the rest from its [parse cache](#parse-cache)
+3. Parses `assistant` events with token usage
+4. Deduplicates API message/response identities across files, Sandy sandboxes and remote hosts, keeping the fullest usage snapshot
+5. Calculates cost using Anthropic's published rates per model
+6. Prints daily breakdown with input/output/cache token splits and monthly summaries
 
 ## Codex CLI
 
@@ -173,14 +178,21 @@ cctrack --install-hook --remote dgx macbook-air
 
 ## Parse cache
 
-cctrack remembers what it read from each log file, so a repeat run re-reads only the files that changed. The cache is one file, `~/.cache/cctrack/cache.sqlite3` (or under `$XDG_CACHE_HOME/cctrack`, or `$CCTRACK_CACHE_DIR`), readable only by you. It holds ids, file paths, working directories, timestamps, models and token counts, never prompt or response text, and never prices: costs are worked out fresh on every run, so a rate-card fix applies to all history. After any change to cctrack, the Python version or the text encoding, the next run reads everything again.
+cctrack remembers what it read from each log file, so a repeat run re-reads only the files that changed. The first run reads everything. So does the first run after any change to cctrack, the Python version or the text encoding: it takes as long as an uncached run. Runs after that are much faster.
+
+- **What's stored:** for each Claude Code transcript, Codex rollout and statusline-hook file, the usage records parsed from it: ids, file paths, working directories, git branches, timestamps, models and token counts. It never stores prompt or response text. It never stores prices or totals either: costs are worked out fresh on every run, so a rate-card fix applies to all history. That comes to a few tens of bytes per usage record.
+- **Where:** one file, `~/.cache/cctrack/cache.sqlite3` (or under `$XDG_CACHE_HOME/cctrack`, or in `$CCTRACK_CACHE_DIR`), readable only by you. You can always delete it safely: the next run reads everything again.
+- **When a file is read again:** when its size or modification time changes. A file modified in the last two seconds is read but not remembered, because it may still be being written. Files that haven't been seen for 30 days are dropped from the cache.
+- **`--remote` hosts** are cached on this machine, not on the host. cctrack sends the host the size and modification time it holds for each of the host's files. The host reads and sends back only the files that changed, and nothing on the host is written. The raw-log fallback (`CCTRACK_REMOTE_PARSE=0`, or a host without Python 3.10+) isn't cached. A host that can't be reached is left out of the report, as before: its cached data isn't used.
+- **Problems never change a report.** If the cache can't be opened or written, for example because the directory is read-only, the file is damaged, or another cctrack run is holding it, cctrack prints one `cctrack: cache ...` note and reads the logs directly. A damaged file is reset.
 
 ```bash
-cctrack --rebuild-cache   # read everything and replace the cache
+cctrack                   # use the cache (the default)
+cctrack --rebuild-cache   # read everything, including on --remote hosts, and replace the cache
 cctrack --no-cache        # read everything; leave the cache alone (or CCTRACK_CACHE=0)
 ```
 
-Statusline hook files are cached per file too. `--remote` hosts are cached the same way, on this machine: the host still reads only its changed files and sends only those. A host that can't be reached is left out of the report, as before.
+With `CCTRACK_TIMING=1`, the timing line of each step that reads logs ends with `cache: N reused, M read`.
 
 ## Rate card
 
