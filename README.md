@@ -180,7 +180,7 @@ cctrack --rebuild-cache   # read everything and replace the cache
 cctrack --no-cache        # read everything; leave the cache alone (or CCTRACK_CACHE=0)
 ```
 
-Statusline hook files and `--remote` hosts are still read in full on every run.
+Statusline hook files are cached per file too. `--remote` hosts are cached the same way, on this machine: the host still reads only its changed files and sends only those. A host that can't be reached is left out of the report, as before.
 
 ## Rate card
 

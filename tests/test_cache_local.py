@@ -11,6 +11,7 @@ import os
 import shutil
 import sqlite3
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,7 @@ import cctrack
 sys.path.insert(0, str(Path(__file__).parent))
 from test_cache_equivalence import (  # noqa: E402
     SRC, TIMING_RE, VARIANTS, _stable, _utc_today, backdate, build_corpus, cache_db,
-    local_log_files, modes, run_cctrack, run_launched, token_count)
+    local_log_files, modes, normalise, run_cctrack, run_launched, token_count)
 from test_cache_store import _raw_frame_text  # noqa: E402
 from test_detail import claude_line, codex_line, codex_usage  # noqa: E402
 
@@ -228,10 +229,12 @@ def test_no_cache_leaves_cache_untouched(corpus):
     assert not fresh.exists()
 
 
-def _entry_paths(home):
+def _entry_paths(home, kinds=("claude", "codex")):
     con = sqlite3.connect(cache_db(home))
     try:
-        return sorted(r[0] for r in con.execute("SELECT path FROM entries"))
+        q = ",".join("?" * len(kinds))
+        return sorted(r[0] for r in con.execute(
+            f"SELECT path FROM entries WHERE host = 'local' AND kind IN ({q})", kinds))
     finally:
         con.close()
 
@@ -247,6 +250,10 @@ def test_rebuild_replaces_the_cache(tmp_path):
     r = run_launched(c, ["--rebuild-cache"], cache_home=home)
     assert r.opens == remaining and _cache_lines(r.stderr) == []
     assert _entry_paths(home) == sorted(str(c.root / p) for p in remaining)
+    cctrack_dirs = [c.home / ".claude" / "cctrack", *c.home.glob(".sandy/sandboxes/*/claude/cctrack")]
+    assert _entry_paths(home, ("hook",)) == sorted(
+        str(f) for d in cctrack_dirs for f in d.glob("statusline*.jsonl"))
+    assert len(_entry_paths(home, ("hook",))) == 3
     assert run_launched(c, [], cache_home=home).opens == []
     cache_db(home).write_bytes(b"garbage" * 1000)
     r = run_launched(c, ["--rebuild-cache"], cache_home=home)
@@ -261,6 +268,7 @@ def _inproc(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(c.home))
     monkeypatch.setenv("SANDY_HOME", str(c.home / ".sandy"))
     monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(cctrack, "CCTRACK_DIR", c.home / ".claude" / "cctrack")
     monkeypatch.setattr(cctrack, "_read_zstd", _raw_frame_text)
     monkeypatch.setattr(cctrack, "_zstd_available", lambda: True)
     files = cctrack.discover_files(cctrack.default_dirs())
@@ -371,24 +379,31 @@ def test_zst_entry_needs_a_decoder(tmp_path):
 
 # ── T9 ────────────────────────────────────────────────────────────────────
 
-def test_remote_runs_cache_only_local_files(tmp_path):
+def test_remote_runs_store_remote_rows_apart(tmp_path):
     c, _ = _fresh(tmp_path)
     home = c.root / "xdg-cache"
 
     def go(attempt):
         h = home / str(attempt)
-        run_launched(c, ["--remote", "fakehost"], cache_home=h)
+        run_launched(c, ["--remote", "fakehost"], cache_home=h, remote_zstd="raw")
         con = sqlite3.connect(cache_db(h))
         try:
-            assert con.execute("SELECT DISTINCT host FROM entries").fetchall() == [("local",)]
-            paths = [r[0] for r in con.execute("SELECT path FROM entries")]
+            assert {r[0] for r in con.execute("SELECT DISTINCT host FROM entries")} == {
+                "local", "remote:fakehost"}
+            local = con.execute("SELECT kind, path FROM entries WHERE host = 'local'").fetchall()
+            remote = [r[0] for r in con.execute(
+                "SELECT path FROM entries WHERE host = 'remote:fakehost'")]
         finally:
             con.close()
-        assert len(paths) == 9 and all(p.startswith(str(c.home)) for p in paths)
+        assert sum(k in ("claude", "codex") for k, _ in local) == 9
+        assert sum(k == "hook" for k, _ in local) == 3
+        assert all(p.startswith(str(c.home)) for _, p in local)
+        assert len(remote) == 13 and all(p.startswith(str(c.remote_home)) for p in remote)
         assert not (c.remote_home / ".cache").exists()
-        warm = run_launched(c, ["--remote", "fakehost", "--json"], cache_home=h)
-        off = run_launched(c, ["--remote", "fakehost", "--json", "--no-cache"], cache_home=h)
-        assert warm.stdout == off.stdout and warm.opens == []
+        warm = run_launched(c, ["--remote", "fakehost", "--json"], cache_home=h, remote_zstd="raw")
+        off = run_launched(c, ["--remote", "fakehost", "--json", "--no-cache"], cache_home=h,
+                           remote_zstd="raw")
+        assert warm.stdout == off.stdout and warm.opens == [] and warm.remote_opens == []
     _attempts(go)
 
 
@@ -453,7 +468,8 @@ def test_interrupted_run_keeps_parsed_files(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err
     con = sqlite3.connect(cctrack.cache_dir() / cctrack.CACHE_FILENAME)
     try:
-        assert con.execute("SELECT count(*) FROM entries").fetchone()[0] == 5
+        assert con.execute("SELECT count(*) FROM entries WHERE kind = 'claude'").fetchone()[0] == 5
+        assert con.execute("SELECT count(*) FROM entries WHERE kind = 'hook'").fetchone()[0] == 3
     finally:
         con.close()
     lines = err.splitlines()
@@ -521,3 +537,89 @@ def test_reference_runs_are_uncached(tmp_path):
     run_cctrack(c, [])
     run_cctrack(c, [])
     assert not (c.root / "xdg-cache").exists()
+
+
+# ── H2-H4: local hook files ───────────────────────────────────────────────
+
+def test_warm_run_opens_only_changed_hook_files(tmp_path):
+    c, t = _fresh(tmp_path)
+    home = c.root / "xdg-cache"
+    hdir = c.home / ".claude" / "cctrack"
+    day120 = (_utc_today().date() - timedelta(days=120)).isoformat()
+    survivors = sorted(
+        str(f.relative_to(c.root)) for d in (hdir, *c.home.glob(".sandy/sandboxes/*/claude/cctrack"))
+        for f in d.glob("statusline*.jsonl") if day120 not in f.name)
+    assert len(survivors) == 3
+
+    def go(attempt):
+        h = home / str(attempt)
+        cold = run_launched(c, [], cache_home=h)
+        assert cold.hook_opens == sorted(survivors + [f"local-home/.claude/cctrack/statusline-{day120}.jsonl"])
+        warm = run_launched(c, [], cache_home=h)
+        assert warm.hook_opens == []
+        today = _utc_today().date().isoformat()
+        f = hdir / f"statusline-{today}.jsonl"
+        f.write_text(json.dumps({"_ts": f"{today}T00:00:01+00:00", "session_id": "s1",
+                                 "cost_usd": 0.5, "model": "claude-opus-5-5"}) + "\n")
+        os.utime(f, ns=(t + 10 * 10**9, t + 10 * 10**9))
+        first = run_launched(c, [], cache_home=h)
+        assert first.hook_opens == [str(f.relative_to(c.root))]
+        assert run_launched(c, [], cache_home=h).hook_opens == []
+        for argv in ([], ["--json"]):
+            assert (run_launched(c, argv, cache_home=h).stdout
+                    == run_launched(c, [*argv, "--no-cache"], cache_home=h).stdout)
+        f.unlink()
+    _attempts(go)
+
+
+def test_rolled_up_hook_file_leaves_no_effect(tmp_path, monkeypatch, capsys):
+    c, t, files, cx = _inproc(tmp_path, monkeypatch)
+    hdir = c.home / ".claude" / "cctrack"
+    d30 = (_utc_today().date() - timedelta(days=30)).isoformat()
+    old = hdir / f"statusline-{d30}.jsonl"
+    old.write_text("\n".join(json.dumps({"_ts": f"{d30}T0{i}:00:00+00:00", "session_id": "r30",
+                                         "cost_usd": cost, "model": "claude-opus-5-5"})
+                             for i, cost in enumerate((0.0, 1.0, 2.5))) + "\n")
+    os.utime(old, ns=(t, t))
+    tr = c.home / ".claude" / "projects" / "-repo" / "r30.jsonl"        # JSONL for that day
+    tr.write_text(claude_line(f"{d30}T00:30:00Z", "rq", sid="r30", inp=1000, out=100) + "\n")
+    os.utime(tr, ns=(t, t))
+
+    def run(*argv):
+        monkeypatch.setattr(sys, "argv", ["cctrack", *argv])
+        cctrack.main()
+        return normalise(capsys.readouterr().out)
+    run()
+    run()                                                      # cold, warm
+    real = cctrack.rollup_old_hook_files
+    monkeypatch.setattr(cctrack, "rollup_old_hook_files",
+                        lambda d, retention_days=10, _r=real: _r(d, retention_days))
+    detail = ("--json", "--sessions", "--bucket", "hour", "--coverage")
+    looked_up = []
+    real_get = cctrack.CacheStore.get
+    monkeypatch.setattr(cctrack.CacheStore, "get",
+                        lambda self, host, kind, path, *a, **k: (looked_up.append(path),
+                                                                 real_get(self, host, kind, path, *a, **k))[1])
+    explored = run(*detail)                              # the run whose rollup removes the file
+    assert not old.exists()
+    assert looked_up and str(old) not in looked_up       # its stale row is never asked for
+    con = sqlite3.connect(cctrack.cache_dir() / cctrack.CACHE_FILENAME)
+    try:
+        assert con.execute("SELECT count(*) FROM entries WHERE path = ?", (str(old),)).fetchone()[0] == 1
+    finally:
+        con.close()
+    assert explored == run(*detail, "--no-cache")
+    assert run("--explore", d30) == run("--explore", d30, "--no-cache")
+    assert run() == run("--no-cache")
+
+
+def test_timing_reports_hook_cache_use(tmp_path):
+    c, _ = _fresh(tmp_path)
+    home = c.root / "xdg-cache"
+    env = {"CCTRACK_TIMING": "1"}
+
+    def hook(r):
+        return {m["name"]: m["detail"] or "" for m in _timing(r.stderr) if not m["indent"]}["hook read"]
+    assert hook(run_launched(c, [], env, cache_home=home)).endswith("; cache: 0 reused, 3 read")
+    assert hook(run_launched(c, [], env, cache_home=home)).endswith("; cache: 3 reused, 0 read")
+    assert "cache:" not in hook(run_launched(c, ["--no-cache"], env, cache_home=home))

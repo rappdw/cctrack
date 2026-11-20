@@ -6,12 +6,13 @@ output and the bench script."""
 import json
 import os
 import re
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -143,8 +144,49 @@ def _populate(home: Path, tag: str, day) -> None:
     _w(hook / f"statusline-{day(120)}.jsonl",
        "\n".join(map(json.dumps, rows("olds" if tag == "lh" else "rolds", (0.0, 2.0, 3.0),
                                       day(120)))) + "\n")
+    _w(hook / "statusline.jsonl",                       # legacy file
+       "\n".join(map(json.dumps, rows("leg" + tag, (0.0, 0.40), day(2)))) + "\n")
+    _w(box / "claude" / "cctrack" / f"statusline-{d1}.jsonl",    # a sandbox's hook dir
+       "\n".join(map(json.dumps, rows("s1", (0.0, 0.05, 0.30), d1)
+                      + rows("bs" + tag, (0.0, 0.20), d1))) + "\n")
     if tag == "lh":
         _w(hook / "config.json", json.dumps({"installed_at": f"{day(150)}T00:00:00+00:00"}))
+
+
+# A sitecustomize.py on the fake remote's PYTHONPATH: logs every .jsonl/.jsonl.zst the
+# remote program opens, and gives the remote a deterministic (raw-frame) zstd decoder.
+REMOTE_SITE = r'''
+import os, sys, types, io
+if os.environ.get("CCTRACK_TEST_REMOTE_ZSTD") == "raw":
+    def _open(path, mode="rt", errors=None, **kw):
+        with open(path, "rb") as fh:
+            data = fh.read()[9:]
+        out, i = [], 0
+        while i < len(data):
+            h = int.from_bytes(data[i:i + 3], "little")
+            size, last = h >> 3, h & 1
+            out.append(data[i + 3:i + 3 + size])
+            i += 3 + size
+            if last:
+                break
+        return io.StringIO(b"".join(out).decode("utf-8", errors or "strict"))
+    pkg = types.ModuleType("compression")
+    z = types.ModuleType("compression.zstd")
+    z.open = _open
+    pkg.zstd = z
+    pkg.__path__ = []
+    sys.modules["compression"] = pkg
+    sys.modules["compression.zstd"] = z
+_log = os.environ.get("CCTRACK_TEST_REMOTE_OPEN_LOG")
+if _log:
+    _fd = os.open(_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    def _hook(event, args):
+        if event == "open" and isinstance(args[0], (str, bytes)):
+            t = os.fsdecode(args[0])
+            if t.endswith(".jsonl") or t.endswith(".jsonl.zst"):
+                os.write(_fd, (t + "\n").encode("utf-8", "surrogateescape"))
+    sys.addaudithook(_hook)
+'''
 
 
 def build_corpus(root: Path, *, settle: bool = True, python: str = sys.executable) -> Corpus:
@@ -157,8 +199,9 @@ def build_corpus(root: Path, *, settle: bool = True, python: str = sys.executabl
     home, remote_home = root / "local-home", root / "remote-home"
     _populate(home, "lh", day)
     _populate(remote_home, "rh", day)
-    bin_dir = _fake_ssh(root, {"HOME": str(remote_home), "SANDY_HOME": str(remote_home / ".sandy")},
-                        python)
+    _w(root / "remote-site" / "sitecustomize.py", REMOTE_SITE)
+    bin_dir = _fake_ssh(root, {"HOME": str(remote_home), "SANDY_HOME": str(remote_home / ".sandy"),
+                               "PYTHONPATH": str(root / "remote-site")}, python)
     corpus = Corpus(root, home, remote_home, bin_dir, anchor, day(1), python)
     if settle:
         run_cctrack(corpus, [])
@@ -255,6 +298,8 @@ class Launched:
     stdout: str
     stderr: str
     opens: list
+    hook_opens: list = field(default_factory=list)
+    remote_opens: list = field(default_factory=list)
 
 
 def cache_db(cache_home) -> Path:
@@ -262,8 +307,9 @@ def cache_db(cache_home) -> Path:
 
 
 def run_launched(corpus: Corpus, argv: list, env: dict | None = None, *, zstd: str = "raw",
-                 src=None, cache_home=None) -> Launched:
-    """Run cctrack through a launcher that logs every .jsonl/.jsonl.zst open."""
+                 src=None, cache_home=None, remote_zstd: str | None = None) -> Launched:
+    """Run cctrack through a launcher that logs every .jsonl/.jsonl.zst open (and, via the
+    fake remote's sitecustomize, every one the remote program opens)."""
     ldir = corpus.root / "launch"
     ldir.mkdir(exist_ok=True)
     launcher = ldir / "cctrack_launch.py"
@@ -271,9 +317,12 @@ def run_launched(corpus: Corpus, argv: list, env: dict | None = None, *, zstd: s
         launcher.write_text(LAUNCHER)
     fd, log = tempfile.mkstemp(dir=ldir, suffix=".log")
     os.close(fd)
+    fd, rlog = tempfile.mkstemp(dir=ldir, suffix=".rlog")
+    os.close(fd)
     full = run_env(corpus, {
         "CCTRACK_CACHE": "1", "PYTHONPATH": str(src or SRC), "CCTRACK_TEST_ZSTD": zstd,
-        "CCTRACK_TEST_OPEN_LOG": log,
+        "CCTRACK_TEST_OPEN_LOG": log, "CCTRACK_TEST_REMOTE_OPEN_LOG": rlog,
+        **({"CCTRACK_TEST_REMOTE_ZSTD": remote_zstd} if remote_zstd else {}),
         **({"XDG_CACHE_HOME": str(cache_home)} if cache_home else {}), **(env or {})})
     try:
         r = subprocess.run([corpus.python, str(launcher), *argv], cwd=corpus.root, env=full,
@@ -281,16 +330,49 @@ def run_launched(corpus: Corpus, argv: list, env: dict | None = None, *, zstd: s
                            encoding="utf-8", timeout=120)
         assert r.returncode == 0, f"cctrack {argv} exited {r.returncode}:\n{r.stderr}"
         logged = Path(log).read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+        rlogged = Path(rlog).read_text(encoding="utf-8", errors="surrogateescape").splitlines()
     finally:
         os.unlink(log)
+        os.unlink(rlog)
     root = str(corpus.root) + os.sep
-    opens = []
+    opens, hook_opens = [], []
     for t in logged:
         if t.startswith(root):
             rel = t[len(root):]
             if "cctrack" not in Path(rel).parts:
                 opens.append(rel)
-    return Launched(normalise(r.stdout), r.stderr, sorted(opens))
+            elif t.endswith(".jsonl"):
+                hook_opens.append(rel)
+    remote_opens = sorted(t[len(root):] for t in rlogged if t.startswith(root))
+    return Launched(normalise(r.stdout), r.stderr, sorted(opens), sorted(hook_opens), remote_opens)
+
+
+def remote_listing(corpus: Corpus) -> list:
+    """Sorted (relpath, "d"|"f"|"l", size, mtime_ns) for every entry under the fake
+    host's home, from os.lstat."""
+    out = []
+    for p in [corpus.remote_home, *corpus.remote_home.rglob("*")]:
+        st = os.lstat(p)
+        kind = "l" if stat.S_ISLNK(st.st_mode) else "d" if stat.S_ISDIR(st.st_mode) else "f"
+        out.append((str(p.relative_to(corpus.remote_home)), kind, st.st_size, st.st_mtime_ns))
+    return sorted(out)
+
+
+def ssh_counter(tmp_path: Path, corpus: Corpus) -> tuple:
+    """(bin_dir, log): a bash `ssh` that appends its arguments to `log` and execs the
+    corpus's fake ssh. Must live under tmp_path, never /dev/shm (noexec)."""
+    bin_dir = tmp_path / "ssh-counter"
+    bin_dir.mkdir(exist_ok=True)
+    log = tmp_path / "ssh-calls.log"
+    script = bin_dir / "ssh"
+    script.write_text(f'#!/bin/bash\necho "$*" >> {log}\nexec {corpus.bin_dir}/ssh "$@"\n')
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return bin_dir, log
+
+
+def python3_calls(log: Path) -> int:
+    """How many logged ssh calls ran `python3 -`."""
+    return sum(1 for ln in log.read_text().splitlines() if ln.endswith("python3 -")) if log.exists() else 0
 
 
 def normalise(stdout: str) -> str:
@@ -371,6 +453,9 @@ def test_corpus_covers_section5_cases(baseline):
     day120 = (_utc_today().date() - timedelta(days=120)).isoformat()
     assert list(cc.glob("monthly-*.json")) and not (cc / f"statusline-{day120}.jsonl").exists()
     assert (corpus.remote_home / ".claude" / "cctrack" / f"statusline-{day120}.jsonl").exists()
+    for h in (corpus.home, corpus.remote_home):
+        assert (h / ".claude" / "cctrack" / "statusline.jsonl").exists()      # legacy file
+        assert list((h / ".sandy" / "sandboxes").glob("*/claude/cctrack/statusline-*.jsonl"))
 
 
 def test_two_uncached_runs_match(baseline):

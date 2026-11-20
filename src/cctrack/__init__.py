@@ -2053,6 +2053,19 @@ class CacheStore:
             self._fail(e)
             return None
 
+    def host_rows(self, host_key: str) -> list:
+        """[(kind, path, size, mtime_ns, code)] for one host key, without payloads. Any
+        error: self._fail(e) and []. Not counted as hits; doesn't touch last_used."""
+        if not self.enabled:
+            return []
+        try:
+            return [tuple(r) for r in self._con.execute(
+                "SELECT kind, path, size, mtime_ns, code FROM entries WHERE host=?",
+                (host_key,)).fetchall()]
+        except Exception as e:
+            self._fail(e)
+            return []
+
     def put(self, host: str, kind: str, path: str, sig: tuple[int, int], payload: dict,
             params: str = "") -> None:
         if not self.enabled:
@@ -2744,7 +2757,8 @@ def parse_remote_codex_events(host: str, file_stats: dict | None = None) -> list
 # 3.10+ fall back to the raw (gzip-compressed) stream. CCTRACK_REMOTE_PARSE=0
 # forces the raw stream.
 
-REMOTE_PROTOCOL = b"CCTRACK_REMOTE_V1\n"
+REMOTE_PROTOCOL = b"CCTRACK_REMOTE_V2\n"
+REMOTE_TIMING = "CCTRACK_REMOTE_TIMING "
 REMOTE_UNSUPPORTED = "CCTRACK_REMOTE_UNSUPPORTED"
 REMOTE_PROGRESS = "CCTRACK_PROGRESS "
 _remote_bundle_cache: dict[str, dict] = {}
@@ -2795,13 +2809,171 @@ def _read_text_lines(path: str):
         return None
 
 
-def _remote_collect(host: str, want_claude: bool, want_codex: bool, timing: bool = False) -> dict:
-    """Runs ON the remote host. Same discovery and per-file parsing as the raw
-    stream path; returns everything the local report needs. Read-only."""
-    out: dict = {"python": sys.version.split()[0]}
+def _parse_env_key() -> str:
+    """What decides a parse on the machine running it, besides the source and the
+    file: interpreter and default text encoding. Runs on the remote (the 'rkey')."""
+    import codecs
+    import io
+    enc = codecs.lookup(io.TextIOWrapper(io.BytesIO()).encoding).name
+    return f"{sys.implementation.name}-{'.'.join(map(str, sys.version_info[:3]))} {enc}"
+
+
+def _remote_host_key(host: str) -> str:
+    """The `host` column for a --remote host's cache rows. Local rows are "local", so
+    a host literally named "local" can never collide with them."""
+    return "remote:" + host
+
+
+def _remote_cache_params(host: str, rkey: str) -> str:
+    """The params part of every remote row's code. `host` fixes source (= host) and
+    label (= f"{host}:{path}"); remote parses never use agent_id_from_name; the kind
+    is in the key."""
+    return json.dumps(["remote", host, rkey])
+
+
+def _remote_manifest(store, host: str, kinds: tuple) -> dict | None:
+    """The manifest to send to `host`: {"rkey", "files": {kind: {path: [size, mtime_ns]}}}
+    from the rows this store holds for it under the current code key, or None for an
+    empty one. If several rkeys qualify, the one with the most rows wins (ties: the
+    greatest string)."""
+    if store is None or not store.enabled:
+        return None
+    prefix = f"{store.code_key} "
+    by_rkey: dict[str, list] = {}
+    for kind, path, size, mtime_ns, code in store.host_rows(_remote_host_key(host)):
+        if kind not in kinds or not code.startswith(prefix):
+            continue
+        try:
+            tail = json.loads(code[len(prefix):])
+        except ValueError:
+            continue
+        if not (isinstance(tail, list) and len(tail) == 3 and isinstance(tail[2], str)):
+            continue
+        if code[len(prefix):] != _remote_cache_params(host, tail[2]):
+            continue
+        by_rkey.setdefault(tail[2], []).append((kind, path, size, mtime_ns))
+    if not by_rkey:
+        return None
+    rkey = max(by_rkey, key=lambda k: (len(by_rkey[k]), k))
+    files: dict[str, dict] = {}
+    for kind, path, size, mtime_ns in by_rkey[rkey]:
+        files.setdefault(kind, {})[path] = [size, mtime_ns]
+    return {"rkey": rkey, "files": files}
+
+
+def _hook_rows_from_blob_text(text: str) -> list[dict]:
+    """One statusline file's rows exactly as parse_hook_blob would split it."""
+    return _hook_rows_from_lines([l for ch in text.split(HOOK_FILE_SEP) for l in ch.splitlines()])
+
+
+def _hook_text_breaks_blob(text: str) -> bool:
+    """True if this statusline text holds a separator that makes parse_hook_blob's
+    partitioning cross file boundaries (it can't be reproduced per file)."""
+    return MONTHLY_FILE_SEP in text or BASELINE_FILE_SEP in text
+
+
+def _remote_hook_blob(hook_dirs, patterns=None) -> str:
+    """The whole-blob hook stream (v1's): statusline, monthly and baseline files, each
+    behind its separator, joined with newlines ("" if there are none)."""
+    parts: list[str] = []
+    for pattern, sep in patterns or (("statusline*.jsonl", HOOK_FILE_SEP),
+                                     ("monthly-*.json", MONTHLY_FILE_SEP),
+                                     ("session-baselines.json", BASELINE_FILE_SEP)):
+        for d in hook_dirs:
+            for f in sorted(d.rglob(pattern)):
+                lines = _read_text_lines(str(f))
+                if lines is not None:
+                    parts.append(sep + "\n" + "".join(lines))
+    return "\n".join(parts)
+
+
+def _remote_hook_extra(hook_dirs) -> list:
+    """[monthly, baselines] from the monthly and baseline files only."""
+    blob = _remote_hook_blob(hook_dirs, (("monthly-*.json", MONTHLY_FILE_SEP),
+                                         ("session-baselines.json", BASELINE_FILE_SEP)))
+    if not blob:
+        return [{}, {}]
+    _, monthly, baselines = parse_hook_blob(blob)
+    return [monthly, baselines]
+
+
+def _remote_stat_item(path: str, known: dict) -> tuple:
+    """(sig, hit): the file's current stat, and whether the manifest has exactly it."""
+    sig = _file_sig(path)
+    k = known.get(path)
+    return sig, (sig is not None and isinstance(k, (list, tuple)) and list(k) == [sig[0], sig[1]])
+
+
+def _remote_file_item(host: str, kind: str, path: str, known: dict) -> list | None:
+    """One Claude/Codex file's wire item: a hit marker (stat matches the manifest and the
+    file can be decoded here) or its own per-file parse. None = unreadable (no item)."""
+    sig, hit = _remote_stat_item(path, known)
+    if hit and (not (kind == "codex" and path.endswith(".zst")) or _zstd_available()):
+        return [path, sig[0], sig[1], "h"]
+    lines = _read_log_lines(kind, path)
+    if lines is None:
+        return None
+    r = _parse_log_lines(kind, lines, f"{host}:{path}", source=host, want_stats=True)
+    ok = sig is not None and _file_sig(path) == sig and not _is_racy(sig, time.time_ns())
+    return [path, *(sig or (0, 0)), "s" if ok else "n", r]
+
+
+def _remote_hook_items(host: str, hook_dirs, known: dict) -> list | None:
+    """Per-file wire items for the host's statusline files (remote blob semantics), or
+    None when a missed file holds separator text (the caller falls back to the blob)."""
+    items = []
+    for d in hook_dirs:
+        for f in sorted(d.rglob("statusline*.jsonl")):
+            path = str(f)
+            sig, hit = _remote_stat_item(path, known)
+            if hit:
+                items.append([path, sig[0], sig[1], "h"])
+                continue
+            lines = _read_text_lines(path)
+            if lines is None:
+                continue
+            text = "".join(lines)
+            if _hook_text_breaks_blob(text):
+                return None
+            payload = {"events": _hook_rows_from_blob_text(text), "stats": None}
+            ok = sig is not None and _file_sig(path) == sig and not _is_racy(sig, time.time_ns())
+            items.append([path, *(sig or (0, 0)), "s" if ok else "n", payload])
+    return items
+
+
+def _remote_collect_files(host: str, want_claude: bool, want_codex: bool,
+                          timing: bool = False, manifest: dict | None = None) -> dict:
+    """Runs ON the remote host; read-only; never opens a cache. Same discovery as the
+    raw stream. Returns the v2 wire data: per file, in discovery order, a hit marker or
+    that file's own per-file parse; never deduped across files."""
+    rkey = _parse_env_key()
+    out: dict = {"python": sys.version.split()[0], "rkey": rkey, "files": {}, "counts": {}}
+    known: dict = {}
+    if isinstance(manifest, dict) and manifest.get("rkey") == rkey \
+            and isinstance(manifest.get("files"), dict):
+        known = {k: v for k, v in manifest["files"].items() if isinstance(v, dict)}
     phases: dict[str, float] = {"discovery": 0.0}
     census_paths: dict[str, list] = {}
     t = time.perf_counter()
+
+    def collect(kind: str, paths: list, progress: Progress) -> list:
+        items, skipped = [], 0
+        kk = known.get(kind, {})
+        for i, path in enumerate(paths, 1):
+            progress.update(f"{i:,}/{len(paths):,} files")
+            it = _remote_file_item(host, kind, path, kk)
+            if it is None:
+                if kind == "codex" and path.endswith(".zst"):
+                    skipped += 1
+                continue
+            items.append(it)
+        reused = sum(1 for it in items if it[3] == "h")
+        out["files"][kind] = items
+        out["counts"][kind] = [reused, len(paths) - reused]
+        if kind == "codex":
+            out["zst_skipped"] = skipped
+        return items
+
     if want_claude:
         files = discover_files(default_dirs())
         if timing:
@@ -2809,40 +2981,29 @@ def _remote_collect(host: str, want_claude: bool, want_codex: bool, timing: bool
             phases["discovery"] += now - t
             t = now
             census_paths["claude parse"] = files
-        stats: dict = {}
-        progress = Progress("parsing Claude transcripts")
-
-        def claude_items():
-            for i, path in enumerate(files, 1):
-                progress.update(f"{i:,}/{len(files):,} files")
-                lines = _read_log_lines("claude", path)
-                if lines is not None:
-                    yield path, lines
-        out["claude"] = _parse_remote_files(host, claude_items(), parse_lines, stats)
-        out["claude_stats"] = stats
+        collect("claude", files, Progress("parsing Claude transcripts"))
         if timing:
             now = time.perf_counter()
             phases["claude parse"] = now - t
             t = now
 
-        # Hook data: the same stream fetch_remote_hook_data would cat, built
-        # from the same files in the same order, then parsed the same way.
         hook_dirs = discover_hook_data_dirs()
+        hook_files = [f for d in hook_dirs for f in sorted(d.rglob("statusline*.jsonl"))]
         if timing:
             now = time.perf_counter()
             phases["discovery"] += now - t
             t = now
-            census_paths["hook read"] = [f for d in hook_dirs for f in d.rglob("statusline*.jsonl")]
-        parts: list[str] = []
-        for pattern, sep in (("statusline*.jsonl", HOOK_FILE_SEP),
-                             ("monthly-*.json", MONTHLY_FILE_SEP),
-                             ("session-baselines.json", BASELINE_FILE_SEP)):
-            for d in hook_dirs:
-                for f in sorted(d.rglob(pattern)):
-                    lines = _read_text_lines(str(f))
-                    if lines is not None:
-                        parts.append(sep + "\n" + "".join(lines))
-        out["hook"] = parse_hook_blob("\n".join(parts)) if parts else ([], {}, {})
+            census_paths["hook read"] = hook_files
+        items = _remote_hook_items(host, hook_dirs, known.get("hook", {}))
+        if items is None:
+            blob = _remote_hook_blob(hook_dirs)
+            out["hook"] = parse_hook_blob(blob) if blob else ([], {}, {})
+            out["counts"]["hook"] = [0, len(hook_files)]
+        else:
+            out["files"]["hook"] = items
+            out["hook_extra"] = _remote_hook_extra(hook_dirs)
+            reused = sum(1 for it in items if it[3] == "h")
+            out["counts"]["hook"] = [reused, len(hook_files) - reused]
         if timing:
             now = time.perf_counter()
             phases["hook read"] = now - t
@@ -2854,22 +3015,7 @@ def _remote_collect(host: str, want_claude: bool, want_codex: bool, timing: bool
             phases["discovery"] += now - t
             t = now
             census_paths["codex parse"] = files
-        stats = {}
-        skipped = [0]
-        progress = Progress("parsing Codex rollouts")
-
-        def codex_items():
-            for i, path in enumerate(files, 1):
-                progress.update(f"{i:,}/{len(files):,} files")
-                lines = _read_log_lines("codex", path)
-                if lines is None:
-                    if path.endswith(".zst"):
-                        skipped[0] += 1
-                    continue
-                yield path, lines
-        out["codex"] = _parse_remote_files(host, codex_items(), parse_codex_lines, stats)
-        out["codex_stats"] = stats
-        out["zst_skipped"] = skipped[0]
+        collect("codex", files, Progress("parsing Codex rollouts"))
         if timing:
             phases["codex parse"] = time.perf_counter() - t
     if timing:
@@ -2878,21 +3024,104 @@ def _remote_collect(host: str, want_claude: bool, want_codex: bool, timing: bool
     return out
 
 
-def _remote_main(host: str, want_claude: bool, want_codex: bool, timing: bool = False) -> None:
+def _assemble_remote_bundle(host: str, data: dict, store) -> dict | None:
+    """v2 wire data -> the bundle fetch_remote_bundle caches. Hits are loaded from the
+    store and misses flagged "s" are put (encoded at put, before any dedup). None if a
+    hit can't be supplied: the caller refetches everything."""
+    t0 = time.perf_counter()
+    hk = _remote_host_key(host)
+    params = _remote_cache_params(host, data["rkey"])
+    st = store if store is not None and store.enabled else None
+    res: dict = {}
+
+    def walk(kind: str) -> tuple | None:
+        lists, stats = [], {}
+        for item in data["files"][kind]:
+            path, sig = item[0], (item[1], item[2])
+            if item[3] == "h":
+                p = st.get(hk, kind, path, sig, params) if st else None
+                if p is None:
+                    return None
+            else:
+                p = item[4]
+                if item[3] == "s" and st is not None and _key_text_ok(hk, path, f"{host}:{path}"):
+                    st.put(hk, kind, path, sig, p, params)
+            lists.append(p["events"])
+            stats[f"{host}:{path}"] = p["stats"]
+        return lists, stats
+
+    for kind in ("claude", "codex"):
+        if kind in data["files"]:
+            got = walk(kind)
+            if got is None:
+                return None
+            res[kind] = dedup_events(got[0])
+            res[f"{kind}_stats"] = got[1]
+    if "hook" in data["files"]:
+        got = walk("hook")
+        if got is None:
+            return None
+        rows = [r for lst in got[0] for r in lst]
+        rows.sort(key=lambda r: (r["session_id"], r["ts"]))
+        res["hook"] = (rows, *data["hook_extra"])
+    elif "hook" in data:
+        res["hook"] = tuple(data["hook"])
+    for k in ("python", "zst_skipped", "timing"):
+        if k in data:
+            res[k] = data[k]
+    counts = data["counts"].values()
+    res["cache_counts"] = {"reused": sum(c[0] for c in counts), "read": sum(c[1] for c in counts)}
+    res["_cached"] = st is not None
+    res["_local_merge"] = time.perf_counter() - t0
+    return res
+
+
+def _remote_collect(host: str, want_claude: bool, want_codex: bool, timing: bool = False) -> dict:
+    """The v1-shaped per-host result (claude, claude_stats, codex, codex_stats, zst_skipped,
+    hook, timing, python), as the local side assembles it from the v2 wire data with no
+    cache. Kept for tests and as the definition of "the per-host result"."""
+    res = _assemble_remote_bundle(host, _remote_collect_files(host, want_claude, want_codex, timing),
+                                  None)
+    for k in ("cache_counts", "_cached", "_local_merge"):
+        res.pop(k, None)
+    return res
+
+
+def _remote_main(host: str, want_claude: bool, want_codex: bool, timing: bool = False,
+                 manifest: str = "") -> None:
     """Entry point of the program fetch_remote_bundle sends to the host."""
     global _remote_progress_lines
     _remote_progress_lines = True
     import zlib
-    data = _remote_collect(host, want_claude, want_codex, timing)
+    known = None
+    try:
+        if manifest:
+            known = json.loads(zlib.decompress(base64.b64decode(manifest)))
+            if not isinstance(known, dict) or not isinstance(known.get("files"), dict):
+                known = None
+    except Exception:
+        known = None
+    data = _remote_collect_files(host, want_claude, want_codex, timing, known)
+    t = time.perf_counter()
     payload = zlib.compress(json.dumps(_tag_json(data), separators=(",", ":")).encode(), 6)
+    secs = time.perf_counter() - t
     sys.stdout.buffer.write(REMOTE_PROTOCOL + payload)
     sys.stdout.flush()
+    if timing:
+        sys.stderr.write(f"{REMOTE_TIMING}encode={secs:.6f}\n")
+        sys.stderr.flush()
 
 
-def _remote_program(host: str, want_claude: bool, want_codex: bool, timing: bool = False) -> bytes:
+def _remote_program(host: str, want_claude: bool, want_codex: bool, timing: bool = False,
+                    manifest: dict | None = None) -> bytes:
     import zlib
     src = Path(__file__).read_bytes()
     blob = base64.b64encode(zlib.compress(src, 9)).decode()
+    extra = ", timing=True" if timing else ""
+    if manifest:
+        m = base64.b64encode(zlib.compress(
+            json.dumps(manifest, separators=(",", ":")).encode(), 9)).decode()
+        extra += f", manifest='{m}'"
     return (
         "import sys\n"
         "if sys.version_info < (3, 10):\n"
@@ -2903,61 +3132,119 @@ def _remote_program(host: str, want_claude: bool, want_codex: bool, timing: bool
         "mod.__file__ = '<cctrack>'\n"
         f"exec(compile(zlib.decompress(base64.b64decode('{blob}')), 'cctrack', 'exec'),"
         " mod.__dict__)\n"
-        f"mod._remote_main({host!r}, {bool(want_claude)!r}, {bool(want_codex)!r}"
-        f"{', timing=True' if timing else ''})\n"
+        f"mod._remote_main({host!r}, {bool(want_claude)!r}, {bool(want_codex)!r}{extra})\n"
     ).encode()
 
 
-def fetch_remote_bundle(host: str, want_claude: bool = True, want_codex: bool = True) -> dict:
+def _remote_exchange(host: str, want_claude: bool, want_codex: bool,
+                     manifest: dict | None) -> dict:
+    """One `ssh host python3 -` call and its reply handling. Returns {"data", "wire",
+    "decode", "encode"} on success, else {"failed": True} or {"fallback": True}."""
+    import zlib
+    cmd = [*_SSH, host, "python3", "-"]
+    try:
+        r = _run_ssh(cmd, input=_remote_program(host, want_claude, want_codex,
+                                              timing=timing_enabled(), manifest=manifest),
+                     capture_output=True, timeout=remote_fetch_timeout(),
+                     progress=f"{host}: parsing logs on {host}")
+    except subprocess.TimeoutExpired:
+        _warn_timeout(host, "remotely parsed logs")
+        return {"failed": True}
+    except FileNotFoundError:
+        print("  Warning: ssh command not found", file=sys.stderr)
+        return {"failed": True}
+    out = r.stdout if isinstance(r.stdout, bytes) else (r.stdout or "").encode()
+    err = r.stderr.decode(errors="replace") if isinstance(r.stderr, bytes) else (r.stderr or "")
+    if out.startswith(REMOTE_PROTOCOL):
+        try:
+            t0 = time.perf_counter()
+            data = _untag_json(json.loads(zlib.decompress(out[len(REMOTE_PROTOCOL):])))
+            decode = time.perf_counter() - t0
+            if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
+                raise ValueError("unexpected reply")
+        except (zlib.error, ValueError, TypeError, KeyError) as exc:
+            print(f"  Note: couldn't read {host}'s parsed results ({exc}); "
+                  f"streaming raw logs instead.", file=sys.stderr)
+            return {"fallback": True}
+        encode = None
+        for line in err.splitlines():
+            if line.startswith(REMOTE_TIMING):
+                try:
+                    encode = float(line.split("encode=", 1)[1])
+                except (IndexError, ValueError):
+                    pass
+        return {"data": data, "wire": len(out), "decode": decode, "encode": encode}
+    if r.returncode == 255:
+        print(f"  Warning: SSH to {host} failed: {err.strip()}", file=sys.stderr)
+        return {"failed": True}
+    why = out.decode(errors="replace").strip()
+    if why.startswith(REMOTE_UNSUPPORTED):
+        why = f"its python3 is {why.split()[-1]}; cctrack needs 3.10+"
+    else:
+        tail = err.strip().splitlines()[-1:] or ["python3 not available"]
+        why = tail[0]
+    print(f"  Note: couldn't parse on {host} ({why}); streaming raw logs "
+          f"instead (slower).", file=sys.stderr)
+    return {"fallback": True}
+
+
+def fetch_remote_bundle(host: str, want_claude: bool = True, want_codex: bool = True,
+                        cache: "CacheStore | None" = None) -> dict:
     """Parse a host's logs on the host itself and fetch the results (cached).
     Returns {"ok": True, ...} on success, {"failed": True} when the host is
     unreachable or timed out (nothing more to try), or {"fallback": True}
-    when it lacks a usable Python — callers then stream raw logs."""
+    when it lacks a usable Python — callers then stream raw logs. With `cache`, the
+    host skips files whose stat the cache already holds (protocol v2)."""
     if host in _remote_bundle_cache:
         return _remote_bundle_cache[host]
     if os.environ.get("CCTRACK_REMOTE_PARSE", "1").strip() in ("0", "no", "false", "off"):
         res = {"fallback": True}
         _remote_bundle_cache[host] = res
         return res
-    import zlib
     print(f"  Fetching from {host} (parsing on {host})...", file=sys.stderr)
-    cmd = [*_SSH, host, "python3", "-"]
-    res: dict
-    try:
-        r = _run_ssh(cmd, input=_remote_program(host, want_claude, want_codex,
-                                              timing=timing_enabled()),
-                     capture_output=True, timeout=remote_fetch_timeout(),
-                     progress=f"{host}: parsing logs on {host}")
-    except subprocess.TimeoutExpired:
-        _warn_timeout(host, "remotely parsed logs")
-        res = {"failed": True}
-    except FileNotFoundError:
-        print("  Warning: ssh command not found", file=sys.stderr)
-        res = {"failed": True}
+    st = cache if cache is not None and cache.enabled else None
+    if st is not None:
+        # The shipped source must be the source the cache key was made from.
+        try:
+            import hashlib
+            now_key = hashlib.sha256(Path(__file__).read_bytes()).hexdigest() + " "
+        except OSError:
+            now_key = None
+        if now_key is None or not st.code_key.startswith(now_key):
+            st = None
+    kinds = ("claude", "hook") if want_claude else ()
+    if want_codex:
+        kinds += ("codex",)
+    manifest = _remote_manifest(st, host, kinds) if st is not None else None
+
+    ex = _remote_exchange(host, want_claude, want_codex, manifest)
+    if "data" not in ex:
+        res = ex
     else:
-        out = r.stdout if isinstance(r.stdout, bytes) else (r.stdout or "").encode()
-        err = r.stderr.decode(errors="replace") if isinstance(r.stderr, bytes) else (r.stderr or "")
-        if out.startswith(REMOTE_PROTOCOL):
-            try:
-                data = _untag_json(json.loads(zlib.decompress(out[len(REMOTE_PROTOCOL):])))
-                res = {"ok": True, **data, "_wire_bytes": len(out)}
-            except (zlib.error, ValueError, TypeError, KeyError) as exc:
-                print(f"  Note: couldn't read {host}'s parsed results ({exc}); "
-                      f"streaming raw logs instead.", file=sys.stderr)
-                res = {"fallback": True}
-        elif r.returncode == 255:
-            print(f"  Warning: SSH to {host} failed: {err.strip()}", file=sys.stderr)
-            res = {"failed": True}
-        else:
-            why = out.decode(errors="replace").strip()
-            if why.startswith(REMOTE_UNSUPPORTED):
-                why = f"its python3 is {why.split()[-1]}; cctrack needs 3.10+"
-            else:
-                tail = err.strip().splitlines()[-1:] or ["python3 not available"]
-                why = tail[0]
-            print(f"  Note: couldn't parse on {host} ({why}); streaming raw logs "
-                  f"instead (slower).", file=sys.stderr)
+        exchanges, res = [ex], None
+        try:
+            bundle = _assemble_remote_bundle(host, ex["data"], st)
+            if bundle is None:
+                print(f"cctrack: cache couldn't supply {host}'s unchanged files; "
+                      f"fetching everything from {host} again", file=sys.stderr)
+                ex = _remote_exchange(host, want_claude, want_codex, None)
+                if "data" not in ex:
+                    res = ex
+                else:
+                    exchanges.append(ex)
+                    bundle = _assemble_remote_bundle(host, ex["data"], st)
+                    if bundle is None:
+                        raise ValueError("a hit marker in the reply to an empty manifest")
+                    bundle["_refetched"] = True
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            print(f"  Note: couldn't read {host}'s parsed results ({exc}); "
+                  f"streaming raw logs instead.", file=sys.stderr)
             res = {"fallback": True}
+        if res is None:
+            res = {"ok": True, **bundle, "_wire_bytes": sum(x["wire"] for x in exchanges),
+                   "_local_decode": sum(x["decode"] for x in exchanges)}
+            if exchanges[-1]["encode"] is not None:
+                res["_remote_encode"] = exchanges[-1]["encode"]
     if res.get("ok") and res.get("zst_skipped"):
         print(f"  Note: {host}: skipped {res['zst_skipped']} compressed Codex rollout(s) "
               f"(.jsonl.zst) — install `zstd` there (or Python 3.14+) to include them.",
@@ -3013,18 +3300,63 @@ def _hook_rows_from_lines(lines) -> list[dict]:
     return rows
 
 
-def parse_hook_rows(cctrack_dir: Path | None = None) -> list[dict]:
+_HOOK_LOCAL_PARAMS = json.dumps(["hook", "local"])
+
+
+def _hook_files(cctrack_dir: Path) -> list[Path]:
+    """The local statusline files, in the order parse_hook_rows reads them: sorted
+    statusline-*.jsonl, then the legacy statusline.jsonl."""
+    files = sorted(cctrack_dir.glob("statusline-*.jsonl"))
+    legacy = cctrack_dir / "statusline.jsonl"
+    if legacy.exists():
+        files.append(legacy)
+    return files
+
+
+def _hook_file_rows_cached(store, path: Path) -> list[dict] | None:
+    """One local hook file's rows, `_hook_rows_from_lines(_read_text_lines(p))`, through
+    the cache (host "local", kind "hook"). None = unreadable (never stored). Stored only
+    if not racy and unchanged while read, like _parse_log_file_cached."""
+    sp = str(path)
+
+    def read():
+        lines = _read_text_lines(sp)
+        return None if lines is None else _hook_rows_from_lines(lines)
+    if store is None or not store.enabled or not _key_text_ok("local", sp):
+        return read()
+    sig = _file_sig(sp)
+    if sig is not None:
+        p = store.get("local", "hook", sp, sig, _HOOK_LOCAL_PARAMS)
+        if p is not None:
+            return p["events"]
+    store.counts["misses"] += 1
+    rows = read()
+    if rows is None:
+        return None
+    if sig is not None and _file_sig(sp) == sig and not _is_racy(sig, time.time_ns()):
+        store.put("local", "hook", sp, sig, {"events": rows, "stats": None}, _HOOK_LOCAL_PARAMS)
+    return rows
+
+
+def parse_hook_rows(cctrack_dir: Path | None = None, cache=None) -> list[dict]:
     """Parse statusline-*.jsonl files from a local hook data directory into
-    per-render rows. Also reads legacy statusline.jsonl for migration."""
+    per-render rows. Also reads legacy statusline.jsonl for migration. With `cache`,
+    each file's rows come through the parse cache; they are joined in file order and
+    stable-sorted again, which equals the single sort over all lines."""
     if cctrack_dir is None:
         cctrack_dir = CCTRACK_DIR
     if not cctrack_dir.exists():
         return []
 
-    files = sorted(cctrack_dir.glob("statusline-*.jsonl"))
-    legacy = cctrack_dir / "statusline.jsonl"
-    if legacy.exists():
-        files.append(legacy)
+    files = _hook_files(cctrack_dir)
+    if cache is not None:
+        rows: list[dict] = []
+        for filepath in files:
+            r = _hook_file_rows_cached(cache, filepath)
+            if r is not None:
+                rows.extend(r)
+        rows.sort(key=lambda r: (r["session_id"], r["ts"]))
+        return rows
 
     lines: list[str] = []
     for filepath in files:
@@ -4796,13 +5128,23 @@ def _note_remote_timing(timing: "_Timing", host: str) -> None:
     phase = f"remote {host}"
     b = _remote_bundle_cache.get(host) or {}
     if b.get("ok"):
-        timing.detail(phase, f"{format_bytes(b.get('_wire_bytes', 0))} received")
+        detail = f"{format_bytes(b.get('_wire_bytes', 0))} received"
+        if b.get("_cached"):
+            c = b.get("cache_counts", {})
+            detail += f"; cache: {c.get('reused', 0):,} reused, {c.get('read', 0):,} read"
+        if b.get("_refetched"):
+            detail += "; refetched"
+        timing.detail(phase, detail)
         if phase not in timing.subs and b.get("timing"):
             census = b["timing"].get("census", {})
             for name, secs in b["timing"]["phases"].items():
                 timing.sub(phase, f"on {host}: {name}", secs,
                            _census_text(census[name]) if name in census else "")
-            timing.other(phase, f"on {host}: other", "ssh, encode, transfer, local decode")
+            if "_remote_encode" in b:
+                timing.sub(phase, f"on {host}: encode", b["_remote_encode"])
+            timing.sub(phase, "local: decode", b.get("_local_decode", 0.0))
+            timing.sub(phase, "local: merge", b.get("_local_merge", 0.0))
+            timing.other(phase, f"on {host}: other", "ssh, transfer and the rest")
     elif b.get("fallback"):
         timing.detail(phase, "raw stream")
     elif b.get("failed"):
@@ -4962,11 +5304,14 @@ def main():
         hook_dirs = discover_hook_data_dirs() if want_claude else []
         timing.phase("hook read")
         hook_progress = Progress("Reading statusline hook data")
+        h0 = _cache_hits(store)
+        n_hook = 0
         for i, hdir in enumerate(hook_dirs, 1):
             hook_progress.update(f"{i}/{len(hook_dirs)} folders", force=True)
             rollup_old_hook_files(hdir)
+            n_hook += len(_hook_files(hdir))
             baselines = load_session_baselines(hdir)
-            rows = parse_hook_rows(hdir)
+            rows = parse_hook_rows(hdir, cache=store)
             local_hook_rows.extend(rows)
             for sid, base in baselines.items():
                 if sid not in local_baselines or base.get("date", "") < local_baselines[sid].get("date", ""):
@@ -4974,6 +5319,7 @@ def main():
             local_hook_events.extend(compute_hook_deltas(rows, baselines))
             merge_monthly_summaries(local_hook_monthly, load_monthly_hook_summaries(hdir))
         hook_progress.done()
+        _note_cache_use(timing, "hook read", store, h0, n_hook)
 
         local_hook_daily: dict = {}
         if local_hook_events or local_hook_monthly:
@@ -5025,7 +5371,7 @@ def main():
                 # below then read from it, or stream raw logs if it fell back.
                 rphase = f"remote {host}"
                 timing.phase(rphase)
-                fetch_remote_bundle(host, want_claude, want_codex)
+                fetch_remote_bundle(host, want_claude, want_codex, cache=store)
                 if want_codex:
                     remote_codex = parse_remote_codex_events(host, file_stats)
                     _add_codex_source(host, remote_codex)

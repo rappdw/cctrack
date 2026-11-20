@@ -193,3 +193,38 @@ def test_raw_stream_is_gzipped_and_decoded():
     truncated = gzip.compress(b"x" * 100000)[:-20]
     assert cctrack._decode_stream(truncated).startswith("x")
     assert "gzip -c" in cctrack._gzip_wrapped("find .")
+
+
+def test_remote_parse_with_warm_cache_matches_raw_stream(host, monkeypatch):
+    import time
+    old = time.time_ns() - 3600 * 10**9
+    for f in Path(host["HOME"]).rglob("*"):
+        if f.is_file():
+            os.utime(f, ns=(old, old))
+
+    def collect(store):
+        cctrack._remote_bundle_cache.clear()
+        cctrack._remote_roots_cache.clear()
+        fs: dict = {}
+        cctrack.fetch_remote_bundle("dgx", True, True, cache=store)
+        return (cctrack.parse_remote_events("dgx", fs), cctrack.parse_remote_codex_events("dgx", fs),
+                cctrack.parse_remote_hook_data("dgx"), fs)
+
+    monkeypatch.setenv("CCTRACK_REMOTE_PARSE", "0")
+    raw = collect(None)
+    monkeypatch.setenv("CCTRACK_REMOTE_PARSE", "1")
+    store = cctrack.open_cache()
+    assert store is not None
+    cold = collect(store)
+    cold_bundle = cctrack._remote_bundle_cache["dgx"]
+    store.flush()
+    warm = collect(store)
+    warm_bundle = cctrack._remote_bundle_cache["dgx"]
+    for got in (cold, warm):
+        assert _sorted_events(got[0]) == _sorted_events(raw[0])
+        assert _sorted_events(got[1]) == _sorted_events(raw[1])
+        assert _canon(got[2]) == _canon(raw[2]) and _canon(got[3]) == _canon(raw[3])
+    assert cold_bundle["cache_counts"] == {"reused": 0, "read": 6}
+    assert warm_bundle["cache_counts"] == {"reused": 6, "read": 0}
+    assert warm_bundle["_wire_bytes"] < cold_bundle["_wire_bytes"]
+    store.close()

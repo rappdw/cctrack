@@ -14,7 +14,7 @@ The `/step` loop reads this table for dependencies and progress, and sets a row 
 | 3 | Cache store, standalone | 2 | done |
 | 4 | Local transcripts and rollouts through the cache | 1, 3 | done |
 | 5 | Local hook data | 4 | skipped (F10: hook read 3.3% of a run, under the 5% gate; local hook caching moved into Step 6 by Dan, 2026-11-20) |
-| 6 | Remote protocol v2 | 5 | todo |
+| 6 | Remote protocol v2 | 5 | done |
 | 7 | Documentation and release readiness | 6 | todo |
 | 8 | Resume inside a growing Claude transcript (optional, gated) | 7 | todo |
 
@@ -107,6 +107,7 @@ Readings for later steps:
 - Pricing and merging (aggregate 21.1 s + reconcile 16.5 s, which itself re-aggregates) are 17% of the run and are not removed by any cache: Step 1 matters.
 - Files changed within 24 h are a large share of the bytes on dgx: 3.5 GB of 5.3 GB of Claude transcripts, and one 2.6 GB Codex rollout. A per-file cache re-reads those in full, so on dgx a warm run would still parse roughly 6 GB. This is the evidence Step 8 asks for (for Claude); Codex is excluded from Step 8 as briefed, so the 2.6 GB rollout would stay a full re-read.
 - "on dgx: other" (30 s) covers encoding, transfer and local decode of 28.7 MB; Step 6's planner should check how much of it is local `_untag_json` decode.
+  *Step 6 finding:* a synthetic 27.7 MB reply decodes locally in 1.9–2.4 s on the planner's sandbox (zlib 0.2–0.3 s, `json.loads` 0.5–0.6 s, `_untag_json` 1.2–1.5 s) and takes 2.9 s to encode on the remote side. Real ids compress better, so estimate 2–4 s decode and 3–5 s encode for the real reply. That leaves roughly 20 s of ssh and transfer, which only the real machines can measure. Step 6 adds `on <host>: encode`, `local: decode` and `local: merge` timing sub-lines to split it.
 
 ## 4. Design
 
@@ -134,7 +135,7 @@ Every entry records a hash of the running module's source (`Path(__file__).read_
 
 ### 4.4 Store
 
-- One SQLite file, `entries(host, kind, path, size, mtime_ns, code, payload BLOB, stored_at, last_used)` with primary key `(host, kind, path)`; `host` is `local` or the `--remote` name; `kind` is `claude`, `codex` or `hook`.
+- One SQLite file, `entries(host, kind, path, size, mtime_ns, code, payload BLOB, stored_at, last_used)` with primary key `(host, kind, path)`; `host` is `local` or `remote:<--remote name>` (Step 6: the prefix keeps a host literally named `local` apart from this machine's rows); `kind` is `claude`, `codex` or `hook`.
 - Location: `$CCTRACK_CACHE_DIR`, else `$XDG_CACHE_HOME/cctrack`, else `~/.cache/cctrack`. Directory mode 0700, file 0600. Contents are ids, paths, working directories and counts, the same sensitivity as the logs' metadata; no prompt or response content.
 - Commit in batches during a run so an interrupted cold run keeps its progress.
 - Two cctrack runs at once must both produce correct reports; one may run uncached. Use a short busy timeout.
@@ -164,6 +165,14 @@ Protocol v2, still one SSH call, remote still read-only:
 2. Remote runs its normal discovery. For each file, in discovery order: if `(size, mtime_ns)` matches the manifest and the file is not racy by the remote clock, emit a hit marker; otherwise parse it and emit that file's `{events, stats}`. **Per file, before any cross-file dedup.**
 3. Local walks the response in order, loading hits from the cache and storing misses, then runs `dedup_events` over the per-file lists itself. That is the same function over the same lists in the same order as `_parse_remote_files` runs today, so the per-host result is unchanged.
 4. A hit the local cache cannot supply (pruned or corrupt between steps) triggers one full refetch with an empty manifest.
+
+*Step 6 additions* (see `docs/plans/steps/06-remote-protocol-v2.md`):
+- **Rows.** Remote rows live under host key `remote:<name>`. Their code is the local code key followed by `["remote", host, rkey]`. The local key covers the shipped source and the local payload format. `rkey` is the remote's interpreter and default text encoding. The manifest is `{rkey, files}`, and the remote ignores it when its own rkey differs.
+- **The manifest is skipped** when the module on disk no longer matches the open store's key.
+- **Hit marker.** It carries the file's current `(size, mtime_ns)`, and local `get` re-checks it, so a wrong remote hit costs a refetch, never a wrong report.
+- **Misses.** A miss carries a storable flag set by the remote's racy and changed-during-read rules.
+- **Hook files** are per-file items parsed with the remote blob's line splitting (`_hook_rows_from_blob_text`), in v1's file order across all hook dirs. Local joins them and does the one stable sort. Monthly and baseline files are always read. If a missed statusline file contains the monthly or baseline separator text, the remote returns v1's whole-blob hook result for that run, because the blob's partitioning then crosses file boundaries.
+- **Local hook files** are cached per file too (host `local`, after `rollup_old_hook_files`).
 
 An unreachable or timed-out host behaves as today: its data is missing and the warning says so. Cached data for that host is not used. (Decision D1.)
 
