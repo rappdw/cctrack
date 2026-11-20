@@ -932,16 +932,14 @@ def _parse_remote_files(host: str, items, parser, file_stats: dict | None) -> li
     """(path, lines) per file → events, exactly as for a streamed remote host.
     Shared by the raw stream and by _remote_collect running on the host, so
     both paths produce the same events."""
+    kind = _log_kind(parser)
     lists = []
     for path, lines in items:
         label = f"{host}:{path}" if path else f"(remote {host})"
-        st = new_parse_stats() if file_stats is not None else None
-        events = parser(lines, source=host, stats=st)
+        r = _parse_log_lines(kind, lines, label, source=host, want_stats=file_stats is not None)
         if file_stats is not None and path:
-            file_stats[label] = st
-        for e in events:
-            _tag_event_file(e, label)
-        lists.append(events)
+            file_stats[label] = r["stats"]
+        lists.append(r["events"])
     return dedup_events(lists)
 
 
@@ -1788,6 +1786,65 @@ def dedup_events(event_lists) -> list[dict]:
     return _remove_codex_fork_replays([e for e in out if e is not None])
 
 
+LOG_KINDS = ("claude", "codex")
+
+
+def _read_log_lines(kind: str, path: str) -> list[str] | None:
+    """One log file's lines exactly as the parsers have always received them, or
+    None if unreadable. Codex `.jsonl.zst`: `_read_zstd(path).splitlines()` (None
+    if it can't be decoded). Everything else: `_read_text_lines(path)`
+    (`readlines()`, errors="replace", None on OSError). Line splitting differs
+    between the two on purpose: `splitlines()` also breaks on U+2028."""
+    if kind not in LOG_KINDS:
+        raise ValueError(f"unknown log kind {kind!r}")
+    if kind == "codex" and path.endswith(".zst"):
+        text = _read_zstd(path)
+        return None if text is None else text.splitlines()
+    return _read_text_lines(path)
+
+
+def _parse_log_lines(kind: str, lines: list[str], label: str, *, source: str = "local",
+                     want_stats: bool = False, agent_id_from_name: bool = False) -> dict:
+    """Parse one file's lines -> {"events": [...], "stats": dict | None}.
+    Events are the parser's in-file-deduped output, each tagged with
+    `_tag_event_file(e, label)`; no cross-file step has seen them.
+    `agent_id_from_name` (local Claude only) fills a sidechain event's missing
+    agent_id from an `agent-<id>.jsonl` file name."""
+    parser = {"claude": parse_lines, "codex": parse_codex_lines}.get(kind)
+    if parser is None:
+        raise ValueError(f"unknown log kind {kind!r}")
+    st = new_parse_stats() if want_stats else None
+    events = parser(lines, source=source, stats=st)
+    for e in events:
+        _tag_event_file(e, label)
+        if agent_id_from_name and e.get("is_sidechain") and not e.get("agent_id"):
+            # Older subagent transcripts lack agentId; the file name has it.
+            name = Path(label).name
+            if name.startswith("agent-") and name.endswith(".jsonl"):
+                e["agent_id"] = name[len("agent-"):-len(".jsonl")]
+    return {"events": events, "stats": st}
+
+
+def _parse_log_file(kind: str, path: str, *, source: str = "local", label: str | None = None,
+                    want_stats: bool = False, agent_id_from_name: bool = False) -> dict | None:
+    """The per-file seam: read `path` and parse it. None = unreadable (OSError, or
+    an undecodable .zst). `label` (default `path`) is what events are tagged with."""
+    lines = _read_log_lines(kind, path)
+    if lines is None:
+        return None
+    return _parse_log_lines(kind, lines, path if label is None else label, source=source,
+                            want_stats=want_stats, agent_id_from_name=agent_id_from_name)
+
+
+def _log_kind(parser) -> str:
+    """Map the parser function that `_remote_parse`/`_parse_remote_files` take to its kind."""
+    if parser is parse_lines:
+        return "claude"
+    if parser is parse_codex_lines:
+        return "codex"
+    raise ValueError(f"unknown log parser {parser!r}")
+
+
 def parse_events(files: list[str], file_stats: dict | None = None) -> list[dict]:
     """Parse all local JSONL files. Dedup API message identities across files
     so resumed sessions aren't double counted. Each event
@@ -1798,24 +1855,15 @@ def parse_events(files: list[str], file_stats: dict | None = None) -> list[dict]
     progress = Progress("Reading Claude transcripts")
     for i, path in enumerate(files, 1):
         progress.update(f"{i:,}/{len(files):,} files")
-        st = new_parse_stats() if file_stats is not None else None
-        try:
-            with open(path, "r", errors="replace") as f:
-                events = parse_lines(f.readlines(), stats=st)
-        except (OSError, IOError):
+        r = _parse_log_file("claude", path, want_stats=file_stats is not None,
+                            agent_id_from_name=True)
+        if r is None:
             if file_stats is not None:
                 file_stats[path] = {**new_parse_stats(), "unreadable": True}
             continue
         if file_stats is not None:
-            file_stats[path] = st
-        for e in events:
-            _tag_event_file(e, path)
-            # Older subagent transcripts lack agentId; the file name has it.
-            if e.get("is_sidechain") and not e.get("agent_id"):
-                name = Path(path).name
-                if name.startswith("agent-") and name.endswith(".jsonl"):
-                    e["agent_id"] = name[len("agent-"):-len(".jsonl")]
-        event_lists.append(events)
+            file_stats[path] = r["stats"]
+        event_lists.append(r["events"])
     progress.update("removing duplicates", force=True)
     try:
         return dedup_events(event_lists)
@@ -2208,29 +2256,16 @@ def parse_codex_events(files: list[str], source: str = "local",
     progress = Progress("Reading Codex rollouts")
     for i, path in enumerate(files, 1):
         progress.update(f"{i:,}/{len(files):,} files")
-        st = new_parse_stats() if file_stats is not None else None
-        if path.endswith(".zst"):
-            text = _read_zstd(path)
-            if text is None:
+        r = _parse_log_file("codex", path, source=source, want_stats=file_stats is not None)
+        if r is None:
+            if path.endswith(".zst"):
                 skipped += 1
-                if file_stats is not None:
-                    file_stats[path] = {**new_parse_stats(), "unreadable": True}
-                continue
-            lines = text.splitlines()
-        else:
-            try:
-                with open(path, "r", errors="replace") as f:
-                    lines = f.readlines()
-            except OSError:
-                if file_stats is not None:
-                    file_stats[path] = {**new_parse_stats(), "unreadable": True}
-                continue
-        events = parse_codex_lines(lines, source=source, stats=st)
+            if file_stats is not None:
+                file_stats[path] = {**new_parse_stats(), "unreadable": True}
+            continue
         if file_stats is not None:
-            file_stats[path] = st
-        for e in events:
-            _tag_event_file(e, path)
-        event_lists.append(events)
+            file_stats[path] = r["stats"]
+        event_lists.append(r["events"])
     progress.done()
     return dedup_events(event_lists), skipped
 
@@ -2357,7 +2392,7 @@ def _remote_collect(host: str, want_claude: bool, want_codex: bool, timing: bool
         def claude_items():
             for i, path in enumerate(files, 1):
                 progress.update(f"{i:,}/{len(files):,} files")
-                lines = _read_text_lines(path)
+                lines = _read_log_lines("claude", path)
                 if lines is not None:
                     yield path, lines
         out["claude"] = _parse_remote_files(host, claude_items(), parse_lines, stats)
@@ -2403,16 +2438,12 @@ def _remote_collect(host: str, want_claude: bool, want_codex: bool, timing: bool
         def codex_items():
             for i, path in enumerate(files, 1):
                 progress.update(f"{i:,}/{len(files):,} files")
-                if path.endswith(".zst"):
-                    text = _read_zstd(path)
-                    if text is None:
+                lines = _read_log_lines("codex", path)
+                if lines is None:
+                    if path.endswith(".zst"):
                         skipped[0] += 1
-                        continue
-                    yield path, text.splitlines()
-                else:
-                    lines = _read_text_lines(path)
-                    if lines is not None:
-                        yield path, lines
+                    continue
+                yield path, lines
         out["codex"] = _parse_remote_files(host, codex_items(), parse_codex_lines, stats)
         out["codex_stats"] = stats
         out["zst_skipped"] = skipped[0]
