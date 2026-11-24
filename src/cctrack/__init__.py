@@ -3390,7 +3390,14 @@ def _hook_streams(session_rows: list[dict], order) -> list[list[dict]]:
     return [rs for _, rs in sorted(by_source.items())]
 
 
-def compute_hook_deltas(rows: list[dict], baselines: dict | None = None) -> list[dict]:
+# A drop to at most this fraction of the previous reading is a restarted
+# process (Claude Code's counter starts again near $0); a smaller drop is
+# another process writing the same session id (see compute_hook_deltas).
+HOOK_RESTART_FRACTION = 0.1
+
+
+def compute_hook_deltas(rows: list[dict], baselines: dict | None = None,
+                        marks: dict | None = None) -> list[dict]:
     """Convert per-render cumulative cost readings into per-(session, date)
     spend, walking every row of each session in timestamp order.
 
@@ -3407,14 +3414,17 @@ def compute_hook_deltas(rows: list[dict], baselines: dict | None = None) -> list
       and count upward from there. A session that genuinely starts on the
       observed day first renders near $0, so nothing real is lost.
 
-    * A drop rebaselines WITHOUT counting the new level. The counter falls back
-      on resume/compaction (or when parallel processes under one session id
-      interleave their own cumulatives). The pre-drop dollars were already
-      spent — not new — so re-adding the post-drop level would let a day's
-      booked spend exceed the counter's own peak, which is impossible for real
-      money (observed: a session whose counter never passed $1,086 was booked
-      at $2,083). After a drop we resume counting increments from the lower
-      level.
+    * A drop to near zero (at most HOOK_RESTART_FRACTION of the previous
+      reading) is a restarted process: counting resumes from the new, low
+      level, so the restarted process's own climb is booked.
+
+    * Any other drop is a second process writing the same session id from a
+      lower cumulative (a "background session", a sandbox started twice).
+      Only rises above the highest level counted so far are booked, so
+      switching between two processes' counters books nothing. Counting from
+      each lower level instead booked $984 for a session whose counter only
+      ever climbed $731 (2026-09), and $2,083 for one that never passed
+      $1,086. A day's booked spend therefore can't exceed the counter's climb.
 
     * Machines (`_source`) that were live at the same time are differenced
       separately. A sandbox rsynced to another host and started there too
@@ -3431,7 +3441,8 @@ def compute_hook_deltas(rows: list[dict], baselines: dict | None = None) -> list
     already folded into a monthly summary aren't recounted — the same "count
     only increments above the baseline" rule. Records with zero spend are
     dropped. Rows lacking `ts` sort by `date_str`, so callers may pass one
-    aggregated reading per day.
+    aggregated reading per day. `marks`, if given, receives each session's
+    final counted level (the next rollup's baseline).
 
     Only cost is derived from hook data — see _hook_rows_from_lines for why the
     hook's token fields are unusable."""
@@ -3451,19 +3462,24 @@ def compute_hook_deltas(rows: list[dict], baselines: dict | None = None) -> list
         for stream in _hook_streams(session_rows, order):
             # None → not yet observed; the first render sets the baseline and is
             # not counted. A rolled-up baseline is a real prior level to count from.
-            prev = float(base["cost_usd"]) if base else None
+            # `mark` is the highest level counted since the last restart.
+            prev = mark = float(base["cost_usd"]) if base else None
             for r in stream:
                 cur = float(r.get("cost_usd", 0.0))
                 key = (sid, r["date_str"], r.get("_source", ""))
                 if r.get("model"):
                     day_model.setdefault(key, r["model"])
                 if prev is None:
-                    prev = cur                               # first observation → baseline
-                elif cur < prev - max(1e-6, abs(prev) * 0.001):
-                    prev = cur                               # counter dropped → rebaseline
-                else:
-                    day_cost[key] += cur - prev              # normal climb → count increment
-                    prev = cur
+                    prev = mark = cur                        # first observation → baseline
+                    continue
+                if cur < prev - max(1e-6, abs(prev) * 0.001) and cur <= HOOK_RESTART_FRACTION * prev:
+                    mark = cur                               # restarted process → count from here
+                elif cur > mark:
+                    day_cost[key] += cur - mark              # new high → count the rise
+                    mark = cur
+                prev = cur
+            if marks is not None and mark is not None:
+                marks[sid] = max(marks.get(sid, mark), mark)
 
     result = []
     for (sid, date_str, source), cost in day_cost.items():
@@ -3568,19 +3584,23 @@ def rollup_old_hook_files(cctrack_dir: Path | None = None,
 
     day_costs: dict[str, float] = defaultdict(float)
     day_session_ids: dict[str, set] = defaultdict(set)
-    for d in compute_hook_deltas(rows, baselines):
+    marks: dict[str, float] = {}
+    for d in compute_hook_deltas(rows, baselines, marks=marks):
         day_costs[d["date_str"]] += d["cost_usd"]
         day_session_ids[d["date_str"]].add(d["session_id"])
 
-    # Record each session's final cumulative so the next pass — and any live
+    # Record each session's counted level so the next pass — and any live
     # statusline data for the same session — resumes from the right point.
-    by_session: dict[str, list[dict]] = defaultdict(list)
+    # The highest counted level, not the last reading: the last reading may be
+    # a second process's lower counter, and seeding from it would let the
+    # higher one be counted again.
+    last_day: dict[str, str] = {}
     for r in rows:
-        by_session[r["session_id"]].append(r)
-    for sid, session_rows in by_session.items():
-        session_rows.sort(key=lambda r: r["ts"])
-        last = session_rows[-1]
-        baselines[sid] = {"date": last["date_str"], "cost_usd": last["cost_usd"]}
+        if r["date_str"] > last_day.get(r["session_id"], ""):
+            last_day[r["session_id"]] = r["date_str"]
+    for sid, mark in marks.items():
+        baselines[sid] = {"date": last_day.get(sid, baselines.get(sid, {}).get("date", "")),
+                          "cost_usd": mark}
 
     # Prune baselines for sessions long past the cutoff (no live data can
     # reference them anymore), then persist.
