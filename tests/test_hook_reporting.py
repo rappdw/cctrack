@@ -781,230 +781,147 @@ def test_read_hook_config_invalid_json():
     assert config is None
 
 
-# ── Accuracy factor tests ──────────────────────────────────────────────
+# ── Report cost composition: transcripts first ─────────────────────────
+#
+# Since 0.12.3 every session-day with a transcript is priced from its tokens at
+# list price; the statusline hook adds only session-days that have no
+# transcript. (Before, the hook's figure replaced the transcripts for a whole
+# machine-day, which dropped sessions the hook never saw: 2026-11-05 showed
+# $116.50 for $576 of usage.)
 
-def test_accuracy_factor_computed():
-    """Accuracy factor is ratio of hook cost to JSONL cost for overlapping dates."""
-    daily = {
-        "2026-04-14": make_bucket(cost=4.00),  # pre-hook
-        "2026-04-15": make_bucket(cost=5.00),  # overlapping
-        "2026-04-16": make_bucket(cost=6.00),  # overlapping
-    }
-    hook_daily = {
-        "2026-04-15": {"cost": 6.25, "sessions": 2},   # 1.25x
-        "2026-04-16": {"cost": 7.50, "sessions": 1},    # 1.25x
-    }
-    factor, is_measured = cctrack._compute_accuracy_factor(daily, hook_daily, "2026-04-15")
-    # hook total = 6.25 + 7.50 = 13.75; jsonl total = 5.00 + 6.00 = 11.00
-    assert is_measured is True
-    assert abs(factor - (13.75 / 11.00)) < 0.001
+def _report(daily, monthly, fake_now, **kw):
+    with patch("cctrack.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        mock_dt.fromisoformat = datetime.fromisoformat
+        mock_dt.side_effect = lambda *a, **kw2: datetime(*a, **kw2)
+        cctrack.print_report(daily, monthly, **kw)
 
 
-def test_accuracy_factor_default_when_no_overlap():
-    """No overlapping dates falls back to default factor."""
-    daily = {"2026-04-14": make_bucket(cost=4.00)}
-    hook_daily = {"2026-04-15": {"cost": 6.00, "sessions": 1}}
-    factor, is_measured = cctrack._compute_accuracy_factor(daily, hook_daily, "2026-04-15")
-    assert is_measured is False
-    assert factor == cctrack.DEFAULT_ACCURACY_FACTOR
+def _row(out, label):
+    return next(l for l in out.splitlines() if l.startswith(f"  {label}"))
 
 
-def test_accuracy_factor_default_when_no_hook_install_date():
-    """No hook install date falls back to default factor."""
-    daily = {"2026-04-15": make_bucket(cost=5.00)}
-    hook_daily = {"2026-04-15": {"cost": 6.00, "sessions": 1}}
-    factor, is_measured = cctrack._compute_accuracy_factor(daily, hook_daily, None)
-    assert is_measured is False
-    assert factor == cctrack.DEFAULT_ACCURACY_FACTOR
+def _cost(row):
+    """(cost, markers) from a report row."""
+    tail = row.split("$")[-1].split()
+    return float(tail[0].replace(",", "")), "".join(tail[1:])
 
 
-def test_accuracy_factor_ignores_pre_hook_dates():
-    """Only dates strictly after hook install are considered."""
-    daily = {
-        "2026-04-14": make_bucket(cost=10.00),
-        "2026-04-16": make_bucket(cost=5.00),
-    }
-    hook_daily = {
-        "2026-04-14": {"cost": 12.00, "sessions": 1},  # before hook install, ignored
-        "2026-04-16": {"cost": 6.25, "sessions": 1},
-    }
-    factor, is_measured = cctrack._compute_accuracy_factor(daily, hook_daily, "2026-04-15")
-    assert is_measured is True
-    assert abs(factor - 1.25) < 0.001
-
-
-def test_accuracy_factor_excludes_install_day():
-    """The install day has partial hook coverage (only post-install sessions),
-    so including it would bias the factor low. It must be excluded."""
-    daily = {
-        "2026-04-15": make_bucket(cost=10.00),  # install day: full-day JSONL
-        "2026-04-16": make_bucket(cost=5.00),
-    }
-    hook_daily = {
-        "2026-04-15": {"cost": 2.00, "sessions": 1},   # partial-day hook — would drag factor down
-        "2026-04-16": {"cost": 6.25, "sessions": 1},
-    }
-    factor, is_measured = cctrack._compute_accuracy_factor(daily, hook_daily, "2026-04-15")
-    assert is_measured is True
-    assert abs(factor - 1.25) < 0.001  # 6.25/5.00 only — install day excluded
-
-
-def test_accuracy_factor_per_source_ignores_hookless_host():
-    """A hook-less machine's JSONL must not inflate the factor denominator."""
-    hooked = {
-        "daily": {"2026-04-16": make_bucket(cost=4.00)},
-        "hook_daily": {"2026-04-16": {"cost": 5.00, "sessions": 1}},
-        "install_date": "2026-04-15",
-    }
-    hookless = {
-        "daily": {"2026-04-16": make_bucket(cost=100.00)},  # would swamp the ratio
-        "hook_daily": {},
-        "install_date": None,
-    }
-    factor, is_measured = cctrack._compute_accuracy_factor_sources([hooked, hookless])
-    assert is_measured is True
-    assert abs(factor - 1.25) < 0.001
-
-
-def test_accuracy_factor_default_when_zero_jsonl_cost():
-    """Zero JSONL cost on overlapping date falls back to default."""
-    daily = {"2026-04-15": make_bucket(cost=0.0)}
-    hook_daily = {"2026-04-15": {"cost": 5.00, "sessions": 1}}
-    factor, is_measured = cctrack._compute_accuracy_factor(daily, hook_daily, "2026-04-15")
-    assert is_measured is False
-    assert factor == cctrack.DEFAULT_ACCURACY_FACTOR
-
-
-# ── Report output with hook data only (all authoritative) ──────────────
-
-def test_print_report_hook_only(capsys):
-    """When all days have hook data, post-install days are authoritative,
-    install day uses max(hook, adjusted JSONL)."""
+def test_transcript_days_are_priced_from_transcripts(capsys):
+    """The hook's figure never replaces a day's transcript cost, whether it is
+    higher (a runaway counter) or lower (missed redraws)."""
     fake_now = datetime(2026, 4, 17, 12, 0, 0, tzinfo=timezone.utc)
-
-    daily = {
-        "2026-04-15": make_bucket(input=1000, output=500, cost=3.00),
-        "2026-04-16": make_bucket(input=2000, output=1000, cost=5.00),
-    }
+    daily = {"2026-04-15": make_bucket(input=1000, output=500, cost=3.00),
+             "2026-04-16": make_bucket(input=2000, output=1000, cost=5.00)}
     monthly = {"2026-04": make_bucket(input=3000, output=1500, cost=8.00)}
-    hook_daily = {
-        "2026-04-15": {"cost": 3.75, "sessions": 1},
-        "2026-04-16": {"cost": 6.25, "sessions": 2},
-    }
-
-    with patch("cctrack.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.fromisoformat = datetime.fromisoformat
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        cctrack.print_report(daily, monthly, hook_daily=hook_daily,
-                             hook_install_date="2026-04-15")
-
+    hook_daily = {"2026-04-15": {"cost": 30.00, "sessions": 1},
+                  "2026-04-16": {"cost": 1.00, "sessions": 2}}
+    _report(daily, monthly, fake_now, hook_daily=hook_daily, hook_install_date="2026-04-01")
     out = capsys.readouterr().out
-    assert "Claude Code Cost Report" in out
-    # Install day (04-15): max(3.75, 3.00*1.25) = 3.75, estimated
-    # Post-install (04-16): 6.25, authoritative
-    # Total: 3.75 + 6.25 = 10.00
-    assert "10.00" in out
-    # Install day is estimated, so tilde appears
-    assert "~" in out
-    assert "1d authoritative" in out
+    assert _cost(_row(out, "2026-04-15")) == (3.00, "")
+    assert _cost(_row(out, "2026-04-16")) == (5.00, "")
+    assert "Total cost:     $8.00\n" in out
+    assert "authoritative" not in out and "adjust" not in out and "~" not in out
 
 
-def test_print_report_post_install_day_no_tilde(capsys):
-    """Post-install days are authoritative with no ~ marker."""
+def test_hook_only_days_are_added_and_marked(capsys):
+    """A day with hook data and no transcript keeps the hook's cost, marked h."""
     fake_now = datetime(2026, 4, 17, 12, 0, 0, tzinfo=timezone.utc)
-
-    daily = {
-        "2026-04-15": make_bucket(input=500, cost=2.00),
-        "2026-04-16": make_bucket(input=1000, cost=4.00),
-    }
-    monthly = {"2026-04": make_bucket(input=1500, cost=6.00)}
-    hook_daily = {
-        "2026-04-15": {"cost": 2.50, "sessions": 1},
-        "2026-04-16": {"cost": 5.00, "sessions": 1},
-    }
-
-    with patch("cctrack.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.fromisoformat = datetime.fromisoformat
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        cctrack.print_report(daily, monthly, hook_daily=hook_daily,
-                             hook_install_date="2026-04-15")
-
+    daily = {"2026-04-15": make_bucket(input=1000, cost=3.00)}
+    monthly = {"2026-04": make_bucket(input=1000, cost=3.00)}
+    hook_daily = {"2026-04-15": {"cost": 3.75, "sessions": 1},
+                  "2026-04-16": {"cost": 5.00, "sessions": 2}}
+    _report(daily, monthly, fake_now, hook_daily=hook_daily, hook_install_date="2026-04-15")
     out = capsys.readouterr().out
-    lines = out.split("\n")
-    # Post-install day (04-16) should use hook cost, no tilde
-    date_16_lines = [l for l in lines if "2026-04-16" in l]
-    assert len(date_16_lines) >= 1
-    assert "5.00" in date_16_lines[0]
-    assert "~" not in date_16_lines[0]
-    # Install day (04-15) gets tilde since it's partial
-    date_15_lines = [l for l in lines if "2026-04-15" in l]
-    assert len(date_15_lines) >= 1
-    assert "~" in date_15_lines[0]
+    cost, marks = _cost(_row(out, "2026-04-16"))
+    assert cost == 5.00 and "h" in marks          # also "!": $5 shown, $0 of tokens
+    assert _cost(_row(out, "2026-04-15")) == (3.00, "")
+    assert "Total cost:     $8.00 (incl. $5.00 from the hook for sessions with no transcript)" in out
+    assert "h = includes the hook's cost for sessions with no transcript" in out
 
 
-# ── Report output with mixed hook + JSONL data ────────────────────────
+def test_session_days_without_transcripts_add_to_transcribed_days(capsys):
+    """reconcile_sources separates, per session-day, hook cost the transcripts
+    don't cover; it adds to that day's transcript cost."""
+    fake_now = datetime(2026, 11, 6, 12, 0, 0, tzinfo=timezone.utc)
+    day = "2026-11-05"
+    seen = {"session_id": "seen", "ts": f"{day}T10:00:00+00:00", "date_str": day,
+            "cost_usd": 0.0, "model": "m"}
+    rows = [seen, {**seen, "ts": f"{day}T11:00:00+00:00", "cost_usd": 82.0},
+            {**seen, "session_id": "lost", "cost_usd": 0.0},
+            {**seen, "session_id": "lost", "ts": f"{day}T11:00:00+00:00", "cost_usd": 7.0}]
+    events = [{"model": "claude-opus-5-5", "timestamp": f"{day}T10:30:00Z", "input": 0,
+               "output": 1_000_000, "cache_read": 0, "cache_write": 0, "cache_write_1h": 0,
+               "_request_id": f"r{sid}", "source": "local", "session_id": sid,
+               "agent": "claude"} for sid in ("seen", "unseen")]              # $20 each
+    src = {"name": "local", "agent": "claude", "daily": {}, "hook_daily": {},
+           "install_date": "2026-11-01", "deltas": [], "_hook_rows": rows}
+    events = cctrack.reconcile_sources(events, [src])
+    assert src["hook_only_daily"] == {day: 7.0}
+    daily, monthly = cctrack.aggregate(events)
+    _report(daily, monthly, fake_now, sources=[src])
+    out = capsys.readouterr().out
+    # $40 of transcripts (the hook's $82 for "seen" is not used) + $7 hook-only.
+    assert _cost(_row(out, day)) == (47.00, "h")
 
-def test_print_report_mixed_data(capsys):
-    """Some days authoritative, some adjusted. Install day is estimated."""
+
+def test_rolled_up_hook_days_count_only_without_transcripts(capsys):
+    """Rolled-up hook days (no session detail) fill a day only when the source
+    has no transcript that day."""
     fake_now = datetime(2026, 4, 17, 12, 0, 0, tzinfo=timezone.utc)
-
-    daily = {
-        "2026-04-14": make_bucket(input=1000, cost=3.00),   # pre-hook
-        "2026-04-15": make_bucket(input=2000, cost=5.00),   # install day
-        "2026-04-16": make_bucket(input=1500, cost=4.00),   # post-hook
-    }
-    monthly = {"2026-04": make_bucket(input=4500, cost=12.00)}
-    hook_daily = {
-        "2026-04-15": {"cost": 6.25, "sessions": 1},
-        "2026-04-16": {"cost": 5.00, "sessions": 2},
-    }
-
-    with patch("cctrack.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.fromisoformat = datetime.fromisoformat
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        cctrack.print_report(daily, monthly, hook_daily=hook_daily,
-                             hook_install_date="2026-04-15")
-
+    src = {"name": "local", "agent": "claude", "install_date": "2026-01-01",
+           "daily": {"2026-03-02": make_bucket(input=10, cost=4.00)},
+           "hook_daily": {"2026-03-01": {"cost": 9.00}, "2026-03-02": {"cost": 50.00}},
+           "hook_only_daily": {},
+           "hook_rolled_daily": {"2026-03-01": 9.00, "2026-03-02": 50.00}}
+    daily = {"2026-03-02": make_bucket(input=10, cost=4.00)}
+    monthly = {"2026-03": make_bucket(input=10, cost=4.00)}
+    _report(daily, monthly, fake_now, sources=[src])
     out = capsys.readouterr().out
-    # 04-14: pre-hook adjusted 3.00*1.25=3.75
-    # 04-15: install day max(6.25, 5.00*1.25=6.25)=6.25, estimated
-    # 04-16: post-hook 5.00, authoritative
-    # Total: 3.75 + 6.25 + 5.00 = 15.00
-    assert "1d authoritative" in out
-    assert "2d adjusted" in out
-    assert "15.00" in out
-    assert "~" in out
+    assert "$  13.00" in _row(out, "2026-03")                   # 4 transcript + 9 rolled
 
 
-def test_print_report_mixed_shows_accuracy_factor(capsys):
-    """When post-install overlap exists, measured factor is shown in legend."""
+def test_previous_months_are_not_scaled(capsys):
     fake_now = datetime(2026, 4, 17, 12, 0, 0, tzinfo=timezone.utc)
-
-    daily = {
-        "2026-04-14": make_bucket(input=1000, cost=4.00),   # pre-hook, estimate
-        "2026-04-16": make_bucket(input=2000, cost=5.00),   # post-install, overlap
-    }
-    monthly = {"2026-04": make_bucket(input=3000, cost=9.00)}
-    hook_daily = {
-        "2026-04-16": {"cost": 6.25, "sessions": 1},  # 1.25x factor
-    }
-
-    with patch("cctrack.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.fromisoformat = datetime.fromisoformat
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        cctrack.print_report(daily, monthly, hook_daily=hook_daily,
-                             hook_install_date="2026-04-15")
-
+    daily = {"2026-04-16": make_bucket(input=1000, cost=4.00),
+             "2026-03-20": make_bucket(input=2000, cost=8.00),
+             "2026-03-21": make_bucket(input=1500, cost=6.00)}
+    monthly = {"2026-04": make_bucket(input=1000, cost=4.00),
+               "2026-03": make_bucket(input=3500, cost=14.00)}
+    hook_daily = {"2026-04-16": {"cost": 5.00, "sessions": 1}}
+    _report(daily, monthly, fake_now, hook_daily=hook_daily, hook_install_date="2026-04-15")
     out = capsys.readouterr().out
-    # Should mention measured undercount in legend
-    assert "measured" in out
-    assert "1.2x" in out
-    # Total: hook(6.25) + adjusted(4.00*1.25=5.00) = 11.25
-    assert "11.25" in out
+    assert "$  14.00" in _row(out, "2026-03")
+    assert "~" not in out
+
+
+def _merged_daily(*dailies):
+    merged: dict = {}
+    for d in dailies:
+        for k, b in d.items():
+            t = merged.setdefault(k, dict(make_bucket()))
+            for f in ("input", "output", "cache_read", "cache_write", "cost"):
+                t[f] = t.get(f, 0) + b.get(f, 0)
+    return merged
+
+
+def test_per_source_hosts_add_up(capsys):
+    """Every machine's transcript cost counts, whether or not it has a hook."""
+    fake_now = datetime(2026, 6, 13, 12, 0, 0, tzinfo=timezone.utc)
+    hooked = {"name": "pro", "daily": {"2026-06-12": make_bucket(input=1000, cost=4.00)},
+              "hook_daily": {"2026-06-12": {"cost": 5.00, "sessions": 1}},
+              "install_date": "2026-06-10"}
+    hookless = {"name": "dgx", "daily": {"2026-06-12": make_bucket(input=500, cost=100.00)},
+                "hook_daily": {}, "install_date": None}
+    two = {"name": "air", "daily": {"2026-06-12": make_bucket(input=200, cost=280.00)},
+           "hook_daily": {"2026-06-12": {"cost": 340.90, "sessions": 7}},
+           "install_date": "2026-06-01"}
+    daily = _merged_daily(hooked["daily"], hookless["daily"], two["daily"])
+    monthly = {"2026-06": make_bucket(input=1700, cost=384.00)}
+    _report(daily, monthly, fake_now, sources=[hooked, hookless, two])
+    out = capsys.readouterr().out
+    assert _cost(_row(out, "2026-06-12")) == (384.00, "")
+    assert _row(out, "2026-06-12").split()[5] == "8"           # sessions summed across hosts
 
 
 # ── Report output with JSONL only (no hook data) ──────────────────────
@@ -1064,29 +981,6 @@ def test_print_report_no_hook_with_days_limit(capsys):
     assert "2026-04-13" not in out
 
 
-# ── Edge case: hook installed today ────────────────────────────────────
-
-def test_print_report_hook_installed_today(capsys):
-    """Hook installed today: install day is estimated (partial hook coverage)."""
-    fake_now = datetime(2026, 4, 17, 12, 0, 0, tzinfo=timezone.utc)
-
-    daily = {"2026-04-17": make_bucket(input=500, cost=2.00)}
-    monthly = {"2026-04": make_bucket(input=500, cost=2.00)}
-    hook_daily = {"2026-04-17": {"cost": 2.50, "sessions": 1}}
-
-    with patch("cctrack.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.fromisoformat = datetime.fromisoformat
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        cctrack.print_report(daily, monthly, hook_daily=hook_daily,
-                             hook_install_date="2026-04-17")
-
-    out = capsys.readouterr().out
-    # Install day: max(2.50, 2.00*1.25=2.50) = 2.50, marked estimated
-    assert "2.50" in out
-    assert "~" in out
-
-
 # ── Hook data in previous months ───────────────────────────────────────
 
 def test_print_report_previous_months_with_hook(capsys):
@@ -1116,218 +1010,6 @@ def test_print_report_previous_months_with_hook(capsys):
     out = capsys.readouterr().out
     assert "Previous months:" in out
     assert "2026-03" in out
-
-
-# ── Hook-only dates (no JSONL for that date) ──────────────────────────
-
-def test_print_report_hook_date_without_jsonl(capsys):
-    """A date with hook data but no JSONL data still appears."""
-    fake_now = datetime(2026, 4, 17, 12, 0, 0, tzinfo=timezone.utc)
-
-    daily = {"2026-04-15": make_bucket(input=1000, cost=3.00)}
-    monthly = {"2026-04": make_bucket(input=1000, cost=3.00)}
-    hook_daily = {
-        "2026-04-15": {"cost": 3.75, "sessions": 1},
-        "2026-04-16": {"cost": 5.00, "sessions": 2},  # no JSONL for this date
-    }
-
-    with patch("cctrack.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.fromisoformat = datetime.fromisoformat
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        cctrack.print_report(daily, monthly, hook_daily=hook_daily,
-                             hook_install_date="2026-04-15")
-
-    out = capsys.readouterr().out
-    assert "2026-04-16" in out
-    assert "5.00" in out
-    # Total should include both: 3.75 + 5.00 = 8.75
-    assert "8.75" in out
-
-
-# ── Unaccounted cost estimation ────────────────────────────────────────
-
-def test_adjusted_cost_with_measured_factor(capsys):
-    """Pre-hook costs are adjusted by measured accuracy factor in totals and daily rows."""
-    fake_now = datetime(2026, 4, 17, 12, 0, 0, tzinfo=timezone.utc)
-
-    daily = {
-        "2026-04-13": make_bucket(input=1000, cost=4.00),   # pre-hook
-        "2026-04-14": make_bucket(input=1000, cost=4.00),   # pre-hook
-        "2026-04-15": make_bucket(input=2000, cost=8.00),   # post-hook
-        "2026-04-16": make_bucket(input=1500, cost=6.00),   # post-hook
-    }
-    monthly = {"2026-04": make_bucket(input=5500, cost=22.00)}
-    hook_daily = {
-        "2026-04-15": {"cost": 10.00, "sessions": 1},  # 1.25x
-        "2026-04-16": {"cost": 7.50, "sessions": 2},   # 1.25x
-    }
-
-    with patch("cctrack.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.fromisoformat = datetime.fromisoformat
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        cctrack.print_report(daily, monthly, hook_daily=hook_daily,
-                             hook_install_date="2026-04-15")
-
-    out = capsys.readouterr().out
-    # Factor = (10+7.5)/(8+6) = 17.5/14 = 1.25x
-    assert "1.25x" in out
-    # MTD: hook(10+7.5) + adjusted(4*1.25 + 4*1.25) = 17.5 + 10.0 = 27.50
-    assert "27.50" in out
-    # Tilde on pre-hook dates
-    assert "~" in out
-
-
-def test_adjusted_cost_without_overlap_uses_default(capsys):
-    """Without overlap, the default factor applies. It is 1.0: with correct
-    prices, logs and Claude Code's own cost agree (measured 0.99-1.02x)."""
-    fake_now = datetime(2026, 4, 17, 12, 0, 0, tzinfo=timezone.utc)
-
-    daily = {
-        "2026-04-13": make_bucket(input=1000, cost=4.00),   # pre-hook only
-        "2026-04-14": make_bucket(input=1000, cost=4.00),   # pre-hook only
-    }
-    monthly = {"2026-04": make_bucket(input=2000, cost=8.00)}
-    hook_daily = {
-        "2026-04-16": {"cost": 5.00, "sessions": 1},
-    }
-
-    with patch("cctrack.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.fromisoformat = datetime.fromisoformat
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        cctrack.print_report(daily, monthly, hook_daily=hook_daily,
-                             hook_install_date="2026-04-15")
-
-    out = capsys.readouterr().out
-    # MTD: estimated(4 + 4) + hook(5) = 13.00 — no unmeasured inflation
-    assert cctrack.DEFAULT_ACCURACY_FACTOR == 1.0
-    assert "13.00" in out
-    # Tilde on estimated days, and the legend says why
-    assert "~" in out
-    assert "no hook overlap" in out
-    assert "20-25%" not in out
-
-
-# ── Previous month accuracy estimation ─────────────────────────────────
-
-def test_previous_month_estimated_actual(capsys):
-    """Previous months with only JSONL data show estimated actual when factor available."""
-    fake_now = datetime(2026, 4, 17, 12, 0, 0, tzinfo=timezone.utc)
-
-    daily = {
-        "2026-04-16": make_bucket(input=1000, cost=4.00),
-        "2026-03-20": make_bucket(input=2000, cost=8.00),
-        "2026-03-21": make_bucket(input=1500, cost=6.00),
-    }
-    monthly = {
-        "2026-04": make_bucket(input=1000, cost=4.00),
-        "2026-03": make_bucket(input=3500, cost=14.00),
-    }
-    hook_daily = {
-        # post-install overlap → a MEASURED 1.25x factor (the install day
-        # itself is excluded from measurement)
-        "2026-04-16": {"cost": 5.00, "sessions": 1},
-    }
-
-    with patch("cctrack.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.fromisoformat = datetime.fromisoformat
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        cctrack.print_report(daily, monthly, hook_daily=hook_daily,
-                             hook_install_date="2026-04-15")
-
-    out = capsys.readouterr().out
-    # Previous month cost is JSONL-only: (8+6) × measured 1.25 = 17.50
-    assert "Previous months:" in out
-    assert "17.50" in out
-    assert "~" in out
-
-
-# ── Per-source cost composition ────────────────────────────────────────
-
-def _merged_daily(*dailies):
-    merged: dict = {}
-    for d in dailies:
-        for k, b in d.items():
-            t = merged.setdefault(k, dict(make_bucket()))
-            for f in ("input", "output", "cache_read", "cache_write", "cost"):
-                t[f] = t.get(f, 0) + b.get(f, 0)
-    return merged
-
-
-def test_per_source_hookless_host_not_dropped(capsys):
-    """Regression: on a date where host A has hook data, host B's JSONL-only
-    cost must still be counted (adjusted), not silently discarded."""
-    fake_now = datetime(2026, 6, 13, 12, 0, 0, tzinfo=timezone.utc)
-
-    hooked = {
-        "name": "pro",
-        "daily": {"2026-06-11": make_bucket(input=1000, cost=8.00),
-                  "2026-06-12": make_bucket(input=1000, cost=4.00)},
-        "hook_daily": {"2026-06-11": {"cost": 10.00, "sessions": 1},   # 1.25x overlap
-                       "2026-06-12": {"cost": 5.00, "sessions": 1}},
-        "install_date": "2026-06-10",
-    }
-    hookless = {
-        "name": "dgx",
-        "daily": {"2026-06-12": make_bucket(input=500, cost=100.00)},
-        "hook_daily": {},
-        "install_date": None,
-    }
-    daily = _merged_daily(hooked["daily"], hookless["daily"])
-    monthly = {"2026-06": make_bucket(input=2500, cost=112.00)}
-
-    with patch("cctrack.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.fromisoformat = datetime.fromisoformat
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        cctrack.print_report(daily, monthly, sources=[hooked, hookless])
-
-    out = capsys.readouterr().out
-    # 06-12: pro hook $5.00 (auth) + dgx JSONL $100 * 1.25 = $125 (est) = $130
-    assert "130.00" in out
-    # The day has an estimated component, so it carries the ~ marker.
-    lines = [l for l in out.splitlines() if "2026-06-12" in l]
-    assert lines and "~" in lines[0]
-    # 06-11 is fully hook-covered: authoritative, no marker.
-    lines = [l for l in out.splitlines() if "2026-06-11" in l]
-    assert lines and "~" not in lines[0] and "10.00" in lines[0]
-
-
-def test_per_source_two_hooked_hosts_sum(capsys):
-    """Costs for the same date on two hook-covered machines add together."""
-    fake_now = datetime(2026, 6, 13, 12, 0, 0, tzinfo=timezone.utc)
-
-    src_a = {
-        "name": "pro",
-        "daily": {"2026-06-11": make_bucket(input=100, cost=7.00)},
-        "hook_daily": {"2026-06-11": {"cost": 9.05, "sessions": 1}},
-        "install_date": "2026-06-01",
-    }
-    src_b = {
-        "name": "air",
-        "daily": {"2026-06-11": make_bucket(input=200, cost=280.00)},
-        "hook_daily": {"2026-06-11": {"cost": 340.90, "sessions": 7}},
-        "install_date": "2026-06-01",
-    }
-    daily = _merged_daily(src_a["daily"], src_b["daily"])
-    monthly = {"2026-06": make_bucket(input=300, cost=287.00)}
-
-    with patch("cctrack.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.fromisoformat = datetime.fromisoformat
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        cctrack.print_report(daily, monthly, sources=[src_a, src_b])
-
-    out = capsys.readouterr().out
-    # 9.05 + 340.90 = 349.95, authoritative
-    assert "349.95" in out
-    lines = [l for l in out.splitlines() if "2026-06-11" in l]
-    assert lines and "~" not in lines[0]
-    # Sessions column sums across hosts: 8
-    assert lines[0].split()[3] == "8" or " 8 " in lines[0]
 
 
 def test_unknown_model_marked(capsys):
@@ -1452,7 +1134,7 @@ def test_report_tokens_never_come_from_hook(capsys):
     assert "112,882" in out      # JSONL output tokens
     assert "6,404" in out        # JSONL input tokens
     assert "411,811" not in out  # hook context-size snapshot must not appear
-    assert "67.55" in out        # cost still comes from the hook
+    assert "61.41" in out and "67.55" not in out   # cost from the transcripts
 
 
 # ── discover_hook_data_dirs tests ─────────────────────────────────────

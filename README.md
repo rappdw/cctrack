@@ -111,9 +111,9 @@ It reports, for that day:
 
 - **Where it went** — the day's cost decomposed by token class (output, 1h/5m cache writes, input, cache reads), so a cache-write blowup or a runaway output loop is obvious at a glance.
 - **By model / by project / by machine** — cost and share for each, so you can see which model, which repo, and which host drove it.
-- **Top sessions** — ranked by cost, each with its project and model, and — where the statusline hook covered that session — its **authoritative** cost next to the JSONL estimate.
+- **Top sessions** — ranked by cost, each with its project and model, and — where the statusline hook covered that session — Claude Code's own cost counter next to the transcript cost.
 
-The day's JSONL-estimated total is shown next to the hook-authoritative total. If they diverge by more than ~15% the report says so: a big gap means the estimate is off (incomplete logs, or a model the rate card doesn't know), not that you actually spent that much. This is the fastest way to tell a real expensive day from an accounting artifact.
+The day's total is priced from the transcripts, plus the hook's figure for any session with no transcript that day. Claude Code's own counter is shown for comparison; if it differs from the transcripts by more than ~15% the explore view says so, and the Hook $ column shows which sessions differ. The hook misses usage when the status line isn't redrawn and over-counts when two processes share a session id, so the transcript figure is the one used.
 
 The project label is the basename of each session's working directory (`cwd`). When that's an unfamiliar name — a container path like `/workspace/team-inbox`, or a directory you don't recognize — trace it to its real location:
 
@@ -150,19 +150,19 @@ cctrack --install-hook      # this machine (add --remote HOST to install on anot
 cctrack --uninstall-hook    # keeps the data it collected
 ```
 
-The hook is optional. Without it, Claude Code cost is priced from the transcripts at list price. With current rates that tracks Claude Code's own counter closely, typically within a few percent. With it, cctrack also records Claude Code's own running cost counter. That gives you:
+The hook is optional. Costs are always priced from the transcripts at list price. With the hook, cctrack also records Claude Code's own running cost counter, which gives you:
 
-- the "authoritative" Claude cost in reports and `hook_cost_usd` in JSON;
-- a measured correction for days priced from transcripts;
+- cost for sessions whose transcripts are missing: the report adds the hook's figure for those session-days and marks the row `h`;
+- a cross-check: `--explore` shows each session's hook cost next to its transcript cost, and `hook_cost_usd` appears in JSON;
 - detection of lost transcripts in `--coverage`.
+
+The hook's figure is never used for a session-day that has a transcript. It misses usage whenever the status line isn't redrawn, for example an unattended agent, and it can over-count when two processes share one session id. Real cases seen: one session's hook recorded $37.56 of a $197.25 day, and another recorded $7,874 for $49 of usage.
 
 It's installed as Claude Code's `statusLine` command (`~/.claude/hooks/cctrack-hook.py`), not as an entry under `hooks`. Each status-line redraw appends one record to `~/.claude/cctrack/statusline-<UTC date>.jsonl`.
 
 **One session on two machines.** If a sandbox is copied to another host (for example with `sandy --rsync`) and runs there too, one session id can be live in two processes at once, each with its own running total. cctrack drops the readings rsync copied, then works out each machine's spend from that machine's readings alone, so an idle copy adds nothing. A session that moved from one machine to the other, with no overlap in time, keeps its running total across the move.
 
-**Rows that don't match their tokens are flagged.** For every daily and monthly row, cctrack also prices that row's tokens at list rates. If the cost shown differs from that by more than 25%, and by at least $5, the row gets a `!` and a footer line gives both figures, with the `--explore` command for that day. It's flagged in both directions: a cost far above the tokens usually means a hook counter went wrong; far below usually means missing or partial hook data. `CCTRACK_MISMATCH_RATIO` (default 1.25) and `CCTRACK_MISMATCH_MIN_USD` (default 5) change the thresholds. Rows with unrecognized models say so, because their token price is itself a guess.
-
-**Implausible hook costs are replaced.** If a session's hook cost for a day is more than 5x its transcript-priced cost (and at least $1 more), cctrack uses the transcript estimate for that session-day. Two processes writing one session id on the same machine produce exactly this kind of inflated counter. The report and `--explore` list every replaced session-day. Days with no transcript at all keep the hook cost.
+**Rows that don't match their tokens are flagged.** For every daily and monthly row, cctrack also prices that row's tokens at list rates. If the cost shown differs from that by more than 25%, and by at least $5, the row gets a `!` and a footer line gives both figures, with the `--explore` command for that day. Because transcripts price every session-day they cover, a gap means hook cost for sessions with no transcript: lost logs, or a hook counter that went wrong for one of them. `CCTRACK_MISMATCH_RATIO` (default 1.25) and `CCTRACK_MISMATCH_MIN_USD` (default 5) change the thresholds. Rows with unrecognized models say so, because their token price is itself a guess.
 
 **An existing status line is kept.** If one is configured, install saves it in `~/.claude/cctrack/config.json`. On every redraw the hook records the cost, then runs your command with the same input, and passes its output and exit code through, so your status line looks the same as before. Uninstall puts your status line back. If you've changed the status line to something else since installing, uninstall leaves it alone. Re-installing keeps the saved command and the original install date.
 

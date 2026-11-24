@@ -54,29 +54,32 @@ def row_for(text, label):
     return next(l for l in text.splitlines() if l.startswith(f"  {label}"))
 
 
-def test_hook_far_above_tokens_is_flagged_with_both_figures():
+# Rows are priced from their transcripts, so a row's cost only departs from its
+# tokens through hook cost for sessions with no transcript ("lost" below).
+
+def test_hook_only_cost_far_above_tokens_is_flagged_with_both_figures():
     ev = transcript(DAY, "a", 200)                 # about $12 of tokens
     t = price(ev)
-    text = report(ev, hook(DAY, "a", 3 * t))       # 3x: flagged, but under the 5x replacement
-    assert row_for(text, DAY).rstrip().endswith("!")
+    text = report(ev, hook(DAY, "a", 1.1 * t) + hook(DAY, "lost", 2 * t))
+    assert row_for(text, DAY).rstrip().endswith("h!")
     assert "differs from the row's tokens at list price by more than 25%" in text
     assert f"${3 * t:,.2f} shown, ${t:,.2f} from tokens (3.00x); see --explore {DAY}" in text
 
 
-def test_cost_far_below_tokens_is_flagged_too():
+def test_hook_figure_for_a_transcribed_session_never_moves_the_row():
     ev = transcript(DAY, "a", 200)
     t = price(ev)
-    text = report(ev, hook(DAY, "a", 0.4 * t))
-    assert row_for(text, DAY).rstrip().endswith("!")
-    assert "(0.40x)" in text
+    for factor in (0.2, 0.4, 3.0, 20.0):
+        text = report(ev, hook(DAY, "a", factor * t))
+        assert "! =" not in text and f"${t:,.2f}".replace("$", "") in row_for(text, DAY)
 
 
 def test_agreeing_rows_and_small_gaps_are_not_flagged():
     ev = transcript(DAY, "a", 200)
     t = price(ev)
-    assert "!" not in row_for(report(ev, hook(DAY, "a", 1.2 * t)), DAY)      # within 25%
+    assert "!" not in row_for(report(ev, hook(DAY, "lost", 0.2 * t)), DAY)  # within 25%
     small = transcript(DAY, "b", 10)                                         # well under $5
-    assert "! =" not in report(small, hook(DAY, "b", 3 * price(small)))
+    assert "! =" not in report(small, hook(DAY, "lost", 3 * price(small)))
 
 
 def test_hook_spend_without_transcripts_is_flagged():
@@ -92,14 +95,14 @@ def test_hook_spend_without_transcripts_is_flagged():
 def test_month_rows_are_checked():
     ev = transcript(LAST_MONTH, "m", 200)
     t = price(ev)
-    text = report(ev, hook(LAST_MONTH, "m", 3 * t))
-    assert row_for(text, LAST_MONTH[:7]).rstrip().endswith("!")
+    text = report(ev, hook(LAST_MONTH, "lost", 2 * t))
+    assert row_for(text, LAST_MONTH[:7]).rstrip().endswith("h!")
     assert f"{LAST_MONTH[:7]:<10}  ${3 * t:,.2f} shown" in text
 
 
 def test_unrecognized_models_are_called_out():
     ev = transcript(DAY, "u", 200, model="claude-opus-9-9")
-    text = report(ev, hook(DAY, "u", 3 * price(ev)))
+    text = report(ev, hook(DAY, "lost", 2 * price(ev)))
     assert "includes unrecognized models, so the token price is a guess" in text
 
 
@@ -107,10 +110,10 @@ def test_thresholds_are_adjustable(monkeypatch):
     ev = transcript(DAY, "a", 200)
     t = price(ev)
     monkeypatch.setenv("CCTRACK_MISMATCH_RATIO", "4")
-    assert "! =" not in report(ev, hook(DAY, "a", 3 * t))
+    assert "! =" not in report(ev, hook(DAY, "lost", 2 * t))
     monkeypatch.setenv("CCTRACK_MISMATCH_RATIO", "1.1")
     monkeypatch.setenv("CCTRACK_MISMATCH_MIN_USD", "0.01")
-    assert "!" in row_for(report(ev, hook(DAY, "a", 1.2 * t)), DAY)
+    assert "!" in row_for(report(ev, hook(DAY, "lost", 0.2 * t)), DAY)
     monkeypatch.setenv("CCTRACK_MISMATCH_RATIO", "nonsense")
     assert cctrack.mismatch_thresholds()[0] == 1.25
 

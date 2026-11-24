@@ -110,7 +110,10 @@ def test_rows_without_timestamps_are_never_dropped_as_copies():
     assert len(cctrack._drop_copied_hook_rows(rows)) == 2
 
 
-# ── Safety net: a hook day far above its transcript estimate ────────────────
+# ── A runaway hook counter can't reach the totals ───────────────────────────
+# 0.12.1 replaced hook session-days above 5x their transcript cost. Since
+# 0.12.3 transcripts price every session-day they cover, so the case can't
+# arise; these tests pin that instead.
 
 def transcript(sid="s", n=4):
     """Real usage for the session that day: n small Opus 5.5 requests."""
@@ -127,8 +130,8 @@ def estimate(events):
 
 
 def same_machine_sawtooth(sid="s"):
-    """Two processes under one session id on ONE machine: streams can't be told
-    apart, so the walk still books every switch."""
+    """Two processes under one session id on ONE machine: the streams can't be
+    told apart, so the hook figure itself is inflated."""
     rows = []
     for i in range(20):
         rows.append(row(f"10:{i:02d}:00", 1.0 + 0.01 * i, sid))
@@ -136,65 +139,44 @@ def same_machine_sawtooth(sid="s"):
     return rows
 
 
-def test_implausible_hook_day_is_priced_from_transcripts():
-    events = transcript()
-    j = estimate(events)
-    sources = [source("local", _hook_rows=same_machine_sawtooth())]
-    cctrack.reconcile_sources(events, sources)
-    assert sources[0]["hook_daily"][DAY]["cost"] == pytest.approx(j)
-    [f] = cctrack.capped_hook_days(sources)
-    assert f["session_id"] == "s" and f["hook"] > 1000 and f["estimate"] == pytest.approx(j)
-
-
-def test_plausible_hook_days_are_left_alone():
-    events = transcript(n=40)
-    j = estimate(events)
-    assert 4.0 * j - j > cctrack.HOOK_CAP_MIN_USD            # only the 5x rule keeps it
-    rows = [row("10:00:00", 0.0), row("11:00:00", 4.0 * j)]    # hook 4x: within the 5x rule
-    sources = [source("local", _hook_rows=rows)]
-    cctrack.reconcile_sources(events, sources)
-    assert sources[0]["hook_daily"][DAY]["cost"] == pytest.approx(4.0 * j)
-    assert cctrack.capped_hook_days(sources) == []
-
-
-def test_small_gaps_and_missing_transcripts_keep_the_hook_cost():
-    tiny = cctrack.parse_lines([claude_line(f"{DAY}T10:00:10Z", "req-t", sid="t", inp=1, out=1)])
-    sources = [source("local", _hook_rows=[row("10:00:00", 0.0, "t"), row("11:00:00", 0.5, "t"),
-                                           row("10:00:00", 0.0, "lost"), row("11:00:00", 75.0, "lost")])]
-    cctrack.reconcile_sources(tiny, sources)
-    costs = {d["session_id"]: d["cost_usd"] for d in sources[0]["deltas"]}
-    assert costs == {"t": pytest.approx(0.5), "lost": pytest.approx(75.0)}   # < $1 gap; no transcript
-    assert cctrack.capped_hook_days(sources) == []
-
-
-def test_cap_keeps_the_accuracy_factor_and_history_sane():
-    """An inflated hook day used to raise the factor that scales estimated days."""
-    events = transcript()
-    sources = [source("local", _hook_rows=same_machine_sawtooth(), install_date="2026-11-01")]
-    cctrack.reconcile_sources(events, sources)
-    factor, measured = cctrack._compute_accuracy_factor_sources(sources)
-    assert measured and factor == pytest.approx(1.0)
-
-
-def test_report_and_explore_say_what_was_replaced():
-    events = transcript()
-    sources = [source("local", _hook_rows=same_machine_sawtooth(), install_date="2026-11-01")]
+def _report(events, sources):
     events = cctrack.reconcile_sources(events, sources)
     out = io.StringIO()
     with patch("sys.stdout", out):
         daily, monthly = cctrack.aggregate(events)
         cctrack.print_report(daily, monthly, sources=sources)
-    text = out.getvalue()
-    assert "1 session-day(s) had a hook cost more than 5x their transcript estimate" in text
-    assert f"{DAY}  s…  hook $" in text
+    return out.getvalue(), events
 
-    capped = cctrack.capped_hook_days(sources)
-    hook_by_session = {("local", "s"): sum(d["cost_usd"] for d in sources[0]["deltas"])}
+
+def test_inflated_hook_session_is_priced_from_its_transcript():
+    events = transcript()
+    sources = [source("local", _hook_rows=same_machine_sawtooth(), install_date="2026-11-01")]
+    out, events = _report(events, sources)
+    assert sources[0]["hook_daily"][DAY]["cost"] > 1000        # the counter is still wrong...
+    assert sources[0]["hook_only_daily"] == {}                 # ...but never reaches a total
+    daily, _ = cctrack.aggregate(events)
+    assert daily[DAY]["cost"] == pytest.approx(estimate(events))
+    assert "! =" not in out                                    # the row matches its tokens
+
+
+def test_hook_session_without_transcript_still_counts():
+    events = transcript("other")
+    rows = [row("10:00:00", 0.0, "lost"), row("11:00:00", 75.0, "lost")]
+    sources = [source("local", _hook_rows=rows, install_date="2026-11-01")]
+    out, _ = _report(events, sources)
+    assert sources[0]["hook_only_daily"] == {DAY: pytest.approx(75.0)}
+    assert "h = includes the hook's cost for sessions with no transcript" in out
+
+
+def test_explore_shows_the_inflated_hook_figure_for_comparison():
+    events = transcript()
+    sources = [source("local", _hook_rows=same_machine_sawtooth(), install_date="2026-11-01")]
+    events = cctrack.reconcile_sources(events, sources)
+    hook = sum(d["cost_usd"] for d in sources[0]["deltas"])
     out = io.StringIO()
     with patch("sys.stdout", out):
-        cctrack.print_explore(events, DAY, hook_by_source={"local": hook_by_session[("local", "s")]},
-                              hook_by_session=hook_by_session, capped=capped)
+        cctrack.print_explore(events, DAY, hook_by_source={"local": hook},
+                              hook_by_session={("local", "s"): hook})
     text = out.getvalue()
-    assert "priced from the transcripts instead" in text
-    assert "! in the Hook $ column" in text
-    assert "!" in [l for l in text.splitlines() if l.lstrip().startswith("s ")][0]
+    assert f"Total:  ${estimate(events):,.2f}  (transcripts priced at list price)" in text
+    assert "⚠ The hook recorded" in text

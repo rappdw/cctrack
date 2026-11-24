@@ -300,8 +300,8 @@ def _run_report(daily, monthly, sources, capsys):
 
 def test_codex_spend_not_displaced_by_claude_hook(capsys):
     """Regression guard: on a day the Claude hook covers, the same machine's
-    Codex spend must still be added (not replaced by the hook figure), and must
-    not be scaled by the Claude-derived accuracy factor."""
+    Codex spend must still be added, unscaled. Claude is priced from its
+    transcripts ($8), not the hook ($10)."""
     claude = {"name": "local", "agent": "claude",
               "daily": {"2026-10-10": _bucket(8.0)},
               "hook_daily": {"2026-10-10": {"cost": 10.0, "sessions": 1}},
@@ -313,10 +313,10 @@ def test_codex_spend_not_displaced_by_claude_hook(capsys):
     monthly = {"2026-10": _bucket(12.0)}
     out = _run_report(daily, monthly, [claude, codex], capsys)
     row = next(l for l in out.splitlines() if "2026-10-10" in l)
-    assert "14.00" in row          # 10.00 hook + 4.00 Codex, unscaled
+    assert "12.00" in row          # 8.00 Claude transcripts + 4.00 Codex, unscaled
     assert "~" not in row
     assert "By agent:" in out
-    assert "Claude Code $10.00" in out and "Codex $4.00" in out
+    assert "Claude Code $8.00" in out and "Codex $4.00" in out
 
 
 def test_no_agent_line_for_claude_only(capsys):
@@ -342,7 +342,7 @@ def test_explore_hook_divergence_ignores_codex(capsys):
                           hook_by_session={("local", "c1"): 10.0})
     out = capsys.readouterr().out
     assert "⚠" not in out
-    assert "Claude Code (hook-authoritative): $10.00" in out
+    assert "Claude Code's own cost counter (statusline hook), for comparison: $10.00" in out
     assert "By agent:" in out and "Codex" in out
 
 

@@ -1443,12 +1443,6 @@ def remote_uninstall_hook(host: str) -> None:
         print(f"Hook uninstall on {host} failed: {result.stderr.strip()}", file=sys.stderr)
 
 
-# Ratio of hook (Claude Code's own) cost to JSONL-priced cost, used only when
-# it can't be measured from overlapping days. It was once 1.25 on the belief
-# that logs undercount ~20-25%; that gap was entirely rate-card error, and with
-# correct prices measured ratios sit at 0.99-1.02x. A stale 1.25 inflated every
-# unmeasured day by a quarter.
-DEFAULT_ACCURACY_FACTOR = 1.0
 
 
 def prompt_hook_install() -> None:
@@ -3777,10 +3771,20 @@ def reconcile_sources(events: list[dict], sources: list[dict], timing=None) -> l
             hosts = owners[(d["session_id"], d["date_str"])]
             if hosts and d.get("source") not in hosts:
                 d["source"] = min(hosts, key=lambda h: (h != "local", h))
-        _cap_implausible_hook_costs(deltas, events)
+        # Transcripts price every session-day they cover; the hook fills in
+        # only session-days with no transcript anywhere (lost or missing logs).
+        transcribed = {(e.get("session_id", ""), _event_date(e)) for e in events
+                       if e.get("agent", "claude") == "claude"}
         for src in hook_sources:
             src["deltas"] = [d for d in deltas if d.get("source") == src["name"]]
             src["hook_daily"] = aggregate_hook_data(src["deltas"], src.get("_hook_monthly"))
+            only: dict[str, float] = defaultdict(float)
+            for d in src["deltas"]:
+                if (d["session_id"], d["date_str"]) not in transcribed:
+                    only[d["date_str"]] += d["cost_usd"]
+            src["hook_only_daily"] = dict(only)
+            src["hook_rolled_daily"] = {day: data["cost"] for day, data
+                                        in (src.get("_hook_monthly") or {}).items()}
     return events
 
 
@@ -3799,67 +3803,6 @@ def _drop_copied_hook_rows(rows: list[dict]) -> list[dict]:
         if cur is None or rank < (cur.get("_source", "") != "local", cur.get("_source", "")):
             best[k] = r
     return list(best.values())
-
-
-# A session-day whose hook cost exceeds this multiple of its transcript-priced
-# cost (and by at least HOOK_CAP_MIN_USD) is priced from the transcripts. The
-# two agree within a few percent when both are sound; a gap this large is a
-# counter artefact (e.g. two processes writing one session id on one machine),
-# not real spend. Days with no transcript at all keep the hook cost.
-HOOK_CAP_RATIO = 5.0
-HOOK_CAP_MIN_USD = 1.0
-
-
-def _cap_implausible_hook_costs(deltas: list[dict], events: list[dict]) -> None:
-    """Replace implausible hook session-days with the transcript estimate, in
-    place; each replaced delta keeps its original cost in `_hook_uncapped` and
-    the day's transcript estimate in `_hook_estimate`."""
-    est: dict[tuple, float] = defaultdict(float)
-    for e in events:
-        if e.get("agent", "claude") != "claude":
-            continue
-        date_str = _event_date(e)
-        est[(e.get("session_id", ""), date_str)] += calculate_cost(
-            e["model"], e["input"], e["output"], e["cache_read"], e["cache_write"],
-            e.get("cache_write_1h", 0), date_str=date_str,
-            request_input=e.get("_request_input"), service_tier=e.get("service_tier"))
-    hook: dict[tuple, float] = defaultdict(float)
-    for d in deltas:
-        hook[(d["session_id"], d["date_str"])] += d["cost_usd"]
-    for d in deltas:
-        k = (d["session_id"], d["date_str"])
-        h, j = hook[k], est.get(k, 0.0)
-        if j > 0 and h > HOOK_CAP_RATIO * j and h - j >= HOOK_CAP_MIN_USD:
-            d["_hook_uncapped"] = d["cost_usd"]
-            d["_hook_estimate"] = j
-            d["cost_usd"] = d["cost_usd"] * j / h
-
-
-def capped_hook_days(sources: list[dict]) -> list[dict]:
-    """[{date_str, session_id, hook, estimate}] for every hook session-day that
-    _cap_implausible_hook_costs replaced, largest first."""
-    found: dict[tuple, dict] = {}
-    for src in sources:
-        for d in src.get("deltas", []):
-            if "_hook_uncapped" in d:
-                f = found.setdefault((d["date_str"], d["session_id"]), {
-                    "date_str": d["date_str"], "session_id": d["session_id"],
-                    "hook": 0.0, "estimate": d["_hook_estimate"]})
-                f["hook"] += d["_hook_uncapped"]
-    return sorted(found.values(), key=lambda f: -f["hook"])
-
-
-def _print_capped_note(capped: list[dict], limit: int = 5) -> None:
-    if not capped:
-        return
-    print()
-    print(f"  ! {len(capped)} session-day(s) had a hook cost more than {HOOK_CAP_RATIO:g}x their "
-          f"transcript estimate; priced from the transcripts instead:")
-    for f in capped[:limit]:
-        print(f"      {f['date_str']}  {f['session_id'][:12]}…  hook ${f['hook']:,.2f} -> "
-              f"${f['estimate']:,.2f}")
-    if len(capped) > limit:
-        print(f"      … and {len(capped) - limit} more (see --explore DATE)")
 
 
 def mismatch_thresholds() -> tuple[float, float]:
@@ -3931,49 +3874,19 @@ def total_tokens(b: dict) -> int:
             + b["cache_write"] + b.get("cache_write_1h", 0))
 
 
-def _compute_accuracy_factor_sources(sources: list[dict]) -> tuple[float, bool]:
-    """Compute ratio of hook cost to JSONL cost over (source, date) pairs where
-    both exist. Dates strictly AFTER each source's install date only — the
-    install day itself has partial hook coverage and would bias the factor low.
-    Comparing per source keeps a hook-less machine's JSONL out of the
-    denominator. Returns (factor, is_measured); falls back to
-    DEFAULT_ACCURACY_FACTOR when no overlapping data exists."""
-    jsonl_total = 0.0
-    hook_total = 0.0
-    for src in sources:
-        install = src.get("install_date")
-        if not install:
-            continue
-        for date_str, d in src["daily"].items():
-            if date_str <= install:
-                continue
-            hook_cost = src["hook_daily"].get(date_str, {}).get("cost", 0.0)
-            if d["cost"] > 0 and hook_cost > 0:
-                jsonl_total += d["cost"]
-                hook_total += hook_cost
-
-    if jsonl_total > 0 and hook_total > 0:
-        return hook_total / jsonl_total, True
-    return DEFAULT_ACCURACY_FACTOR, False
-
-
-def _compute_accuracy_factor(daily: dict, hook_daily: dict, hook_install_date: str | None) -> tuple[float, bool]:
-    """Single-source convenience wrapper around _compute_accuracy_factor_sources."""
-    return _compute_accuracy_factor_sources([
-        {"daily": daily, "hook_daily": hook_daily, "install_date": hook_install_date}
-    ])
-
-
 def print_report(daily: dict, monthly: dict, days: int | None = None,
                  hook_daily: dict | None = None,
                  hook_install_date: str | None = None,
                  sources: list[dict] | None = None,
                  show_energy: bool = False):
     """Print the report. `sources` is a list of {name, daily, hook_daily,
-    install_date} — one per machine — enabling per-source cost composition
-    (hook cost where covered, adjusted JSONL where not) so a hook-less machine
-    isn't dropped on days another machine has hook data. When omitted, the
-    legacy (daily, hook_daily, hook_install_date) args form a single source."""
+    install_date, hook_only_daily, hook_rolled_daily} — one per machine and
+    agent. Cost is priced from the transcripts at list price; the statusline
+    hook adds only session-days that have no transcript (`hook_only_daily`,
+    built by reconcile_sources), and rolled-up hook days (older than the
+    hook's retention, no session detail) count only when that source has no
+    transcript for the day. When omitted, the legacy (daily, hook_daily,
+    hook_install_date) args form a single source."""
     if hook_daily is None:
         hook_daily = {}
     if sources is None:
@@ -4008,50 +3921,32 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
     sorted_days = sorted(all_dates, reverse=True)
     sorted_months = sorted(all_months_set, reverse=True)
 
-    accuracy_factor, factor_is_measured = _compute_accuracy_factor_sources(sources)
-
-    def _source_date_cost(src: dict, date_str: str) -> tuple[float, str | None]:
-        """Returns (cost, kind) for one source; kind is 'auth', 'est', or None.
-        Hook cost is authoritative for dates after that source's hook install;
-        the install day itself takes max(hook, adjusted JSONL) since the hook
-        only captured post-install sessions; JSONL-only days are adjusted by
-        the accuracy factor whenever any hook data exists anywhere."""
-        hook_cost = src["hook_daily"].get(date_str, {}).get("cost", 0.0)
+    def _source_date_cost(src: dict, date_str: str) -> tuple[float, float]:
+        """(cost, hook part) for one source and day. Transcripts are priced at
+        list price; the hook adds what it saw for sessions with no transcript.
+        Callers without per-session hook data (`hook_only_daily`) fall back to
+        the hook only on days the source has no transcript at all."""
         jsonl_cost = src["daily"].get(date_str, {}).get("cost", 0.0)
-        install = src.get("install_date")
-
         if src.get("exact"):
-            # Priced directly from per-response usage the agent logs itself
-            # (Codex). There is no hook to defer to, and the Claude-derived
-            # accuracy factor says nothing about these logs.
-            return (jsonl_cost, "auth") if jsonl_cost > 0 else (0.0, None)
+            # Priced directly from per-response usage the agent logs itself (Codex).
+            return jsonl_cost, 0.0
+        if "hook_only_daily" in src:
+            extra = src["hook_only_daily"].get(date_str, 0.0)
+            if jsonl_cost == 0 and extra == 0:
+                extra = src.get("hook_rolled_daily", {}).get(date_str, 0.0)
+        else:
+            extra = (src["hook_daily"].get(date_str, {}).get("cost", 0.0)
+                     if jsonl_cost == 0 else 0.0)
+        return jsonl_cost + extra, extra
 
-        if install and date_str == install:
-            adjusted = jsonl_cost * accuracy_factor if jsonl_cost > 0 else 0.0
-            cost = max(hook_cost, adjusted)
-            return (cost, "est") if cost > 0 else (0.0, None)
-        if install and date_str > install and hook_cost > 0:
-            return hook_cost, "auth"
-        if jsonl_cost > 0:
-            if hooks_exist:
-                return jsonl_cost * accuracy_factor, "est"
-            return jsonl_cost, "auth"
-        if hook_cost > 0:
-            return hook_cost, "auth"
-        return 0.0, None
-
-    def _date_cost(date_str: str) -> tuple[float, bool]:
-        """Sum of per-source costs; authoritative only if every contributing
-        source component is hook-authoritative."""
-        total = 0.0
-        kinds = []
+    def _date_cost(date_str: str) -> tuple[float, float]:
+        """(cost, hook part) summed across sources."""
+        total = hook_part = 0.0
         for src in sources:
-            cost, kind = _source_date_cost(src, date_str)
+            cost, extra = _source_date_cost(src, date_str)
             total += cost
-            if kind:
-                kinds.append(kind)
-        is_auth = bool(kinds) and all(k == "auth" for k in kinds)
-        return total, is_auth
+            hook_part += extra
+        return total, hook_part
 
     def _date_tokens(date_str: str) -> tuple[int, int]:
         """Input/output per date, summed across sources. Always JSONL-derived:
@@ -4082,6 +3977,7 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
                    for src in sources)
 
     saw_unknown_model = False
+    saw_hook_only = False
 
     def _model_str(models: dict) -> str:
         nonlocal saw_unknown_model
@@ -4112,15 +4008,11 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
         day_of_month = now.day
 
         mtd_cost = 0.0
-        auth_days = 0
-        est_days = 0
+        mtd_hook = 0.0
         for d in current_days_all:
-            cost, is_auth = _date_cost(d)
+            cost, extra = _date_cost(d)
             mtd_cost += cost
-            if is_auth:
-                auth_days += 1
-            else:
-                est_days += 1
+            mtd_hook += extra
 
         m = monthly.get(current_month)
 
@@ -4163,14 +4055,9 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
         if mtd_sessions:
             print(f"  Sessions:       {mtd_sessions:>15}")
 
-        if hooks_exist and est_days > 0:
-            factor_source = "measured" if factor_is_measured else "default"
-            cost_note = f" ({accuracy_factor:.2f}x adjustment, {factor_source})"
-            if auth_days > 0:
-                cost_note = f" ({auth_days}d authoritative, {est_days}d adjusted {accuracy_factor:.2f}x)"
-            print(f"  Total cost:     ${mtd_cost:.2f}{cost_note}")
-        elif hooks_exist and auth_days > 0:
-            print(f"  Total cost:     ${mtd_cost:.2f} (authoritative)")
+        if mtd_hook > 0.005:
+            print(f"  Total cost:     ${mtd_cost:.2f} (incl. ${mtd_hook:,.2f} from the hook "
+                  f"for sessions with no transcript)")
         else:
             print(f"  Total cost:     ${mtd_cost:.2f}")
 
@@ -4221,7 +4108,7 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
             display_days = display_days[:days]
         flagged: list[dict] = []
         for date_str in display_days:
-            cost, is_auth = _date_cost(date_str)
+            cost, hook_part = _date_cost(date_str)
             d = daily.get(date_str)
             input_t, output_t = _date_tokens(date_str)
             cache_r = d["cache_read"] if d else 0
@@ -4235,20 +4122,14 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
                                 "tokens": d["cost"] if d else 0.0, "ratio": mismatch,
                                 "unknown": any(not is_known_model(m) for m in (d or {}).get("models", {}))})
             if hooks_exist:
-                marker = ("" if is_auth else "~") + ("!" if mismatch is not None else "")
+                marker = ("h" if hook_part > 0.005 else "") + ("!" if mismatch is not None else "")
+                saw_hook_only = saw_hook_only or hook_part > 0.005
                 sessions = _date_sessions(date_str)
                 sess_str = str(sessions) if sessions else "-"
                 print(f"  {date_str:<12} {format_tokens(input_t):>11} {format_tokens(output_t):>11} {format_tokens(cache_r):>11} {format_tokens(cache_w):>11} {sess_str:>5} {model_str:<12} ${cost:>7.2f}{energy_col} {marker:>2}")
             else:
                 print(f"  {date_str:<12} {format_tokens(input_t):>11} {format_tokens(output_t):>11} {format_tokens(cache_r):>11} {format_tokens(cache_w):>11} {model_str:<12} ${cost:>7.2f}{energy_col}")
 
-    if hooks_exist and current_month_days:
-        has_estimated = any(not _date_cost(d)[1] for d in current_month_days)
-        if has_estimated:
-            if factor_is_measured:
-                print(f"  ~ = estimated (JSONL-derived, {accuracy_factor:.1f}x undercount measured from hook data)")
-            else:
-                print("  ~ = estimated (JSONL-derived; no hook overlap yet to measure accuracy)")
 
     # Previous months summary
     month_flagged: list[dict] = []
@@ -4266,21 +4147,14 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
             days_str = f" ({len(month_days_list)}d)" if month_days_list else ""
 
             month_cost = 0.0
-            month_has_hook = False
-            month_has_est = False
+            month_hook = 0.0
             for d in month_days_list:
-                cost, is_auth = _date_cost(d)
+                cost, extra = _date_cost(d)
                 month_cost += cost
-                if is_auth:
-                    month_has_hook = True
-                else:
-                    month_has_est = True
+                month_hook += extra
 
             if not month_days_list and m:
                 month_cost = m["cost"]
-                if hooks_exist:
-                    month_cost *= accuracy_factor
-                month_has_est = True
 
             input_t = m["input"] if m else 0
             output_t = m["output"] if m else 0
@@ -4290,18 +4164,21 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
 
             cost_str = f"${month_cost:>7.2f}"
             month_energy = f" {format_energy(m.get('energy_wh', 0.0) if m else 0.0):>10}" if show_energy else ""
-            if hooks_exist and month_has_est and not month_has_hook:
-                cost_str += "  ~"
+            if month_hook > 0.005:
+                cost_str += "  h"
+                saw_hook_only = True
             mismatch = cost_mismatch(month_cost, m["cost"] if m else 0.0)
             if mismatch is not None:
                 month_flagged.append({"label": month_str, "daily": False, "shown": month_cost,
                                       "tokens": m["cost"] if m else 0.0, "ratio": mismatch,
                                       "unknown": any(not is_known_model(x)
                                                      for x in (m or {}).get("models", {}))})
-                cost_str += "  !" if not cost_str.endswith("~") else "!"
+                cost_str += "  !" if not cost_str.endswith("h") else "!"
             print(f"  {month_str + days_str:<12} {format_tokens(input_t):>11} {format_tokens(output_t):>11} {format_tokens(cache_r):>11} {format_tokens(cache_w):>11} {model_str:<12} {cost_str}{month_energy}")
 
-    _print_capped_note(capped_hook_days(sources))
+    if saw_hook_only:
+        print()
+        print("  h = includes the hook's cost for sessions with no transcript (see --coverage)")
     _print_mismatch_note((flagged if current_month_days else []) + month_flagged)
 
     if saw_unknown_model:
@@ -4356,8 +4233,7 @@ def print_explore(events: list[dict], date_str: str,
                   hook_by_source: dict | None = None,
                   hook_by_session: dict | None = None,
                   show_energy: bool = False,
-                  project_filter: str | None = None,
-                  capped: list[dict] | None = None):
+                  project_filter: str | None = None):
     """Drill into a single day: where the money went (by token class), and
     which models, projects, sessions and machines drove it. Costs are
     JSONL-derived estimates; where the statusline hook covered a source its
@@ -4369,8 +4245,6 @@ def print_explore(events: list[dict], date_str: str,
     unfamiliar project label can be traced to a real location on disk."""
     hook_by_source = hook_by_source or {}
     hook_by_session = hook_by_session or {}
-    capped = [f for f in (capped or []) if f["date_str"] == date_str]
-    capped_sids = {f["session_id"] for f in capped}
 
     day_events = [e for e in events if _event_date(e) == date_str]
 
@@ -4454,17 +4328,24 @@ def print_explore(events: list[dict], date_str: str,
     jsonl_total = sum(jsonl_by_source.values())
 
     claude_total = sum(claude_by_source.values())
-    print(f"Total (JSONL-estimated):  ${jsonl_total:,.2f}")
+    # Sessions the hook saw that have no transcript that day: the report adds
+    # their hook cost (they can't be broken down by token class or project).
+    transcribed = {sid for _, sid in by_session}
+    hook_only = 0.0 if project_filter else sum(
+        v for (_, sid), v in hook_by_session.items() if sid not in transcribed)
+    hook_only_n = 0 if project_filter else sum(
+        1 for (_, sid), v in hook_by_session.items() if sid not in transcribed and v > 0)
+    print(f"Total:  ${jsonl_total + hook_only:,.2f}  (transcripts priced at list price"
+          + (f", plus ${hook_only:,.2f} from the hook for {hook_only_n} session(s) "
+             f"with no transcript)" if hook_only > 0.005 else ")"))
     if hook_by_source:
         hook_total = sum(hook_by_source.values())
-        mixed = claude_total < jsonl_total - 0.005
-        label = "Claude Code (hook-authoritative)" if mixed else "Total (hook-authoritative)"
-        print(f"{label}: ${hook_total:,.2f}")
+        print(f"Claude Code's own cost counter (statusline hook), for comparison: ${hook_total:,.2f}")
         if claude_total > 0 and hook_total > 0:
-            ratio = claude_total / hook_total
+            ratio = hook_total / claude_total
             if ratio > 1.15 or ratio < 0.87:
-                print(f"  ⚠ Claude JSONL estimate is {ratio:.2f}× the authoritative hook cost —")
-                print(f"    the breakdown below is JSONL-derived and may be distorted.")
+                print(f"  ⚠ The hook recorded {ratio:.2f}× what the transcripts show. The report uses the")
+                print(f"    transcripts; the Hook $ column below shows which sessions differ.")
     if show_energy:
         print(f"Energy (est):             {format_energy(energy_total)}")
     print()
@@ -4533,19 +4414,12 @@ def print_explore(events: list[dict], date_str: str,
         for (src, sid), d in ranked[:10]:
             hook_cost = hook_by_session.get((src, sid))
             hook_str = f"${hook_cost:>8,.2f}" if hook_cost is not None else "     —"
-            if sid in capped_sids and hook_cost is not None:
-                hook_str += "!"
             models = "+".join(sorted(
                 m[len("claude-"):] if m.startswith("claude-") else m for m in d["models"]
             )) or "(unknown)"
             sid_short = (sid[:12] + "…") if len(sid) > 13 else (sid or "(none)")
             print(f"  {sid_short:<14} {d['project'][:20]:<20} {models[:14]:<14} "
                   f"${d['cost']:>8,.2f} {hook_str:>10}")
-        print()
-
-    if capped:
-        _print_capped_note(capped, limit=len(capped))
-        print("  (! in the Hook $ column marks these sessions)")
         print()
 
     if saw_unknown:
@@ -4584,9 +4458,9 @@ def print_explore(events: list[dict], date_str: str,
                 print(f"     file: {fpath}")
         print()
 
-    print("Costs are JSONL-derived estimates. Where a machine runs the statusline")
-    print("hook, its authoritative cost is shown for comparison; large gaps mean the")
-    print("estimate (not the hook) is off.")
+    print("Costs are priced from the transcripts at list price. Hook $ is Claude Code's own")
+    print("counter, shown for comparison: it misses usage when the status line isn't redrawn")
+    print("and can over-count when two processes share a session id.")
     if not project_filter and ranked and _needs_tracing():
         print("Re-run with --explore <date> --project <name> to trace one project.")
     print()
@@ -5625,8 +5499,7 @@ def main():
                           hook_by_source=dict(hook_by_source),
                           hook_by_session=dict(hook_by_session),
                           show_energy=args.energy,
-                          project_filter=args.project,
-                          capped=capped_hook_days(sources))
+                          project_filter=args.project)
             return
 
         # Global aggregates feed the token columns; cost is composed per source.

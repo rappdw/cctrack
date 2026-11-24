@@ -1036,7 +1036,8 @@ def test_explore_by_model_and_project(capsys):
 
 
 def test_explore_hook_reconciliation_and_flag(capsys):
-    # JSONL prices this session at $50; hook says $200 → estimate is 0.25× → warn.
+    # The transcript prices this session at $50; the hook says $200 → 4x → warn,
+    # and the total stays the transcript's $50.
     events = [_mk("claude-fable-5", "runaway", "monorepo", out=1_000_000, source="air")]
     cctrack.print_explore(
         events, "2026-08-03",
@@ -1044,11 +1045,23 @@ def test_explore_hook_reconciliation_and_flag(capsys):
         hook_by_session={("air", "runaway"): 200.0},
     )
     out = capsys.readouterr().out
-    assert "hook-authoritative" in out
-    assert "$200.00" in out
-    assert "⚠" in out
-    # session row shows both estimate and authoritative
-    assert "$50.00" in out
+    assert "Total:  $50.00  (transcripts priced at list price)" in out
+    assert "for comparison: $200.00" in out
+    assert "⚠ The hook recorded 4.00× what the transcripts show" in out
+    assert "hook-authoritative" not in out
+    # session row shows both figures
+    assert "$50.00" in out and "$  200.00" in out
+
+
+def test_explore_adds_hook_only_sessions(capsys):
+    """A session the hook saw that day but with no transcript is added to the
+    total (it can't be broken down further)."""
+    events = [_mk("claude-fable-5", "seen", "p", out=1_000_000, source="air")]     # $50
+    cctrack.print_explore(events, "2026-08-03", hook_by_source={"air": 57.0},
+                          hook_by_session={("air", "seen"): 50.0, ("air", "lost"): 7.0})
+    out = capsys.readouterr().out
+    assert ("Total:  $57.00  (transcripts priced at list price, plus $7.00 from the hook "
+            "for 1 session(s) with no transcript)") in out
 
 
 def test_explore_flags_unknown_model(capsys):
