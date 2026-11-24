@@ -3371,6 +3371,21 @@ def parse_hook_rows(cctrack_dir: Path | None = None, cache=None) -> list[dict]:
     return _hook_rows_from_lines(lines)
 
 
+def _hook_streams(session_rows: list[dict], order) -> list[list[dict]]:
+    """One session's rows (sorted by `order`) as the sequences to difference:
+    all of them as one sequence unless two machines' readings overlap in time,
+    in which case each machine's readings are their own sequence."""
+    by_source: dict[str, list[dict]] = defaultdict(list)
+    for r in session_rows:
+        by_source[r.get("_source", "")].append(r)
+    if len(by_source) < 2:
+        return [session_rows]
+    spans = sorted((order(rs[0])[0], order(rs[-1])[0]) for rs in by_source.values())
+    if all(spans[i][1] < spans[i + 1][0] for i in range(len(spans) - 1)):
+        return [session_rows]                                # a handoff between hosts
+    return [rs for _, rs in sorted(by_source.items())]
+
+
 def compute_hook_deltas(rows: list[dict], baselines: dict | None = None) -> list[dict]:
     """Convert per-render cumulative cost readings into per-(session, date)
     spend, walking every row of each session in timestamp order.
@@ -3397,6 +3412,17 @@ def compute_hook_deltas(rows: list[dict], baselines: dict | None = None) -> list
       at $2,083). After a drop we resume counting increments from the lower
       level.
 
+    * Machines (`_source`) that were live at the same time are differenced
+      separately. A sandbox rsynced to another host and started there too
+      (sandy starts Claude with `--continue`) runs one session id in two
+      processes, each with its own cumulative. Interleaving them booked every
+      switch from the lower counter to the higher one as new spend (observed:
+      $11,612 booked for one day with $86 of real usage). Per-machine streams
+      whose time ranges don't overlap are still walked as one sequence, so a
+      session that moved hosts keeps its running total across the move.
+      Callers drop exact copied readings first (reconcile_sources), or the
+      copied history would make every pair of streams overlap.
+
     A rolled-up baseline (see load_session_baselines) seeds `prev` so days
     already folded into a monthly summary aren't recounted — the same "count
     only increments above the baseline" rule. Records with zero spend are
@@ -3412,24 +3438,28 @@ def compute_hook_deltas(rows: list[dict], baselines: dict | None = None) -> list
     day_cost: dict[tuple, float] = defaultdict(float)
     day_model: dict[tuple, str] = {}
 
+    def order(r):
+        return (r.get("ts") or r["date_str"], r.get("_source", ""))
+
     for sid, session_rows in by_session.items():
-        session_rows.sort(key=lambda r: (r.get("ts") or r["date_str"], r.get("_source", "")))
+        session_rows.sort(key=order)
         base = (baselines or {}).get(sid)
-        # None → not yet observed; the first render sets the baseline and is
-        # not counted. A rolled-up baseline is a real prior level to count from.
-        prev = float(base["cost_usd"]) if base else None
-        for r in session_rows:
-            cur = float(r.get("cost_usd", 0.0))
-            key = (sid, r["date_str"], r.get("_source", ""))
-            if r.get("model"):
-                day_model.setdefault(key, r["model"])
-            if prev is None:
-                prev = cur                                   # first observation → baseline
-            elif cur < prev - max(1e-6, abs(prev) * 0.001):
-                prev = cur                                   # counter dropped → rebaseline
-            else:
-                day_cost[key] += cur - prev                  # normal climb → count increment
-                prev = cur
+        for stream in _hook_streams(session_rows, order):
+            # None → not yet observed; the first render sets the baseline and is
+            # not counted. A rolled-up baseline is a real prior level to count from.
+            prev = float(base["cost_usd"]) if base else None
+            for r in stream:
+                cur = float(r.get("cost_usd", 0.0))
+                key = (sid, r["date_str"], r.get("_source", ""))
+                if r.get("model"):
+                    day_model.setdefault(key, r["model"])
+                if prev is None:
+                    prev = cur                               # first observation → baseline
+                elif cur < prev - max(1e-6, abs(prev) * 0.001):
+                    prev = cur                               # counter dropped → rebaseline
+                else:
+                    day_cost[key] += cur - prev              # normal climb → count increment
+                    prev = cur
 
     result = []
     for (sid, date_str, source), cost in day_cost.items():
@@ -3727,6 +3757,7 @@ def reconcile_sources(events: list[dict], sources: list[dict], timing=None) -> l
         # Other hosts can retain raw copies from before a rolled baseline.
         rows = [r for r in rows if not baselines.get(r["session_id"], {}).get("date")
                 or r["date_str"] > baselines[r["session_id"]]["date"]]
+        rows = _drop_copied_hook_rows(rows)
         deltas = compute_hook_deltas(rows, baselines)
         owners = defaultdict(set)
         for e in events:
@@ -3736,10 +3767,89 @@ def reconcile_sources(events: list[dict], sources: list[dict], timing=None) -> l
             hosts = owners[(d["session_id"], d["date_str"])]
             if hosts and d.get("source") not in hosts:
                 d["source"] = min(hosts, key=lambda h: (h != "local", h))
+        _cap_implausible_hook_costs(deltas, events)
         for src in hook_sources:
             src["deltas"] = [d for d in deltas if d.get("source") == src["name"]]
             src["hook_daily"] = aggregate_hook_data(src["deltas"], src.get("_hook_monthly"))
     return events
+
+
+def _drop_copied_hook_rows(rows: list[dict]) -> list[dict]:
+    """Keep one of each exact reading (session, timestamp, cost). rsync copies a
+    sandbox's statusline files byte for byte, so the copied history appears
+    under both machines; the local copy (else the first host by name) is kept."""
+    best: dict[tuple, dict] = {}
+    for r in rows:
+        k = (r["session_id"], r.get("ts") or "", r["date_str"], float(r.get("cost_usd", 0.0)))
+        if not k[1]:
+            best[(id(r),)] = r                               # no timestamp: never a copy
+            continue
+        cur = best.get(k)
+        rank = (r.get("_source", "") != "local", r.get("_source", ""))
+        if cur is None or rank < (cur.get("_source", "") != "local", cur.get("_source", "")):
+            best[k] = r
+    return list(best.values())
+
+
+# A session-day whose hook cost exceeds this multiple of its transcript-priced
+# cost (and by at least HOOK_CAP_MIN_USD) is priced from the transcripts. The
+# two agree within a few percent when both are sound; a gap this large is a
+# counter artefact (e.g. two processes writing one session id on one machine),
+# not real spend. Days with no transcript at all keep the hook cost.
+HOOK_CAP_RATIO = 5.0
+HOOK_CAP_MIN_USD = 1.0
+
+
+def _cap_implausible_hook_costs(deltas: list[dict], events: list[dict]) -> None:
+    """Replace implausible hook session-days with the transcript estimate, in
+    place; each replaced delta keeps its original cost in `_hook_uncapped` and
+    the day's transcript estimate in `_hook_estimate`."""
+    est: dict[tuple, float] = defaultdict(float)
+    for e in events:
+        if e.get("agent", "claude") != "claude":
+            continue
+        date_str = _event_date(e)
+        est[(e.get("session_id", ""), date_str)] += calculate_cost(
+            e["model"], e["input"], e["output"], e["cache_read"], e["cache_write"],
+            e.get("cache_write_1h", 0), date_str=date_str,
+            request_input=e.get("_request_input"), service_tier=e.get("service_tier"))
+    hook: dict[tuple, float] = defaultdict(float)
+    for d in deltas:
+        hook[(d["session_id"], d["date_str"])] += d["cost_usd"]
+    for d in deltas:
+        k = (d["session_id"], d["date_str"])
+        h, j = hook[k], est.get(k, 0.0)
+        if j > 0 and h > HOOK_CAP_RATIO * j and h - j >= HOOK_CAP_MIN_USD:
+            d["_hook_uncapped"] = d["cost_usd"]
+            d["_hook_estimate"] = j
+            d["cost_usd"] = d["cost_usd"] * j / h
+
+
+def capped_hook_days(sources: list[dict]) -> list[dict]:
+    """[{date_str, session_id, hook, estimate}] for every hook session-day that
+    _cap_implausible_hook_costs replaced, largest first."""
+    found: dict[tuple, dict] = {}
+    for src in sources:
+        for d in src.get("deltas", []):
+            if "_hook_uncapped" in d:
+                f = found.setdefault((d["date_str"], d["session_id"]), {
+                    "date_str": d["date_str"], "session_id": d["session_id"],
+                    "hook": 0.0, "estimate": d["_hook_estimate"]})
+                f["hook"] += d["_hook_uncapped"]
+    return sorted(found.values(), key=lambda f: -f["hook"])
+
+
+def _print_capped_note(capped: list[dict], limit: int = 5) -> None:
+    if not capped:
+        return
+    print()
+    print(f"  ! {len(capped)} session-day(s) had a hook cost more than {HOOK_CAP_RATIO:g}x their "
+          f"transcript estimate; priced from the transcripts instead:")
+    for f in capped[:limit]:
+        print(f"      {f['date_str']}  {f['session_id'][:12]}…  hook ${f['hook']:,.2f} -> "
+              f"${f['estimate']:,.2f}")
+    if len(capped) > limit:
+        print(f"      … and {len(capped) - limit} more (see --explore DATE)")
 
 
 def format_tokens(n: int) -> str:
@@ -4124,6 +4234,8 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
                 cost_str += "  ~"
             print(f"  {month_str + days_str:<12} {format_tokens(input_t):>11} {format_tokens(output_t):>11} {format_tokens(cache_r):>11} {format_tokens(cache_w):>11} {model_str:<12} {cost_str}{month_energy}")
 
+    _print_capped_note(capped_hook_days(sources))
+
     if saw_unknown_model:
         print()
         print("  ? = unrecognized model — priced at default Sonnet rates; update cctrack's rate card")
@@ -4176,7 +4288,8 @@ def print_explore(events: list[dict], date_str: str,
                   hook_by_source: dict | None = None,
                   hook_by_session: dict | None = None,
                   show_energy: bool = False,
-                  project_filter: str | None = None):
+                  project_filter: str | None = None,
+                  capped: list[dict] | None = None):
     """Drill into a single day: where the money went (by token class), and
     which models, projects, sessions and machines drove it. Costs are
     JSONL-derived estimates; where the statusline hook covered a source its
@@ -4188,6 +4301,8 @@ def print_explore(events: list[dict], date_str: str,
     unfamiliar project label can be traced to a real location on disk."""
     hook_by_source = hook_by_source or {}
     hook_by_session = hook_by_session or {}
+    capped = [f for f in (capped or []) if f["date_str"] == date_str]
+    capped_sids = {f["session_id"] for f in capped}
 
     day_events = [e for e in events if _event_date(e) == date_str]
 
@@ -4350,12 +4465,19 @@ def print_explore(events: list[dict], date_str: str,
         for (src, sid), d in ranked[:10]:
             hook_cost = hook_by_session.get((src, sid))
             hook_str = f"${hook_cost:>8,.2f}" if hook_cost is not None else "     —"
+            if sid in capped_sids and hook_cost is not None:
+                hook_str += "!"
             models = "+".join(sorted(
                 m[len("claude-"):] if m.startswith("claude-") else m for m in d["models"]
             )) or "(unknown)"
             sid_short = (sid[:12] + "…") if len(sid) > 13 else (sid or "(none)")
             print(f"  {sid_short:<14} {d['project'][:20]:<20} {models[:14]:<14} "
                   f"${d['cost']:>8,.2f} {hook_str:>10}")
+        print()
+
+    if capped:
+        _print_capped_note(capped, limit=len(capped))
+        print("  (! in the Hook $ column marks these sessions)")
         print()
 
     if saw_unknown:
@@ -5435,7 +5557,8 @@ def main():
                           hook_by_source=dict(hook_by_source),
                           hook_by_session=dict(hook_by_session),
                           show_energy=args.energy,
-                          project_filter=args.project)
+                          project_filter=args.project,
+                          capped=capped_hook_days(sources))
             return
 
         # Global aggregates feed the token columns; cost is composed per source.

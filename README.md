@@ -158,6 +158,10 @@ The hook is optional. Without it, Claude Code cost is priced from the transcript
 
 It's installed as Claude Code's `statusLine` command (`~/.claude/hooks/cctrack-hook.py`), not as an entry under `hooks`. Each status-line redraw appends one record to `~/.claude/cctrack/statusline-<UTC date>.jsonl`.
 
+**One session on two machines.** If a sandbox is copied to another host (for example with `sandy --rsync`) and runs there too, one session id can be live in two processes at once, each with its own running total. cctrack drops the readings rsync copied, then works out each machine's spend from that machine's readings alone, so an idle copy adds nothing. A session that moved from one machine to the other, with no overlap in time, keeps its running total across the move.
+
+**Implausible hook costs are replaced.** If a session's hook cost for a day is more than 5x its transcript-priced cost (and at least $1 more), cctrack uses the transcript estimate for that session-day. Two processes writing one session id on the same machine produce exactly this kind of inflated counter. The report and `--explore` list every replaced session-day. Days with no transcript at all keep the hook cost.
+
 **An existing status line is kept.** If one is configured, install saves it in `~/.claude/cctrack/config.json`. On every redraw the hook records the cost, then runs your command with the same input, and passes its output and exit code through, so your status line looks the same as before. Uninstall puts your status line back. If you've changed the status line to something else since installing, uninstall leaves it alone. Re-installing keeps the saved command and the original install date.
 
 ## Remote aggregation
