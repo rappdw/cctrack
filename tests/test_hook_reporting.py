@@ -1225,3 +1225,32 @@ def test_main_aggregates_sandy_hook_data():
         # Both sessions counted: $5.00 + $95.30 = $100.30
         assert abs(hook_daily["2026-04-17"]["cost"] - 100.30) < 0.01
         assert hook_daily["2026-04-17"]["sessions"] == 2
+
+
+def test_sessions_are_counted_from_transcripts_plus_hook_only(capsys):
+    """Sess counts every session with a transcript that day (Claude Code and
+    Codex), plus sessions only the hook saw; the hook booking $0 for a session
+    (its counter below an earlier high) doesn't hide it."""
+    fake_now = datetime(2026, 11, 14, 12, 0, 0, tzinfo=timezone.utc)
+    day = "2026-11-13"
+
+    def ev(sid, agent="claude", model="claude-opus-5-5"):
+        return {"model": model, "timestamp": f"{day}T10:00:00Z", "input": 0, "output": 1000,
+                "cache_read": 0, "cache_write": 0, "cache_write_1h": 0, "_request_id": f"r-{sid}",
+                "source": "local", "session_id": sid, "agent": agent}
+    events = [ev("a"), ev("b"), ev("c"), ev("x", "codex", "gpt-6.1-sol")]
+    flat = {"session_id": "a", "ts": f"{day}T09:00:00+00:00", "date_str": day,
+            "cost_usd": 50.0, "model": "m"}
+    rows = [flat, {**flat, "ts": f"{day}T11:00:00+00:00", "cost_usd": 40.0},   # books $0
+            {**flat, "session_id": "lost", "cost_usd": 0.0},
+            {**flat, "session_id": "lost", "ts": f"{day}T11:00:00+00:00", "cost_usd": 3.0}]
+    src = {"name": "local", "agent": "claude", "daily": {}, "hook_daily": {},
+           "install_date": "2026-11-01", "deltas": [], "_hook_rows": rows}
+    codex = {"name": "local", "agent": "codex", "exact": True, "daily": {}, "hook_daily": {},
+             "install_date": None, "deltas": []}
+    events = cctrack.reconcile_sources(events, [src, codex])
+    daily, monthly = cctrack.aggregate(events)
+    _report(daily, monthly, fake_now, sources=[src, codex])
+    out = capsys.readouterr().out
+    assert _row(out, day).split()[5] == "5"                     # a, b, c, x + lost
+    assert [l for l in out.splitlines() if "Sessions:" in l][0].split()[-1] == "5"

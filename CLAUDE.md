@@ -30,6 +30,9 @@ python3 scripts/bench_cache.py --filler-lines 6 --runs 3
 cctrack --rebuild-cache
 cctrack --no-cache   # or CCTRACK_CACHE=0
 
+# Compare the statusline drop rules (0.12.3 rebaseline vs 0.12.4 high-water) against transcripts; read-only
+python3 scripts/hook_rule_check.py
+
 # Run a single test
 python -m pytest tests/test_cctrack.py::test_name
 

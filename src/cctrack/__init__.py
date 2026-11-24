@@ -3692,7 +3692,8 @@ def aggregate_hook_data(events: list[dict], monthly_summaries: dict | None = Non
 
 def new_bucket() -> dict:
     return {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
-            "cache_write_1h": 0, "cost": 0.0, "energy_wh": 0.0, "models": {}}
+            "cache_write_1h": 0, "cost": 0.0, "energy_wh": 0.0, "models": {},
+            "session_ids": set()}
 
 
 def aggregate(events: list[dict]) -> tuple[dict, dict]:
@@ -3736,6 +3737,7 @@ def aggregate(events: list[dict]) -> tuple[dict, dict]:
                                     e["cache_read"], e["cache_write"], cache_1h,
                                     scale=scale)
         model = e.get("model", "")
+        sid = e.get("session_id", "")
 
         for bucket in (daily[date_str], monthly[month_str]):
             bucket["input"] += e["input"]
@@ -3747,6 +3749,8 @@ def aggregate(events: list[dict]) -> tuple[dict, dict]:
             bucket["energy_wh"] += energy
             if model:
                 bucket["models"][model] = bucket["models"].get(model, 0) + 1
+            if sid:
+                bucket["session_ids"].add(sid)
 
     return dict(daily), dict(monthly)
 
@@ -3799,10 +3803,13 @@ def reconcile_sources(events: list[dict], sources: list[dict], timing=None) -> l
             src["deltas"] = [d for d in deltas if d.get("source") == src["name"]]
             src["hook_daily"] = aggregate_hook_data(src["deltas"], src.get("_hook_monthly"))
             only: dict[str, float] = defaultdict(float)
+            only_ids: dict[str, set] = defaultdict(set)
             for d in src["deltas"]:
                 if (d["session_id"], d["date_str"]) not in transcribed:
                     only[d["date_str"]] += d["cost_usd"]
+                    only_ids[d["date_str"]].add(d["session_id"])
             src["hook_only_daily"] = dict(only)
+            src["hook_only_sessions"] = dict(only_ids)
             src["hook_rolled_daily"] = {day: data["cost"] for day, data
                                         in (src.get("_hook_monthly") or {}).items()}
     return events
@@ -3980,8 +3987,35 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
                 to += d["output"]
         return ti, to
 
+    def _date_session_ids(date_str: str) -> tuple[set, int]:
+        """(distinct session ids, extra uncounted sessions) for a day: every
+        session with a transcript (Claude Code and Codex), plus sessions only
+        the hook saw, plus rolled-up hook days' session counts where a source
+        has no transcript that day. Callers whose buckets carry no session ids
+        (legacy) count the hook's sessions."""
+        bucket = daily.get(date_str) or {}
+        if "session_ids" not in bucket:
+            ids, extra = set(), 0
+            for src in sources:
+                h = src["hook_daily"].get(date_str, {})
+                if h.get("session_ids"):
+                    ids |= h["session_ids"]
+                    extra += h.get("rolled_sessions", 0)
+                else:
+                    extra += h.get("sessions", 0)
+            return ids, extra
+        ids = set(bucket["session_ids"])
+        extra = 0
+        for src in sources:
+            ids |= src.get("hook_only_sessions", {}).get(date_str, set())
+            if (date_str in src.get("hook_rolled_daily", {})
+                    and not src["daily"].get(date_str, {}).get("cost")):
+                extra += src["hook_daily"].get(date_str, {}).get("rolled_sessions", 0)
+        return ids, extra
+
     def _date_sessions(date_str: str) -> int:
-        return sum(src["hook_daily"].get(date_str, {}).get("sessions", 0) for src in sources)
+        ids, extra = _date_session_ids(date_str)
+        return len(ids) + extra
 
     def _date_hook_models(date_str: str) -> dict:
         merged: dict = {}
@@ -4056,21 +4090,14 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
             if mtd_model:
                 print(f"  Model:          {mtd_model:>15}")
 
-        # Distinct sessions for the month: union of live session ids (a session
-        # spanning several days counts once) + rolled-up per-day counts.
+        # Distinct sessions for the month: a session spanning several days
+        # counts once (see _date_session_ids).
         mtd_ids: set = set()
         mtd_counted = 0
         for d in current_days_all:
-            for src in sources:
-                h = src["hook_daily"].get(d)
-                if not h:
-                    continue
-                ids = h.get("session_ids")
-                if ids:
-                    mtd_ids |= ids
-                    mtd_counted += h.get("rolled_sessions", 0)
-                else:
-                    mtd_counted += h.get("sessions", 0)
+            ids, extra = _date_session_ids(d)
+            mtd_ids |= ids
+            mtd_counted += extra
         mtd_sessions = len(mtd_ids) + mtd_counted
         if mtd_sessions:
             print(f"  Sessions:       {mtd_sessions:>15}")
