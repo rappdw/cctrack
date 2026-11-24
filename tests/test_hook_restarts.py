@@ -1,17 +1,22 @@
-"""compute_hook_deltas: restarts vs a second process on the same session id.
+"""compute_hook_deltas on drops, checked against real data.
 
-The September 2026 series below is every 40th statusline reading of one real
-session (a sandbox whose transcripts were lost in a host docker crash). Claude
-reported its "most recent conversation moved to a background session ...
-registered from another machine or container": two processes, one session id.
-None of its drops goes near $0, so none is a restart. Until 0.12.4 each climb
-from a lower level was booked as new spend: $984 for a counter that rose $731.
+When a session's statusline counter drops, cctrack rebaselines and counts the
+climb after it. Resumed sessions restart their counter at a lower, often
+non-zero, level and keep working. 0.12.4 counted only rises above an earlier
+high instead; scripts/hook_rule_check.py run on 577 real session-days with
+transcripts (2026-11) showed that rule at 85.2% of transcript cost (median
+session-day 0.52) against 105.8% (median 1.04) for rebaselining, so 0.12.5
+went back to it. Two processes truly alternating on one session id on one
+machine (23 of 158 non-zero drops in that data) are still over-counted; since
+0.12.3 that can only affect sessions with no transcript.
 """
 
 import pytest
 
 import cctrack
 
+# Every 40th statusline reading of one real session (Sep 2026, transcripts lost
+# in a host docker crash).
 SEPTEMBER = [
     ("2026-09-19T14:30", 14.3064355), ("2026-09-19T18:27", 30.246942),
     ("2026-09-19T19:18", 41.272944), ("2026-09-19T19:26", 21.433828),
@@ -39,54 +44,34 @@ def booked(deltas):
     return sum(d["cost_usd"] for d in deltas)
 
 
-def test_second_process_drops_book_only_new_highs():
-    deltas = cctrack.compute_hook_deltas(rows(SEPTEMBER))
-    assert booked(deltas) == pytest.approx(745.4281188 - 14.3064355)       # $731.12
-    by_day = {d["date_str"]: d["cost_usd"] for d in deltas}
-    assert "2026-09-24" not in by_day             # 305 → 336: below the $355.67 high
-    # Sep 27 books only what rose above the earlier high ($355.67, Sep 21).
-    assert by_day["2026-09-27"] == pytest.approx(418.4432958 - 355.671606)
+def test_resume_at_a_lower_non_zero_level_keeps_counting():
+    """The common real case: the counter drops to a lower level and climbs on."""
+    series = [("2026-09-01T09:00", 0.0), ("2026-09-01T12:00", 50.0),
+              ("2026-09-02T09:00", 30.0), ("2026-09-02T12:00", 80.0)]
+    by_day = {d["date_str"]: d["cost_usd"] for d in cctrack.compute_hook_deltas(rows(series))}
+    assert by_day == {"2026-09-01": pytest.approx(50.0), "2026-09-02": pytest.approx(50.0)}
 
 
-def test_genuine_restart_counts_the_new_process():
+def test_restart_near_zero_counts_the_new_climb():
     series = [("2026-09-01T09:00", 0.0), ("2026-09-01T12:00", 80.0),
-              ("2026-09-02T09:00", 0.4), ("2026-09-02T12:00", 25.4)]      # restart near $0
-    assert booked(cctrack.compute_hook_deltas(rows(series))) == pytest.approx(80.0 + 25.0)
+              ("2026-09-02T09:00", 0.4), ("2026-09-02T12:00", 25.4)]
+    assert booked(cctrack.compute_hook_deltas(rows(series))) == pytest.approx(105.0)
 
 
-def test_restart_threshold_is_a_fraction_of_the_previous_reading():
-    f = cctrack.HOOK_RESTART_FRACTION
-    just_restart = [("2026-09-01T09:00", 0.0), ("2026-09-01T10:00", 100.0),
-                    ("2026-09-01T11:00", 100.0 * f), ("2026-09-01T12:00", 100.0 * f + 5)]
-    not_restart = [("2026-09-01T09:00", 0.0), ("2026-09-01T10:00", 100.0),
-                   ("2026-09-01T11:00", 100.0 * f + 1), ("2026-09-01T12:00", 100.0 * f + 6)]
-    assert booked(cctrack.compute_hook_deltas(rows(just_restart))) == pytest.approx(105.0)
-    assert booked(cctrack.compute_hook_deltas(rows(not_restart))) == pytest.approx(100.0)
+def test_september_series_books_every_climb_after_each_drop():
+    # Every step counts except real drops; a sub-0.1% dip is jitter and nets out.
+    climbs = sum(b - a for (_, a), (_, b) in zip(SEPTEMBER, SEPTEMBER[1:])
+                 if not b < a - max(1e-6, a * 0.001))
+    assert booked(cctrack.compute_hook_deltas(rows(SEPTEMBER))) == pytest.approx(climbs)
 
 
-def test_interleaved_processes_on_one_machine_book_one_climb():
-    """Two live processes, $100 apart, both climbing $10: the higher one's
-    climb is what's booked, never the switches between them."""
-    series = []
-    for i in range(10):
-        series += [(f"2026-09-01T10:{i:02d}", 200.0 + i), (f"2026-09-01T10:{i:02d}:30"[:16], 300.0 + i)]
-    series = sorted(set(series))
-    assert booked(cctrack.compute_hook_deltas(rows(series))) == pytest.approx(309.0 - 200.0, abs=0.01)
-
-
-def test_marks_report_the_highest_counted_level():
-    marks = {}
-    cctrack.compute_hook_deltas(rows(SEPTEMBER), marks=marks)
-    assert marks == {"s": pytest.approx(745.4281188)}
-    # A last reading below the high: the mark is still the high.
+def test_marks_report_the_final_reading():
     marks = {}
     cctrack.compute_hook_deltas(rows(SEPTEMBER[:20]), marks=marks)      # ends at 343.46
-    assert marks["s"] == pytest.approx(418.4432958)
+    assert marks == {"s": pytest.approx(343.4581495)}
 
 
-def test_rollup_seeds_later_data_from_the_high_not_the_last_reading(tmp_path, monkeypatch):
-    """A rolled-up day ending on the lower process's reading must not let the
-    higher process's next reading be counted again."""
+def test_rollup_baseline_is_the_last_reading(tmp_path):
     import json
     from datetime import datetime, timedelta, timezone
     day = (datetime.now(timezone.utc) - timedelta(days=40)).strftime("%Y-%m-%d")
@@ -96,6 +81,6 @@ def test_rollup_seeds_later_data_from_the_high_not_the_last_reading(tmp_path, mo
     cctrack.rollup_old_hook_files(tmp_path, retention_days=30)
     assert not (tmp_path / f"statusline-{day}.jsonl").exists()           # it was rolled up
     base = cctrack.load_session_baselines(tmp_path)
-    assert base["s"]["cost_usd"] == pytest.approx(418.44)
-    later = rows([((datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%dT10:00"), 420.0)])
-    assert booked(cctrack.compute_hook_deltas(later, base)) == pytest.approx(1.56)
+    assert base["s"]["cost_usd"] == pytest.approx(343.46)
+    later = rows([((datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%dT10:00"), 350.0)])
+    assert booked(cctrack.compute_hook_deltas(later, base)) == pytest.approx(6.54)

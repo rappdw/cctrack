@@ -212,9 +212,8 @@ def test_compute_hook_deltas_first_seen_cumulative_not_booked():
 
 
 def test_compute_hook_deltas_never_exceeds_counter_peak():
-    """THE $2,083-vs-$1,086 BUG: a mid-session drop that isn't to ~$0 is a second
-    process's lower counter; its climb back up is not new spend. A day's booked
-    cost can't exceed the counter's own climb."""
+    """THE $2,083-vs-$1,086 BUG: a mid-session drop must not be re-added as
+    fresh spend: the drop rebaselines and only the climb after it counts."""
     rows = [
         make_row(session_id="s", ts="2026-08-03T09:00:00+00:00", cost_usd=0.0),
         make_row(session_id="s", ts="2026-08-03T10:00:00+00:00", cost_usd=1076.4),
@@ -224,9 +223,10 @@ def test_compute_hook_deltas_never_exceeds_counter_peak():
     ]
     deltas = cctrack.compute_hook_deltas(rows)
     booked = deltas[0]["cost_usd"]
-    # 0 → 1086.97; the drop to 971.12 and its climb to 996.15 stay below that peak.
-    # (Until 0.12.4 the climb from the lower level was added: 1112.00.)
-    assert abs(booked - 1086.97) < 0.01
+    # Increments: 0→1086.97 (=1086.97) + 971.12→996.15 (=25.03) = 1112.00. The
+    # climb after the drop counts: resumed sessions restart lower and keep working
+    # (0.12.4 dropped it and fell to 85% of transcript cost on real data).
+    assert abs(booked - 1112.00) < 0.01
 
 
 def test_compute_hook_deltas_drops_zero_records():

@@ -72,9 +72,7 @@ def test_merging_interleaved_machines_was_the_bug():
     mac, dgx = interleaved()
     merged = [{**r, "_source": ""} for r in sorted(mac + dgx, key=lambda r: r["ts"])]
     old_style = sum(d["cost_usd"] for d in cctrack.compute_hook_deltas(merged))
-    # Still wrong merged: a counter near $0 looks like a restart, so each switch
-    # from it back to the $100 counter books about $95. Hence the per-machine split.
-    assert old_style > 500
+    assert old_style > 1500                                  # about $95 per switch
     split = [{**r, "_source": "local"} for r in mac] + [{**r, "_source": "dgx"} for r in dgx]
     assert sum(d["cost_usd"] for d in cctrack.compute_hook_deltas(split)) == pytest.approx(19.0)
 

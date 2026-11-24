@@ -160,7 +160,7 @@ The hook's figure is never used for a session-day that has a transcript. It miss
 
 It's installed as Claude Code's `statusLine` command (`~/.claude/hooks/cctrack-hook.py`), not as an entry under `hooks`. Each status-line redraw appends one record to `~/.claude/cctrack/statusline-<UTC date>.jsonl`.
 
-**Two processes on one session.** When the counter drops, cctrack checks how far. A drop to near zero is a restarted Claude Code process, and its new climb is counted. Any other drop is a second process writing the same session id from its own lower total, so only rises above the session's highest level so far count. Switching between the two counters therefore adds nothing.
+**When the counter drops.** A resumed session usually restarts its counter at a lower level and keeps working, so cctrack counts the climb after a drop. This was checked against transcripts with `scripts/hook_rule_check.py`. Two processes alternating on one session id on the same machine are still over-counted, but since transcripts price every session-day they cover, that can only affect sessions with no transcript.
 
 **One session on two machines.** If a sandbox is copied to another host (for example with `sandy --rsync`) and runs there too, one session id can be live in two processes at once, each with its own running total. cctrack drops the readings rsync copied, then works out each machine's spend from that machine's readings alone, so an idle copy adds nothing. A session that moved from one machine to the other, with no overlap in time, keeps its running total across the move.
 

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Which statusline drop rule tracks the transcripts?
 
-When a session's hook counter drops to a level that isn't near zero, cctrack
-0.12.3 restarted counting from the lower level ("rebaseline"); 0.12.4 counts
-only rises above the session's earlier high ("high-water"). The first is right
-for a session resumed with a lower counter, the second for two processes
-writing one session id. Sessions that have transcripts settle it: their
-transcript cost is the true figure, so this prices every such session-day both
-ways and reports which rule comes closer.
+When a session's hook counter drops, cctrack (0.12.3, and again from 0.12.5)
+restarts counting from the lower level ("rebaseline"). 0.12.4 counted only
+rises above the session's earlier high ("high-water"), which was wrong: on
+577 real session-days it reached 85% of transcript cost. "Per-process" is an
+experimental third rule: each reading continues the counter it is closest
+above, a reading below every live counter starts a new one, and a counter
+idle for 6 hours is retired. It should handle both resumes and two processes
+alternating on one session id. Sessions that have transcripts settle it: their
+transcript cost is the true figure, so this prices every such session-day
+each way and reports which rule comes closer.
 
 Read-only: reads this machine's Claude Code transcripts (host and every Sandy
 sandbox) and statusline hook files. It never rolls up or deletes hook files,
@@ -29,33 +32,78 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import cctrack  # noqa: E402
 
 
-def rebaseline_deltas(rows: list[dict], baselines: dict) -> dict:
-    """0.12.3's walk: any drop rebaselines, then every climb is booked."""
-    out: dict[tuple, float] = defaultdict(float)
+RESTART_FRACTION = 0.1          # 0.12.4: a drop to <=10% was a restart
+LANE_IDLE_SECONDS = 6 * 3600    # per-process: retire a counter idle this long
+
+
+def _sessions(rows):
     by_session: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         by_session[r["session_id"]].append(r)
-    for sid, rs in by_session.items():
+    for rs in by_session.values():
         rs.sort(key=lambda r: r.get("ts") or r["date_str"])
-        base = baselines.get(sid)
-        prev = float(base["cost_usd"]) if base else None
-        for r in rs:
-            cur = float(r.get("cost_usd", 0.0))
-            if prev is None:
-                prev = cur
-            elif cur < prev - max(1e-6, abs(prev) * 0.001):
-                prev = cur
-            else:
-                out[(sid, r["date_str"])] += cur - prev
-                prev = cur
+    return by_session
+
+
+def _drop(prev, cur):
+    return cur < prev - max(1e-6, abs(prev) * 0.001)
+
+
+def rebaseline_deltas(rows: list[dict], baselines: dict) -> dict:
+    """The current rule (cctrack.compute_hook_deltas): any drop rebaselines,
+    then every climb is booked."""
+    out: dict[tuple, float] = defaultdict(float)
+    for d in cctrack.compute_hook_deltas(rows, baselines):
+        out[(d["session_id"], d["date_str"])] += d["cost_usd"]
     return out
 
 
 def high_water_deltas(rows: list[dict], baselines: dict) -> dict:
-    """0.12.4's walk (cctrack.compute_hook_deltas)."""
+    """0.12.4's walk: a drop to <=10% restarts; any other drop counts only
+    rises above the earlier high."""
     out: dict[tuple, float] = defaultdict(float)
-    for d in cctrack.compute_hook_deltas(rows, baselines):
-        out[(d["session_id"], d["date_str"])] += d["cost_usd"]
+    for sid, rs in _sessions(rows).items():
+        base = baselines.get(sid)
+        prev = mark = float(base["cost_usd"]) if base else None
+        for r in rs:
+            cur = float(r.get("cost_usd", 0.0))
+            if prev is None:
+                prev = mark = cur
+                continue
+            if _drop(prev, cur) and cur <= RESTART_FRACTION * prev:
+                mark = cur
+            elif cur > mark:
+                out[(sid, r["date_str"])] += cur - mark
+                mark = cur
+            prev = cur
+    return out
+
+
+def _seconds(r):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(r["ts"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def per_process_deltas(rows: list[dict], baselines: dict) -> dict:
+    """Experimental: follow each process's counter separately."""
+    out: dict[tuple, float] = defaultdict(float)
+    for sid, rs in _sessions(rows).items():
+        base = baselines.get(sid)
+        lanes: list[list] = [[float(base["cost_usd"]), None]] if base else []   # [level, last seen]
+        for r in rs:
+            cur, now = float(r.get("cost_usd", 0.0)), _seconds(r)
+            if now is not None:
+                lanes = [l for l in lanes if l[1] is None or now - l[1] <= LANE_IDLE_SECONDS]
+            below = [l for l in lanes if not _drop(l[0], cur)]
+            if not below:
+                lanes.append([cur, now])            # new process or resume: a baseline
+                continue
+            lane = max(below, key=lambda l: l[0])   # the counter it's closest above
+            out[(sid, r["date_str"])] += cur - lane[0]
+            lane[0], lane[1] = cur, now
     return out
 
 
@@ -74,7 +122,7 @@ def drop_census(rows: list[dict]) -> dict:
             prev, cur = vals[i - 1], vals[i]
             if not cur < prev - max(1e-6, abs(prev) * 0.001):
                 continue
-            if cur <= cctrack.HOOK_RESTART_FRACTION * prev:
+            if cur <= RESTART_FRACTION * prev:
                 restart += 1
                 continue
             nonzero += 1
@@ -133,6 +181,7 @@ def main() -> int:
 
     a = rebaseline_deltas(rows, baselines)
     b = high_water_deltas(rows, baselines)
+    c = per_process_deltas(rows, baselines)
 
     keys = []
     for (sid, day), t in truth.items():
@@ -168,47 +217,52 @@ def main() -> int:
               f"{within / len(keys):5.1%}   abs error ${abs_err:,.2f}")
         return abs_err
 
-    err_a = summary("0.12.3 rebaseline", a)
+    err_a = summary("rebaseline (current)", a)
     err_b = summary("0.12.4 high-water", b)
+    err_c = summary("per-process (exp.)", c)
 
-    closer_a = closer_b = ties = 0
-    for k in keys:
-        da, db = abs(a.get(k, 0.0) - truth[k]), abs(b.get(k, 0.0) - truth[k])
-        if abs(da - db) < 0.005:
-            ties += 1
-        elif da < db:
-            closer_a += 1
-        else:
-            closer_b += 1
+    def head_to_head(name_x, x, name_y, y):
+        cx = cy = ties = 0
+        for k in keys:
+            dx, dy = abs(x.get(k, 0.0) - truth[k]), abs(y.get(k, 0.0) - truth[k])
+            if abs(dx - dy) < 0.005:
+                ties += 1
+            elif dx < dy:
+                cx += 1
+            else:
+                cy += 1
+        print(f"  {name_x} vs {name_y}: differ on {cx + cy:,} session-days "
+              f"({name_x} closer: {cx:,}, {name_y} closer: {cy:,}); identical: {ties:,}")
+
     print()
-    print(f"  Session-days where the rules differ: {closer_a + closer_b:,} "
-          f"(rebaseline closer: {closer_a:,}, high-water closer: {closer_b:,}); "
-          f"identical: {ties:,}")
+    head_to_head("rebaseline", a, "high-water", b)
+    head_to_head("rebaseline", a, "per-process", c)
 
     census = drop_census(rows)
     print(f"  Counter drops seen: {census['restart']:,} to near zero (restarts), "
           f"{census['nonzero']:,} to a non-zero level, of which "
           f"{census['alternating']:,} alternated back and forth (two processes)")
 
-    differ = sorted((k for k in keys if abs(a.get(k, 0.0) - b.get(k, 0.0)) >= 0.005),
-                    key=lambda k: -abs(a.get(k, 0.0) - b.get(k, 0.0)))
+    differ = sorted((k for k in keys if abs(a.get(k, 0.0) - c.get(k, 0.0)) >= 0.005),
+                    key=lambda k: -abs(a.get(k, 0.0) - c.get(k, 0.0)))
     if differ:
         print()
-        print(f"  Largest differences (top {min(args.top, len(differ))} of {len(differ)}):")
+        print(f"  Largest rebaseline / per-process differences "
+              f"(top {min(args.top, len(differ))} of {len(differ)}):")
         print(f"    {'Day':<10}  {'Session':<9} {'Transcript':>11} {'Rebaseline':>11} "
-              f"{'High-water':>11}  Closer")
+              f"{'Per-process':>11}  Closer")
         for k in differ[:args.top]:
-            t, va, vb = truth[k], a.get(k, 0.0), b.get(k, 0.0)
-            closer = "rebaseline" if abs(va - t) < abs(vb - t) else "high-water"
-            print(f"    {k[1]:<10}  {k[0][:8]:<9} ${t:>10,.2f} ${va:>10,.2f} ${vb:>10,.2f}  {closer}")
+            t, va, vc = truth[k], a.get(k, 0.0), c.get(k, 0.0)
+            closer = "rebaseline" if abs(va - t) < abs(vc - t) else "per-process"
+            print(f"    {k[1]:<10}  {k[0][:8]:<9} ${t:>10,.2f} ${va:>10,.2f} ${vc:>10,.2f}  {closer}")
 
     print()
-    if abs(err_a - err_b) < 0.01 * t_total:
-        verdict = "the two rules are about equally close; the drop rule barely matters here"
-    elif err_a < err_b:
-        verdict = "the 0.12.3 rebaseline rule tracks the transcripts more closely"
+    best = min((err_a, "rebaseline (the current rule)"), (err_b, "0.12.4 high-water"),
+               (err_c, "per-process (experimental)"))
+    if abs(err_a - best[0]) < 0.01 * t_total:
+        verdict = "the current rebaseline rule is as close as any (within 1% of transcript cost)"
     else:
-        verdict = "the 0.12.4 high-water rule tracks the transcripts more closely"
+        verdict = f"{best[1]} tracks the transcripts most closely"
     print(f"  Verdict: {verdict}.")
     print("  (Both rules miss usage the hook never saw, e.g. a status line that wasn't "
           "redrawn, so both can read below the transcripts.)")
