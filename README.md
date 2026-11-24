@@ -160,6 +160,8 @@ It's installed as Claude Code's `statusLine` command (`~/.claude/hooks/cctrack-h
 
 **One session on two machines.** If a sandbox is copied to another host (for example with `sandy --rsync`) and runs there too, one session id can be live in two processes at once, each with its own running total. cctrack drops the readings rsync copied, then works out each machine's spend from that machine's readings alone, so an idle copy adds nothing. A session that moved from one machine to the other, with no overlap in time, keeps its running total across the move.
 
+**Rows that don't match their tokens are flagged.** For every daily and monthly row, cctrack also prices that row's tokens at list rates. If the cost shown differs from that by more than 25%, and by at least $5, the row gets a `!` and a footer line gives both figures, with the `--explore` command for that day. It's flagged in both directions: a cost far above the tokens usually means a hook counter went wrong; far below usually means missing or partial hook data. `CCTRACK_MISMATCH_RATIO` (default 1.25) and `CCTRACK_MISMATCH_MIN_USD` (default 5) change the thresholds. Rows with unrecognized models say so, because their token price is itself a guess.
+
 **Implausible hook costs are replaced.** If a session's hook cost for a day is more than 5x its transcript-priced cost (and at least $1 more), cctrack uses the transcript estimate for that session-day. Two processes writing one session id on the same machine produce exactly this kind of inflated counter. The report and `--explore` list every replaced session-day. Days with no transcript at all keep the hook cost.
 
 **An existing status line is kept.** If one is configured, install saves it in `~/.claude/cctrack/config.json`. On every redraw the hook records the cost, then runs your command with the same input, and passes its output and exit code through, so your status line looks the same as before. Uninstall puts your status line back. If you've changed the status line to something else since installing, uninstall leaves it alone. Re-installing keeps the saved command and the original install date.
@@ -220,10 +222,12 @@ Prices per million tokens. Claude prices are from [Anthropic's pricing page](htt
 | Haiku 3.5 | $0.80 | $4.00 | $0.08 | $1.00 | $1.60 |
 | Haiku 3 | $0.25 | $1.25 | $0.03 | $0.30 | $0.50 |
 
-OpenAI prices (for Codex) are from [OpenAI's pricing page](https://developers.openai.com/api/docs/pricing), Standard tier, last checked 2026-11-16. Cache writes are priced at OpenAI's 30-minute rate, shown below. OpenAI also sells 12-hour writes at 2×, but Codex logs don't record which one was used. Where no cache-write price is listed, cache writes bill as ordinary input. Some ids Codex logs aren't on OpenAI's price list at all, such as `codex-auto-review` and `gpt-daybreak-blue-latest`. Those stay flagged `?` and are estimated at GPT-5 rates.
+OpenAI prices (for Codex) are from [OpenAI's pricing page](https://developers.openai.com/api/docs/pricing), Standard tier, last checked 2026-11-24. Cache writes are priced at OpenAI's 30-minute rate, shown below. OpenAI also sells 12-hour writes at 2×, but Codex logs don't record which one was used. Where no cache-write price is listed, cache writes bill as ordinary input. Some ids Codex logs aren't on OpenAI's price list at all, such as `codex-auto-review` and `gpt-daybreak-blue-latest`. Those stay flagged `?` and are estimated at GPT-5 rates.
 
 | OpenAI model | Input | Cached input | Output | Cache write | Over 272K input |
 |---|---|---|---|---|---|
+| gpt-6.2-astra | $8.00 | $0.40 | $40.00 | $10.00 | $16 / $0.80 / $60 / $20 |
+| gpt-6.2-sol | $2.00 | $0.10 | $10.00 | $2.50 | $4 / $0.20 / $15 / $5 |
 | gpt-6-astra | $10.00 | $1.00 | $50.00 | $12.50 | $20 / $2 / $75 / $25 |
 | gpt-6.1-sol | $2.00 | $0.10 | $10.00 | $2.50 | $4 / $0.20 / $15 / $5 |
 | gpt-6.1-terra | $1.00 | $0.05 | $5.00 | $1.25 | $2 / $0.10 / $7.50 / $2.50 |
@@ -243,6 +247,9 @@ OpenAI prices (for Codex) are from [OpenAI's pricing page](https://developers.op
 | gpt-5-pro | $15.00 | — | $120.00 | — | |
 | gpt-5-mini | $0.25 | $0.025 | $2.00 | — | |
 | gpt-5-nano | $0.05 | $0.005 | $0.40 | — | |
+| gpt-4.1 / gpt-4.1-mini | $2.00 / $0.40 | $0.50 / $0.10 | $8.00 / $1.60 | — | |
+| gpt-4o / gpt-4o-mini | $2.50 / $0.15 | $1.25 / $0.075 | $10.00 / $0.60 | — | |
+| o3 / o3-pro | $2.00 / $20.00 | $0.50 / — | $8.00 / $80.00 | — | |
 
 Codex variants without their own price (e.g. `gpt-5.1-codex`) are priced as their base model, consistent with the one variant OpenAI does list (`gpt-5.3-codex` = `gpt-5.2`). Long-context and Haiku 5.5 prompt-length tiers are applied to the whole request, including cache tokens when selecting the tier. The historical Sonnet 4/4.5 premium follows [Anthropic's published whole-request pricing](https://claude.com/resources/articles/1m-context), rather than ccusage 20.0.34's marginal calculation. Explicit aliases include `gpt-5.1-codex-mini` (GPT-5 mini), `gpt-5.1-codex-max` (GPT-5.1), and `gpt-5.6` (GPT-5.6 Sol); dated snapshots of those aliases are supported.
 

@@ -53,7 +53,7 @@ def _oa(family, tier, inp, cached, out, cache_write=None, lc=None):
 # "intro" is a time-limited launch price applying to usage on/before "until".
 # "long_context" rates apply to a whole request whose prompt (input + cache
 # reads + cache writes) exceeds "over".
-# Source: https://platform.claude.com/docs/en/about-claude/pricing (2026-11-16).
+# Source: https://platform.claude.com/docs/en/about-claude/pricing (2026-11-24).
 def _an(family, tier, inp, cw5, cw1h, read, out, lc=None):
     """Build an Anthropic rate-card row."""
     row = {"family": family, "tier": tier, "provider": "anthropic", "input": inp,
@@ -101,7 +101,7 @@ RATES = [
     _an("claude-haiku-3",        "haiku",     0.25,  0.30,  0.50, 0.03,   1.25),
 ] + [
     # ── OpenAI (Codex CLI). Source: https://developers.openai.com/api/docs/pricing
-    # (Standard tier, fetched 2026-10-12; re-checked 2026-11-16). OpenAI lists
+    # (Standard tier, fetched 2026-10-12; re-checked 2026-11-16 and 2026-11-24). OpenAI lists
     # 30-minute and 12-hour cache writes, but Codex logs a single
     # cache_write_input_tokens count with no TTL, so writes are priced at the
     # 30-minute rate and cache_write == cache_write_1h (12h writes, at 2x, would
@@ -112,6 +112,8 @@ RATES = [
     # Codex variants without their own row (gpt-5.1-codex, …) price as their base
     # model — consistent with the one listed variant (gpt-5.3-codex == gpt-5.2).
     # "tier" is a price-class proxy for the energy model only.
+    _oa("gpt-6.2-astra", "frontier",  8.00, 0.40,  40.00, 10.00, lc=(16.00, 0.80, 60.00, 20.00)),
+    _oa("gpt-6.2-sol",   "sonnet",    2.00, 0.10,  10.00,  2.50, lc=(4.00, 0.20, 15.00, 5.00)),
     _oa("gpt-6-astra",   "frontier", 10.00, 1.00,  50.00, 12.50, lc=(20.00, 2.00, 75.00, 25.00)),
     _oa("gpt-6.1-sol",   "sonnet",    2.00, 0.10,  10.00,  2.50, lc=(4.00, 0.20, 15.00, 5.00)),
     _oa("gpt-6.1-terra", "sonnet",    1.00, 0.05,   5.00,  1.25, lc=(2.00, 0.10,  7.50, 2.50)),
@@ -134,6 +136,13 @@ RATES = [
     _oa("gpt-5-mini",    "haiku",     0.25, 0.025,  2.00),
     _oa("gpt-5-nano",    "haiku",     0.05, 0.005,  0.40),
     _oa("gpt-5",         "sonnet",    1.25, 0.125, 10.00),
+    # Older models still on the price list; Codex doesn't use them by default.
+    _oa("gpt-4.1-mini",  "haiku",     0.40, 0.10,   1.60),
+    _oa("gpt-4.1",       "sonnet",    2.00, 0.50,   8.00),
+    _oa("gpt-4o-mini",   "haiku",     0.15, 0.075,  0.60),
+    _oa("gpt-4o",        "sonnet",    2.50, 1.25,  10.00),
+    _oa("o3-pro",        "frontier", 20.00, None,  80.00),
+    _oa("o3",            "sonnet",    2.00, 0.50,   8.00),
 ]
 
 # Explicit aliases only: never guess a newly released model's price.
@@ -152,6 +161,7 @@ FAST_MULTIPLIERS = {
     "gpt-5.5": 2.5,
     **dict.fromkeys(("gpt-5.3-codex", "gpt-5.4", "gpt-5.6-sol", "gpt-5.6-terra",
                      "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra",
+                     "gpt-6.2-astra", "gpt-6.2-sol",
                      "gpt-6-luna"), 2.0),
 }
 FLEX_MODELS = {
@@ -3852,6 +3862,49 @@ def _print_capped_note(capped: list[dict], limit: int = 5) -> None:
         print(f"      … and {len(capped) - limit} more (see --explore DATE)")
 
 
+def mismatch_thresholds() -> tuple[float, float]:
+    """(ratio, minimum dollar gap) for flagging a report row whose cost differs
+    from its tokens at list price: CCTRACK_MISMATCH_RATIO (default 1.25, i.e.
+    25%) and CCTRACK_MISMATCH_MIN_USD (default 5)."""
+    def num(name, default, low):
+        try:
+            return max(low, float(os.environ.get(name, default)))
+        except ValueError:
+            return default
+    return num("CCTRACK_MISMATCH_RATIO", 1.25, 1.0), num("CCTRACK_MISMATCH_MIN_USD", 5.0, 0.0)
+
+
+def cost_mismatch(shown: float, tokens: float) -> float | None:
+    """How far a row's shown cost is from its token-priced cost, as a ratio
+    (>1: shown is higher; <1: lower), when that's beyond the thresholds; else
+    None. A missing side counts as infinitely far."""
+    ratio, min_usd = mismatch_thresholds()
+    if abs(shown - tokens) < min_usd:
+        return None
+    if shown <= 0 or tokens <= 0:
+        return float("inf") if shown > tokens else 0.0
+    r = shown / tokens
+    return r if (r > ratio or r < 1 / ratio) else None
+
+
+def _print_mismatch_note(flagged: list[dict]) -> None:
+    """Footer for rows marked `!` by cost_mismatch."""
+    if not flagged:
+        return
+    ratio, min_usd = mismatch_thresholds()
+    print()
+    print(f"  ! = the cost shown differs from the row's tokens at list price by more than "
+          f"{(ratio - 1) * 100:.0f}% (and ${min_usd:,.0f}):")
+    for f in flagged:
+        r = f["ratio"]
+        how = ("no transcripts" if r == float("inf") else
+               "no cost recorded" if r == 0.0 else f"{r:.2f}x")
+        hint = f"; see --explore {f['label']}" if f["daily"] else ""
+        guess = "; includes unrecognized models, so the token price is a guess" if f["unknown"] else ""
+        print(f"      {f['label']:<10}  ${f['shown']:,.2f} shown, ${f['tokens']:,.2f} from tokens "
+              f"({how}){hint}{guess}")
+
+
 def format_tokens(n: int) -> str:
     return f"{n:,}"
 
@@ -4166,6 +4219,7 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
         display_days = current_month_days
         if days is not None:
             display_days = display_days[:days]
+        flagged: list[dict] = []
         for date_str in display_days:
             cost, is_auth = _date_cost(date_str)
             d = daily.get(date_str)
@@ -4175,8 +4229,13 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
             models = (d.get("models", {}) if d else {}) or _date_hook_models(date_str)
             model_str = _model_str(models)
             energy_col = f" {format_energy(_date_energy_wh(date_str)):>10}" if show_energy else ""
+            mismatch = cost_mismatch(cost, d["cost"] if d else 0.0)
+            if mismatch is not None:
+                flagged.append({"label": date_str, "daily": True, "shown": cost,
+                                "tokens": d["cost"] if d else 0.0, "ratio": mismatch,
+                                "unknown": any(not is_known_model(m) for m in (d or {}).get("models", {}))})
             if hooks_exist:
-                marker = "" if is_auth else "~"
+                marker = ("" if is_auth else "~") + ("!" if mismatch is not None else "")
                 sessions = _date_sessions(date_str)
                 sess_str = str(sessions) if sessions else "-"
                 print(f"  {date_str:<12} {format_tokens(input_t):>11} {format_tokens(output_t):>11} {format_tokens(cache_r):>11} {format_tokens(cache_w):>11} {sess_str:>5} {model_str:<12} ${cost:>7.2f}{energy_col} {marker:>2}")
@@ -4192,6 +4251,7 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
                 print("  ~ = estimated (JSONL-derived; no hook overlap yet to measure accuracy)")
 
     # Previous months summary
+    month_flagged: list[dict] = []
     prev_months = [m for m in sorted_months if m != current_month]
     if prev_months:
         print()
@@ -4232,9 +4292,17 @@ def print_report(daily: dict, monthly: dict, days: int | None = None,
             month_energy = f" {format_energy(m.get('energy_wh', 0.0) if m else 0.0):>10}" if show_energy else ""
             if hooks_exist and month_has_est and not month_has_hook:
                 cost_str += "  ~"
+            mismatch = cost_mismatch(month_cost, m["cost"] if m else 0.0)
+            if mismatch is not None:
+                month_flagged.append({"label": month_str, "daily": False, "shown": month_cost,
+                                      "tokens": m["cost"] if m else 0.0, "ratio": mismatch,
+                                      "unknown": any(not is_known_model(x)
+                                                     for x in (m or {}).get("models", {}))})
+                cost_str += "  !" if not cost_str.endswith("~") else "!"
             print(f"  {month_str + days_str:<12} {format_tokens(input_t):>11} {format_tokens(output_t):>11} {format_tokens(cache_r):>11} {format_tokens(cache_w):>11} {model_str:<12} {cost_str}{month_energy}")
 
     _print_capped_note(capped_hook_days(sources))
+    _print_mismatch_note((flagged if current_month_days else []) + month_flagged)
 
     if saw_unknown_model:
         print()
@@ -4532,7 +4600,7 @@ def print_explore(events: list[dict], date_str: str,
 
 SCHEMA_VERSION = 1
 # Date the rate card was last verified against both providers' price pages.
-RATE_CARD_VERSION = "2026-11-16"
+RATE_CARD_VERSION = "2026-11-24"
 RATE_CARD_SOURCES = {
     "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
     "openai": "https://developers.openai.com/api/docs/pricing",
